@@ -1,0 +1,15 @@
+ao-data-platform has been installed in namespace {{ .Release.Namespace }}.
+
+Verify the deployment:
+
+  # ClickHouse operator
+  kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/name=altinity-clickhouse-operator
+
+  # ClickHouse instance
+  kubectl get chi -n {{ .Release.Namespace }}
+
+  # Schema migration job
+  kubectl get jobs -n {{ .Release.Namespace }}
+
+  # OTel collector
+  kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/name=opentelemetry-collector

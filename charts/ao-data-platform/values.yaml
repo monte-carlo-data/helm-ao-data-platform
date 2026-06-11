@@ -1,0 +1,290 @@
+clickhouse:
+  # ClickHouse server image — required whenever the CHI's podTemplate is
+  # emitted (Altinity operator does not merge container spec defaults).
+  # Pinning here moves image lifecycle ownership (CVE/version bumps) onto
+  # this chart; the AO team owns periodic review and bumps. Pinned to an
+  # immutable patch tag (not `:latest` or a floating minor) so deployments
+  # are reproducible. Note: `26.4` is a deliberate jump from the Altinity
+  # 0.26.0 operator default of `23.8` — adopt with intent on first install.
+  image: clickhouse/clickhouse-server:26.4.3
+  storageClass: ""
+  storageSize: 100Gi
+  # Data retention, in days, for the telemetry tables — the raw traces, the
+  # trace-id timestamp index, and the normalized spans. The schema job re-applies
+  # this on every install and upgrade via `ALTER TABLE … MODIFY TTL`, so changing
+  # it here takes effect on existing tables (unlike the system-log TTLs); the SQL
+  # files carry the same value as their create-time default. The SaaS terraform
+  # module's `clickhouse_ttl_days` variable maps onto this key.
+  #
+  # Scope: telemetry only. The llm_* tables are the LLM worker's job-queue state
+  # (batches/inputs/results), not customer telemetry, and keep their own fixed
+  # TTL in SQL (see sql/0008–0010) — their retention is an operational concern
+  # tracked separately from this knob.
+  #
+  # Note: shrinking the value purges already-expired data lazily on the next
+  # background merge, not immediately — see README for the manual-purge escape hatch.
+  ttlDays: 30
+  # Name of the K8s Secret containing a "password" key for the otel user.
+  # This secret is created by the ExternalSecret below.
+  otelSecret: ao-clickhouse-otel-credentials
+  # CIDR list allowed to authenticate as the otel user. Default is open
+  # (matches CH's default user model); the SaaS-deployed terraform module
+  # overrides this with the deployment's VPC CIDR. Per-user tightening
+  # (otel → pod CIDR, separate reader/admin users) is a planned follow-up.
+  otelNetworksIp:
+    - "0.0.0.0/0"
+  externalSecret:
+    secretStoreRef:
+      name: ""                    # user must provide
+      kind: ClusterSecretStore
+    remoteRef:
+      key: ""                     # user must provide
+      property: ""                # optional, for JSON secrets
+      version: ""                 # optional, required for Fake provider
+    refreshInterval: 1h
+  readonlyUser:
+    enabled: false
+    # Name of the K8s Secret containing a "password" key for the readonly_user.
+    # Created by the gated ExternalSecret below when enabled = true.
+    secret: ao-clickhouse-readonly-user-credentials
+    externalSecret:
+      secretStoreRef:
+        name: ""                  # user must provide
+        kind: ClusterSecretStore
+      remoteRef:
+        key: ""                   # user must provide
+        property: ""              # optional, for JSON secrets
+        version: ""               # optional, required for Fake provider
+      refreshInterval: 1h
+  hostname: ""    # if set, adds external-dns.alpha.kubernetes.io/hostname annotation
+  service:
+    type: ClusterIP
+    annotations: {}
+  # Pod scheduling for the ClickHouse server. Wired into the CHI's
+  # podTemplate; defaults are no-ops.
+  nodeSelector: {}
+  tolerations: []
+  # Resource requests/limits for the ClickHouse server container. Sized to
+  # fit on a t3.large (8 GiB) node with headroom for kubelet and other
+  # system pods. CPU limit intentionally omitted — ClickHouse is bursty
+  # and benefits from using spare CPU when available.
+  #
+  # NOTE: limits.memory feeds CH's max_server_memory_usage_to_ram_ratio
+  # (set to 0.8 in the CHI). Keep it set — if removed, CH falls back to
+  # host RAM detection and can OOM-kill the node on a multi-tenant host.
+  resources:
+    requests:
+      cpu: 250m
+      memory: 2Gi
+    limits:
+      memory: 4Gi
+
+tls:
+  enabled: true
+  certManager:
+    createCA: true
+    existingIssuerRef: {}
+    # existingIssuerRef:
+    #   name: my-issuer
+    #   kind: Issuer  # or ClusterIssuer
+
+# Altinity ClickHouse Operator — defaults are fine
+altinity-clickhouse-operator:
+  fullnameOverride: clickhouse-operator
+
+# LLM Worker — polls ClickHouse for pending batches, calls AWS Bedrock, writes results back
+llmWorker:
+  image:
+    repository: ""
+    tag: ""
+  aws:
+    region: us-east-1
+  serviceAccount:
+    annotations: {}
+  # Extra env vars (e.g., MAX_WORKERS, POLL_INTERVAL)
+  env: []
+  # Resource requests/limits for the llm-worker container. Modest dev
+  # defaults; bump via terraform tfvars per environment. CPU limit
+  # intentionally omitted.
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 1Gi
+
+# OTel Collector subchart values
+# NOTE: The config below assumes tls.enabled=true (the default). If you set
+# tls.enabled=false, also override the opentelemetry-collector section to
+# remove TLS receiver config, change the exporter endpoint back to port 9000,
+# and remove the extraVolumes/extraVolumeMounts for TLS secrets.
+opentelemetry-collector:
+  fullnameOverride: opentelemetry-collector
+  mode: deployment
+  replicaCount: 1
+
+  # Bound the collector's memory so memory_limiter has a fixed reference
+  # rather than detecting from the (possibly oversubscribed) node.
+  # 6Gi limit fits within the 8Gi t3.large nodes the collector schedules on,
+  # leaving ~2Gi for kubelet and other system pods.
+  resources:
+    requests:
+      cpu: 200m
+      memory: 2Gi
+    limits:
+      memory: 6Gi
+
+  image:
+    repository: otel/opentelemetry-collector-contrib
+    tag: ""
+
+  ports:
+    otlp:
+      enabled: true
+    otlp-http:
+      enabled: true
+    jaeger-compact:
+      enabled: false
+    jaeger-thrift:
+      enabled: false
+    jaeger-grpc:
+      enabled: false
+    zipkin:
+      enabled: false
+
+  service:
+    type: ClusterIP
+
+  initContainers:
+    - name: wait-for-clickhouse-schema
+      # Keep this tag in sync with clickhouse.image above — it can't reference
+      # the parent chart's values from inside this subchart block.
+      image: clickhouse/clickhouse-server:26.4.3
+      command:
+        - sh
+        - -c
+        - |
+          echo "Waiting for otel_traces database..."
+          until clickhouse-client --host clickhouse-otel --user otel --password "${CLICKHOUSE_PASSWORD}" --secure --port 9440 --query "SELECT 1 FROM system.databases WHERE name='otel_traces'" 2>/dev/null | grep -q 1; do
+            sleep 2
+          done
+          echo "Database ready."
+      env:
+        - name: CLICKHOUSE_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: ao-clickhouse-otel-credentials
+              key: password
+        - name: SSL_CERT_FILE
+          value: /tls/clickhouse-ca/ca.crt
+      volumeMounts:
+        - name: clickhouse-ca
+          mountPath: /tls/clickhouse-ca
+          readOnly: true
+
+  extraEnvs:
+    - name: CLICKHOUSE_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: ao-clickhouse-otel-credentials
+          key: password
+    - name: SSL_CERT_FILE
+      value: /tls/clickhouse-ca/ca.crt
+
+  extraVolumes:
+    - name: otel-tls
+      secret:
+        secretName: otel-collector-tls
+        optional: true
+    - name: clickhouse-ca
+      secret:
+        secretName: clickhouse-server-tls
+        optional: true
+        items:
+          - key: ca.crt
+            path: ca.crt
+
+  extraVolumeMounts:
+    - name: otel-tls
+      mountPath: /tls/otel
+      readOnly: true
+    - name: clickhouse-ca
+      mountPath: /tls/clickhouse-ca
+      readOnly: true
+
+  config:
+    receivers:
+      jaeger: null
+      zipkin: null
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+            tls:
+              cert_file: /tls/otel/tls.crt
+              key_file: /tls/otel/tls.key
+              reload_interval: 10m
+          http:
+            endpoint: 0.0.0.0:4318
+            tls:
+              cert_file: /tls/otel/tls.crt
+              key_file: /tls/otel/tls.key
+              reload_interval: 10m
+      prometheus:
+        config:
+          scrape_configs:
+            - job_name: otel-collector
+              scrape_interval: 30s
+              static_configs:
+                - targets: ["${env:MY_POD_IP}:8888"]
+
+    processors:
+      memory_limiter:
+        check_interval: 5s
+        limit_percentage: 80
+        spike_limit_percentage: 25
+      batch:
+        timeout: 5s
+        send_batch_size: 1000
+        send_batch_max_size: 1500
+
+    exporters:
+      clickhouse:
+        endpoint: tcp://clickhouse-otel.{{ .Release.Namespace }}.svc.cluster.local:9440?secure=true
+        json: true
+        database: otel_traces
+        username: otel
+        password: ${env:CLICKHOUSE_PASSWORD}
+        create_schema: false
+        compress: lz4
+        traces_table_name: otel_traces
+        metrics_table_name: otel_metrics
+        timeout: 30s
+        async_insert: false
+        sending_queue:
+          enabled: true
+          num_consumers: 2
+          queue_size: 1000
+        retry_on_failure:
+          enabled: true
+          initial_interval: 5s
+          max_interval: 30s
+          max_elapsed_time: 30m
+
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+
+    service:
+      extensions: [health_check]
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, batch]
+          exporters: [clickhouse]
+      telemetry:
+        logs:
+          level: info
+          encoding: json
+        metrics:
+          level: detailed

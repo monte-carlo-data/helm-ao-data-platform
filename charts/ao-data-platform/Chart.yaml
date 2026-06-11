@@ -1,0 +1,13 @@
+apiVersion: v2
+name: ao-data-platform
+description: Monte Carlo data platform — ClickHouse, OTel collector, and schema management
+version: 1.5.0
+type: application
+
+dependencies:
+  - name: altinity-clickhouse-operator
+    version: 0.26.0
+    repository: https://docs.altinity.com/clickhouse-operator/
+  - name: opentelemetry-collector
+    version: 0.151.0
+    repository: https://open-telemetry.github.io/opentelemetry-helm-charts

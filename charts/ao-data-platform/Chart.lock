@@ -1,0 +1,9 @@
+dependencies:
+- name: altinity-clickhouse-operator
+  repository: https://docs.altinity.com/clickhouse-operator/
+  version: 0.26.0
+- name: opentelemetry-collector
+  repository: https://open-telemetry.github.io/opentelemetry-helm-charts
+  version: 0.151.0
+digest: sha256:9706fbea3efe47339ca09644aca2ffbc2403251c5e11b24366fd408a9d6bbd1d
+generated: "2026-05-01T12:01:03.854362-05:00"

@@ -1,0 +1,87 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-worker
+  labels:
+    {{- include "ao-data-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: llm-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "ao-data-platform.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: llm-worker
+  template:
+    metadata:
+      labels:
+        {{- include "ao-data-platform.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: llm-worker
+    spec:
+      serviceAccountName: llm-worker
+      initContainers:
+        - name: wait-for-clickhouse
+          image: {{ .Values.clickhouse.image }}
+          command:
+            - sh
+            - -c
+            - |
+              echo "Waiting for ClickHouse..."
+              until clickhouse-client --host clickhouse-otel --user otel --password "${CLICKHOUSE_PASSWORD}" --secure --port 9440 --query "SELECT 1 FROM system.databases WHERE name='otel_traces'" 2>/dev/null | grep -q 1; do
+                sleep 2
+              done
+              echo "ClickHouse ready."
+          env:
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.clickhouse.otelSecret }}
+                  key: password
+            - name: SSL_CERT_FILE
+              value: /tls/clickhouse-ca/ca.crt
+          volumeMounts:
+            - name: clickhouse-ca
+              mountPath: /tls/clickhouse-ca
+              readOnly: true
+      containers:
+        - name: llm-worker
+          image: "{{ .Values.llmWorker.image.repository }}:{{ .Values.llmWorker.image.tag }}"
+          env:
+            - name: CH_HOST
+              value: clickhouse-otel
+            - name: CH_PORT
+              value: "8443"
+            - name: CH_USER
+              value: otel
+            - name: CH_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.clickhouse.otelSecret }}
+                  key: password
+            - name: CH_DATABASE
+              value: otel_traces
+            - name: POLL_INTERVAL
+              value: "2"
+            - name: MAX_WORKERS
+              value: "80"
+            - name: AWS_REGION
+              value: {{ .Values.llmWorker.aws.region | quote }}
+            - name: CH_CA_CERT
+              value: /tls/clickhouse-ca/ca.crt
+            {{- with .Values.llmWorker.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          volumeMounts:
+            - name: clickhouse-ca
+              mountPath: /tls/clickhouse-ca
+              readOnly: true
+          {{- with .Values.llmWorker.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: clickhouse-ca
+          secret:
+            secretName: clickhouse-server-tls
+            items:
+              - key: ca.crt
+                path: ca.crt

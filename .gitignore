@@ -1,0 +1,4 @@
+charts/*/charts/
+
+# Local planning/working artifacts (start-work, hack, ship, etc.) — not shared
+.work/

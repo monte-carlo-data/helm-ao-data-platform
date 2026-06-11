@@ -1,0 +1,116 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: clickhouse-schema-{{ .Release.Revision }}
+  labels:
+    {{- include "ao-data-platform.labels" . | nindent 4 }}
+spec:
+  backoffLimit: 10
+  template:
+    spec:
+      restartPolicy: OnFailure
+      volumes:
+        - name: sql
+          configMap:
+            name: clickhouse-schema
+        {{- if .Values.tls.enabled }}
+        - name: clickhouse-ca
+          secret:
+            secretName: clickhouse-server-tls
+            items:
+              - key: ca.crt
+                path: ca.crt
+        {{- end }}
+      containers:
+        - name: create-schema
+          image: {{ .Values.clickhouse.image }}
+          volumeMounts:
+            - name: sql
+              mountPath: /sql
+            {{- if .Values.tls.enabled }}
+            - name: clickhouse-ca
+              mountPath: /tls/clickhouse-ca
+              readOnly: true
+            {{- end }}
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              # Single point of truth for the client invocation (host/auth/TLS),
+              # used by the readiness probe, the migration loop, and the TTL step.
+              ch() {
+                clickhouse-client --host clickhouse-otel --user otel --password "${CLICKHOUSE_PASSWORD}"{{ if .Values.tls.enabled }} --secure --port 9440{{ end }} "$@"
+              }
+              # MODIFY TTL with materialize_ttl_after_modify=0: update table metadata
+              # only — TTL is enforced by normal background merges, avoiding a heavy
+              # full-table mutation on every install/upgrade.
+              modify_ttl() {
+                ch --query "ALTER TABLE $1 MODIFY TTL $2 SETTINGS materialize_ttl_after_modify = 0"
+              }
+              # As modify_ttl, but skips tables that don't exist. Used for the
+              # system log tables: which ones the operator enables varies (e.g.
+              # query_thread_log ships disabled), and a disabled log's table is
+              # never created — so an unconditional ALTER would fail UNKNOWN_TABLE.
+              modify_ttl_if_exists() {
+                if [ "$(ch --query "EXISTS TABLE $1")" = "1" ]; then
+                  modify_ttl "$1" "$2"
+                else
+                  echo "  skipping $1 — table absent (log disabled or not yet created)"
+                fi
+              }
+              echo "Waiting for ClickHouse to accept queries..."
+              until ch --query "SELECT 1" 2>/dev/null; do
+                sleep 2
+              done
+              echo "Running schema migrations..."
+              for f in /sql/*.sql; do
+                echo "  Running $f..."
+                ch < "$f"
+              done
+              echo "Schema creation complete."
+              # Apply the configured retention to the telemetry tables. The SQL
+              # files carry the same value as their create-time default; this ALTER
+              # is the source of truth and keeps existing tables in sync on upgrade.
+              # Scope covers spans telemetry plus the conversations source derived
+              # from it (conversations_normalized) and its eval scores, which are
+              # designed to age out in lockstep with the conversations they annotate.
+              # Excluded: the llm_* tables are LLM-worker queue state, not telemetry,
+              # and keep their own fixed TTL (sql/0008–0010).
+              echo "Applying {{ .Values.clickhouse.ttlDays }}-day TTL to telemetry tables..."
+              modify_ttl otel_traces.otel_traces "toDate(Timestamp) + toIntervalDay({{ .Values.clickhouse.ttlDays }})"
+              modify_ttl otel_traces.otel_traces_trace_id_ts "toDate(Start) + toIntervalDay({{ .Values.clickhouse.ttlDays }})"
+              modify_ttl otel_traces.spans_normalized "start_time + toIntervalDay({{ .Values.clickhouse.ttlDays }})"
+              modify_ttl otel_traces.conversations_normalized "turn_start + toIntervalDay({{ .Values.clickhouse.ttlDays }})"
+              modify_ttl otel_traces.conversation_eval_scores "scored_at + toIntervalDay({{ .Values.clickhouse.ttlDays }})"
+              echo "TTL configuration complete."
+              # Cap system log retention at 7 days. CH otherwise grows these
+              # tables without bound, which dominates disk over months on small
+              # PVs. This can't live in the CHI config: CH 26.4 ships each
+              # system-log table with an inline engine that already carries a
+              # TTL, and rejects a separate `<ttl>` setting on top (Code: 36) —
+              # see templates/clickhouse-installation.yaml. SYSTEM FLUSH LOGS
+              # first materializes every *enabled* system-log table so we don't
+              # race their lazy creation; modify_ttl_if_exists then skips any
+              # that are disabled (the operator ships some, e.g.
+              # query_thread_log, with remove="1").
+              echo "Applying 7-day TTL to system log tables..."
+              ch --query "SYSTEM FLUSH LOGS"
+              modify_ttl_if_exists system.query_log "event_date + INTERVAL 7 DAY"
+              modify_ttl_if_exists system.query_thread_log "event_date + INTERVAL 7 DAY"
+              modify_ttl_if_exists system.query_views_log "event_date + INTERVAL 7 DAY"
+              modify_ttl_if_exists system.part_log "event_date + INTERVAL 7 DAY"
+              modify_ttl_if_exists system.trace_log "event_date + INTERVAL 7 DAY"
+              modify_ttl_if_exists system.metric_log "event_date + INTERVAL 7 DAY"
+              modify_ttl_if_exists system.text_log "event_date + INTERVAL 7 DAY"
+              echo "System log TTL configuration complete."
+          env:
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.clickhouse.otelSecret }}
+                  key: password
+            {{- if .Values.tls.enabled }}
+            - name: SSL_CERT_FILE
+              value: /tls/clickhouse-ca/ca.crt
+            {{- end }}
