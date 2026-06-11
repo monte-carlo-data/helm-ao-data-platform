@@ -1,0 +1,182 @@
+apiVersion: "clickhouse.altinity.com/v1"
+kind: "ClickHouseInstallation"
+metadata:
+  name: {{ include "ao-data-platform.chiName" . }}
+  labels:
+    {{- include "ao-data-platform.labels" . | nindent 4 }}
+spec:
+  configuration:
+    clusters:
+      - name: "otel"
+        layout:
+          shardsCount: 1
+          replicasCount: 1
+    users:
+      otel/password:
+        valueFrom:
+          secretKeyRef:
+            name: {{ .Values.clickhouse.otelSecret }}
+            key: password
+      otel/networks/ip:
+        {{- toYaml .Values.clickhouse.otelNetworksIp | nindent 8 }}
+      {{- if .Values.clickhouse.readonlyUser.enabled }}
+      readonly_user/password:
+        valueFrom:
+          secretKeyRef:
+            name: {{ .Values.clickhouse.readonlyUser.secret }}
+            key: password
+      readonly_user/networks/ip:
+        - "0.0.0.0/0"
+      readonly_user/profile: readonly_settings
+      {{- end }}
+    {{- if .Values.clickhouse.readonlyUser.enabled }}
+    profiles:
+      # readonly=2 keeps the user SELECT-only but allows per-session SET; the
+      # built-in `readonly` profile is mode 1 and rejects all setting changes,
+      # which breaks JDBC clients (DataGrip etc.) on handshake.
+      readonly_settings/readonly: "2"
+    {{- end }}
+    files:
+      # Remove the built-in `default` user. Stock ClickHouse ships `default`
+      # with an empty password and `access_management: 1` (full superuser).
+      # The Altinity operator restricts its networks to pod IPs but leaves the
+      # password empty, so it stays a passwordless superuser reachable from
+      # inside the pod. Nothing in this chart authenticates as `default` (all
+      # clients use `otel`; the operator uses its own `clickhouse_operator`
+      # user), so removing it is safe. See Altinity docs/security_hardening.md.
+      users.d/remove_default_user.xml: |
+        <clickhouse>
+          <users>
+            <default remove="1"/>
+          </users>
+        </clickhouse>
+      {{- if .Values.tls.enabled }}
+      server.crt:
+        valueFrom:
+          secretKeyRef:
+            name: clickhouse-server-tls
+            key: tls.crt
+      server.key:
+        valueFrom:
+          secretKeyRef:
+            name: clickhouse-server-tls
+            key: tls.key
+      ca.crt:
+        valueFrom:
+          secretKeyRef:
+            name: clickhouse-server-tls
+            key: ca.crt
+      {{- end }}
+    settings:
+      # Cap CH memory at 80% of the cgroup limit. Requires
+      # clickhouse.resources.limits.memory to be set so the ratio resolves
+      # to the pod's cgroup limit rather than host RAM.
+      max_server_memory_usage_to_ram_ratio: "0.8"
+      # Quiet the server log for steady-state prod volume. CH defaults to
+      # trace/information, which is too chatty for production.
+      logger/level: notice
+      # System log retention (capping these tables, which CH otherwise grows
+      # without bound) is applied post-start by the schema Job, NOT here.
+      # CH 26.4 ships each system-log table with an inline `<engine>` that
+      # already carries a TTL, and the server rejects a separate `<ttl>`
+      # setting on top of it ("If 'engine' is specified for system table, TTL
+      # parameters should be specified directly inside 'engine'…", Code: 36) —
+      # so configuring `query_log/ttl` here aborts startup. The Job applies the
+      # retention via `ALTER TABLE system.<log> MODIFY TTL` instead; see
+      # templates/schema-job.yaml.
+      {{- if .Values.tls.enabled }}
+      tcp_port_secure: "9440"
+      https_port: "8443"
+      openSSL/server/certificateFile: /etc/clickhouse-server/secrets.d/server.crt/clickhouse-server-tls/tls.crt
+      openSSL/server/privateKeyFile: /etc/clickhouse-server/secrets.d/server.key/clickhouse-server-tls/tls.key
+      openSSL/server/caConfig: /etc/clickhouse-server/secrets.d/ca.crt/clickhouse-server-tls/ca.crt
+      {{- end }}
+  defaults:
+    templates:
+      dataVolumeClaimTemplate: data
+      serviceTemplate: clickhouse-svc
+      # Stock installs always hit this branch (resources is defaulted in
+      # values.yaml); the conditional is an escape hatch for consumers who
+      # set all three to empty to fall back to operator defaults.
+      {{- if or .Values.clickhouse.nodeSelector .Values.clickhouse.tolerations .Values.clickhouse.resources }}
+      podTemplate: clickhouse
+      {{- end }}
+  templates:
+    {{- if or .Values.clickhouse.nodeSelector .Values.clickhouse.tolerations .Values.clickhouse.resources }}
+    podTemplates:
+      - name: clickhouse
+        spec:
+          # `image` is required whenever this podTemplate emits a containers[]
+          # entry — the Altinity operator does not merge container spec defaults.
+          containers:
+            - name: clickhouse
+              image: {{ .Values.clickhouse.image }}
+              {{- with .Values.clickhouse.resources }}
+              resources:
+                {{- toYaml . | nindent 16 }}
+              {{- end }}
+              # Only the startupProbe is set here. The Altinity operator
+              # injects its own liveness/readiness probes on the `clickhouse`
+              # container for steady-state health, so we rely on those and
+              # add only this startup gate. Generous startup window — large
+              # mark-cache warmups on restart can otherwise trip liveness and
+              # create restart loops.
+              startupProbe:
+                httpGet:
+                  path: /ping
+                  {{- if .Values.tls.enabled }}
+                  port: 8443
+                  scheme: HTTPS
+                  {{- else }}
+                  port: 8123
+                  {{- end }}
+                failureThreshold: 30
+                periodSeconds: 10
+          {{- with .Values.clickhouse.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.clickhouse.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+    {{- end }}
+    serviceTemplates:
+      - name: clickhouse-svc
+        metadata:
+          {{- if or .Values.clickhouse.service.annotations .Values.clickhouse.hostname }}
+          annotations:
+            {{- with .Values.clickhouse.service.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+            {{- if .Values.clickhouse.hostname }}
+            external-dns.alpha.kubernetes.io/hostname: {{ .Values.clickhouse.hostname }}
+            {{- end }}
+          {{- else }}
+          {}
+          {{- end }}
+        spec:
+          type: {{ .Values.clickhouse.service.type }}
+          ports:
+            {{- if .Values.tls.enabled }}
+            - name: https
+              port: 8443
+            - name: tcp-secure
+              port: 9440
+            {{- else }}
+            - name: http
+              port: 8123
+            - name: tcp
+              port: 9000
+            {{- end }}
+    volumeClaimTemplates:
+      - name: data
+        spec:
+          {{- if .Values.clickhouse.storageClass }}
+          storageClassName: {{ .Values.clickhouse.storageClass }}
+          {{- end }}
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: {{ .Values.clickhouse.storageSize }}

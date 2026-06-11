@@ -1,0 +1,19 @@
+# PodDisruptionBudget for the ClickHouse pod.
+#
+# Circuit breaker for cluster automation (node drains during EKS upgrades,
+# managed node group AMI bumps, manual kubectl drain) — not an HA mechanism.
+# With one replica, minAvailable: 1 means voluntary eviction returns 429 and
+# the initiating operation has to handle it explicitly. Does NOT protect
+# against involuntary disruption: node failure, spot termination, OOM kill,
+# kubectl delete pod, app crashes.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: clickhouse-pdb
+  labels:
+    {{- include "ao-data-platform.labels" . | nindent 4 }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      clickhouse.altinity.com/chi: {{ include "ao-data-platform.chiName" . }}

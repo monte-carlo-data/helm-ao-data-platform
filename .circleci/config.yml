@@ -1,0 +1,133 @@
+version: 2.1
+
+# Docker Hub publish context — must provide DOCKER_LOGIN and a scoped Docker Hub
+# access token as DOCKER_PASSWORD, and must NOT be exposed to forked-PR builds.
+# PLACEHOLDER name — confirm/resolve before first publish (reuse the shared
+# `docker` context vs. a dedicated publish-only scoped token).
+defaults:
+  - &dockerhub_context
+    - helm-ao-data-platform-dockerhub
+
+commands:
+  install-helm:
+    steps:
+      - run:
+          name: Install Helm
+          command: |
+            curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+            chmod +x get_helm.sh
+            ./get_helm.sh
+
+  add-helm-repos:
+    steps:
+      - run:
+          name: Add chart repositories
+          command: |
+            helm repo add altinity https://docs.altinity.com/clickhouse-operator/
+            helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts
+
+  login-dockerhub:
+    steps:
+      - run:
+          name: Login to Docker Hub
+          command: |
+            echo "$DOCKER_PASSWORD" \
+              | helm registry login registry-1.docker.io --username "$DOCKER_LOGIN" --password-stdin
+
+jobs:
+  lint:
+    docker:
+      - image: cimg/base:current
+    steps:
+      - checkout
+      - install-helm
+      - add-helm-repos
+      - run:
+          name: Build chart dependencies
+          command: helm dependency build charts/ao-data-platform
+      - run:
+          name: Lint chart
+          command: helm lint charts/ao-data-platform
+
+  publish-dev:
+    docker:
+      - image: cimg/base:current
+    steps:
+      - checkout
+      - install-helm
+      - login-dockerhub
+      - add-helm-repos
+      - run:
+          name: Build and publish dev chart (latest + per-commit)
+          command: |
+            SHORT_SHA=$(git rev-parse --short=7 HEAD)
+            DEV_VERSION="0.0.0-dev.g${SHORT_SHA}"
+            helm dependency build charts/ao-data-platform
+            # Immutable per-commit dev artifact — push first so `latest` is never
+            # advanced to a SHA without a corresponding immutable copy to pin to.
+            helm package charts/ao-data-platform --version "$DEV_VERSION"
+            helm push "ao-data-platform-${DEV_VERSION}.tgz" "oci://registry-1.docker.io/montecarlodata"
+            # Floating "tip of dev" pointer.
+            helm package charts/ao-data-platform --version "0.0.0-latest"
+            helm push "ao-data-platform-0.0.0-latest.tgz" "oci://registry-1.docker.io/montecarlodata"
+            echo "Published ${DEV_VERSION} and 0.0.0-latest"
+
+  publish-tag:
+    docker:
+      - image: cimg/base:current
+    steps:
+      - checkout
+      - run:
+          name: Verify tag is on main
+          command: |
+            git fetch --quiet origin main
+            if ! git merge-base --is-ancestor "$CIRCLE_TAG" origin/main; then
+              echo "Tag $CIRCLE_TAG is not an ancestor of origin/main — refusing to publish."
+              exit 1
+            fi
+            echo "Tag $CIRCLE_TAG is on main, proceeding."
+      - run:
+          name: Verify Chart.yaml version matches tag
+          command: |
+            CHART_VERSION=$(awk '/^version:/ {gsub(/"/, "", $2); print $2; exit}' charts/ao-data-platform/Chart.yaml)
+            EXPECTED="${CIRCLE_TAG#v}"
+            if [ "$CHART_VERSION" != "$EXPECTED" ]; then
+              echo "Chart.yaml version ($CHART_VERSION) does not match tag ($EXPECTED) — refusing to publish."
+              exit 1
+            fi
+            echo "Chart.yaml version ($CHART_VERSION) matches tag, proceeding."
+      - install-helm
+      - login-dockerhub
+      - add-helm-repos
+      - run:
+          name: Build and publish tagged release
+          command: |
+            VERSION="${CIRCLE_TAG#v}"
+            echo "Publishing chart version: $VERSION"
+            helm dependency build charts/ao-data-platform
+            helm package charts/ao-data-platform --version "$VERSION"
+            helm push "ao-data-platform-${VERSION}.tgz" "oci://registry-1.docker.io/montecarlodata"
+
+workflows:
+  build:
+    jobs:
+      - lint:
+          filters:
+            tags:
+              only: /^v.*/
+      - publish-dev:
+          requires:
+            - lint
+          context: *dockerhub_context
+          filters:
+            branches:
+              only: dev
+      - publish-tag:
+          requires:
+            - lint
+          context: *dockerhub_context
+          filters:
+            branches:
+              ignore: /.*/
+            tags:
+              only: /^v.*/
