@@ -1,0 +1,41 @@
+NOTICE
+======
+
+ao-data-platform Helm chart
+Copyright 2026 Monte Carlo AI, Inc.
+
+This product includes software developed at Monte Carlo AI, Inc.
+(https://montecarlo.ai).
+
+
+--------------------------------------------------------------------------------
+Third-party components
+--------------------------------------------------------------------------------
+
+This Helm chart is distributed as an OCI package that bundles the following
+third-party Helm subcharts. Each is included unmodified in the `charts/`
+directory of the packaged artifact and is licensed under the Apache License,
+Version 2.0. A verbatim copy of each component's license is provided under the
+LICENSES/ directory distributed alongside this NOTICE.
+
+The exact versions bundled in any given release are recorded in the chart's
+Chart.yaml and Chart.lock.
+
+1. Altinity ClickHouse Operator Helm chart
+   Copyright:  Altinity Ltd and/or its affiliates
+   Source:     https://github.com/Altinity/clickhouse-operator
+   License:    Apache License, Version 2.0
+               LICENSES/altinity-clickhouse-operator/LICENSE
+
+2. OpenTelemetry Collector Helm chart
+   Copyright:  The OpenTelemetry Authors
+   Source:     https://github.com/open-telemetry/opentelemetry-helm-charts
+   License:    Apache License, Version 2.0
+               LICENSES/opentelemetry-collector/LICENSE
+
+--------------------------------------------------------------------------------
+
+The container images referenced by this chart (e.g. clickhouse/clickhouse-server,
+otel/opentelemetry-collector-contrib, altinity/clickhouse-operator) are NOT
+redistributed in this package; they are pulled at runtime from their respective
+registries and remain subject to their own licenses.
