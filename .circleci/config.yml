@@ -1,12 +1,8 @@
 version: 2.1
 
-# Docker Hub publish context — must provide DOCKER_LOGIN and a scoped Docker Hub
-# access token as DOCKER_PASSWORD, and must NOT be exposed to forked-PR builds.
-# PLACEHOLDER name — confirm/resolve before first publish (reuse the shared
-# `docker` context vs. a dedicated publish-only scoped token).
 defaults:
   - &dockerhub_context
-    - helm-ao-data-platform-dockerhub
+    - docker
 
 commands:
   install-helm:
@@ -63,11 +59,8 @@ jobs:
             SHORT_SHA=$(git rev-parse --short=7 HEAD)
             DEV_VERSION="0.0.0-dev.g${SHORT_SHA}"
             helm dependency build charts/ao-data-platform
-            # Immutable per-commit dev artifact — push first so `latest` is never
-            # advanced to a SHA without a corresponding immutable copy to pin to.
             helm package charts/ao-data-platform --version "$DEV_VERSION"
             helm push "ao-data-platform-${DEV_VERSION}.tgz" "oci://registry-1.docker.io/montecarlodata"
-            # Floating "tip of dev" pointer.
             helm package charts/ao-data-platform --version "0.0.0-latest"
             helm push "ao-data-platform-0.0.0-latest.tgz" "oci://registry-1.docker.io/montecarlodata"
             echo "Published ${DEV_VERSION} and 0.0.0-latest"
