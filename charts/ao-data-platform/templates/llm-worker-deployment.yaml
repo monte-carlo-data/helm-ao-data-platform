@@ -26,7 +26,7 @@ spec:
             - -c
             - |
               echo "Waiting for ClickHouse..."
-              until clickhouse-client --host clickhouse-otel --user otel --password "${CLICKHOUSE_PASSWORD}" --secure --port 9440 --query "SELECT 1 FROM system.databases WHERE name='otel_traces'" 2>/dev/null | grep -q 1; do
+              until clickhouse-client --host clickhouse-otel --user llm_worker --password "${CLICKHOUSE_PASSWORD}" --secure --port 9440 --query "EXISTS TABLE otel_traces.llm_batches" 2>/dev/null | grep -q 1; do
                 sleep 2
               done
               echo "ClickHouse ready."
@@ -34,7 +34,7 @@ spec:
             - name: CLICKHOUSE_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.clickhouse.otelSecret }}
+                  name: {{ .Values.clickhouse.llmWorkerUser.secret }}
                   key: password
             - name: SSL_CERT_FILE
               value: /tls/clickhouse-ca/ca.crt
@@ -51,11 +51,11 @@ spec:
             - name: CH_PORT
               value: "8443"
             - name: CH_USER
-              value: otel
+              value: llm_worker
             - name: CH_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.clickhouse.otelSecret }}
+                  name: {{ .Values.clickhouse.llmWorkerUser.secret }}
                   key: password
             - name: CH_DATABASE
               value: otel_traces

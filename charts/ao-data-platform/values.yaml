@@ -62,6 +62,23 @@ clickhouse:
         property: ""              # optional, for JSON secrets
         version: ""               # optional, required for Fake provider
       refreshInterval: 1h
+  # llm_worker — identity for the llm-worker Deployment. Reads the LLM job queue and appends
+  # results back (no mutations): SELECT on llm_batches/llm_inputs/llm_results, INSERT on
+  # llm_batches/llm_results. Created by the ExternalSecret below.
+  llmWorkerUser:
+    secret: ao-clickhouse-llm-worker-credentials
+    # CIDR list allowed to authenticate as llm_worker (in-cluster). Default open; tighten per env.
+    networksIp:
+      - "0.0.0.0/0"
+    externalSecret:
+      secretStoreRef:
+        name: ""                  # user must provide
+        kind: ClusterSecretStore
+      remoteRef:
+        key: ""                   # user must provide
+        property: ""              # optional, for JSON secrets
+        version: ""               # optional, required for Fake provider
+      refreshInterval: 1h
   readonlyUser:
     enabled: false
     # Name of the K8s Secret containing a "password" key for the readonly_user.

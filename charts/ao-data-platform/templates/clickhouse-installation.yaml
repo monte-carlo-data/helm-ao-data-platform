@@ -34,6 +34,20 @@ spec:
         - "GRANT CREATE TABLE, CREATE VIEW, ALTER, SELECT, INSERT, DROP, OPTIMIZE ON otel_traces.*"
         - "GRANT ALTER ON system.*"
         - "GRANT SYSTEM FLUSH LOGS ON *.*"
+      # llm_worker — the llm-worker Deployment. Reads the queue, appends results (no mutations).
+      llm_worker/password:
+        valueFrom:
+          secretKeyRef:
+            name: {{ .Values.clickhouse.llmWorkerUser.secret }}
+            key: password
+      llm_worker/networks/ip:
+        {{- toYaml .Values.clickhouse.llmWorkerUser.networksIp | nindent 8 }}
+      llm_worker/grants/query:
+        - "GRANT SELECT ON otel_traces.llm_batches"
+        - "GRANT SELECT ON otel_traces.llm_inputs"
+        - "GRANT SELECT ON otel_traces.llm_results"
+        - "GRANT INSERT ON otel_traces.llm_batches"
+        - "GRANT INSERT ON otel_traces.llm_results"
       {{- if .Values.clickhouse.readonlyUser.enabled }}
       readonly_user/password:
         valueFrom:
