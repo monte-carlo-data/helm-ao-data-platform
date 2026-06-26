@@ -87,6 +87,21 @@ spec:
       readonly_user/grants/query:
         {{- include "ao-data-platform.readerGrants" . | nindent 8 }}
       {{- end }}
+      {{- if .Values.clickhouse.adminUser.enabled }}
+      # admin — gated break-glass superuser: full access + user management + SYSTEM. Not for
+      # service-to-service. Defaults to loopback-only (adminUser.networksIp), so it's usable only
+      # by exec-ing into the pod.
+      admin/password:
+        valueFrom:
+          secretKeyRef:
+            name: {{ .Values.clickhouse.adminUser.secret }}
+            key: password
+      admin/networks/ip:
+        {{- toYaml .Values.clickhouse.adminUser.networksIp | nindent 8 }}
+      admin/access_management: "1"
+      admin/grants/query:
+        - "GRANT ALL ON *.* WITH GRANT OPTION"
+      {{- end }}
     {{- if .Values.clickhouse.readonlyUser.enabled }}
     profiles:
       # readonly=2 keeps the user SELECT-only but allows per-session SET; the
