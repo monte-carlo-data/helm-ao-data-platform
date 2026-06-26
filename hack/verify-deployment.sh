@@ -763,16 +763,29 @@ done
 pass "OTel Collector TLS certificates on ports 4317 and 4318 are valid and verified against the CA."
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Read-only credential for the schema/data checks below (CHECK 28+). These run as readonly_user,
+# so enable it (readonlyUser.enabled=true) to run this verification. Avoids the removed `default`
+# user and the write-scoped otel / schema_owner identities.
+# ─────────────────────────────────────────────────────────────────────────────
+CH_READ_USER="readonly_user"
+CH_READ_PW=$(kubectl get secret -n "$NS" ao-clickhouse-readonly-user-credentials \
+  -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || true)
+if [[ -z "$CH_READ_PW" ]]; then
+  fail "readonly_user credential not found — enable readonlyUser (readonlyUser.enabled=true) to run the ClickHouse data checks."
+fi
+echo -e "  ${YELLOW}▸ Using ClickHouse reader 'readonly_user' for schema/data checks${RESET}"
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CHECK 28 — ClickHouse database and schema
 # ─────────────────────────────────────────────────────────────────────────────
 banner "ClickHouse database 'otel_traces' and tables exist"
 
 run_cmd "Databases" \
   kubectl exec -n "$NS" "$CH_POD" -- \
-    clickhouse-client --query "SHOW DATABASES"
+    clickhouse-client --user "$CH_READ_USER" --password "$CH_READ_PW" --query "SHOW DATABASES"
 
 DB_EXISTS=$(kubectl exec -n "$NS" "$CH_POD" -- \
-  clickhouse-client --query "SELECT name FROM system.databases WHERE name='otel_traces'" 2>/dev/null)
+  clickhouse-client --user "$CH_READ_USER" --password "$CH_READ_PW" --query "SELECT name FROM system.databases WHERE name='otel_traces'" 2>/dev/null)
 
 if [[ -z "$DB_EXISTS" ]]; then
   fail "Database 'otel_traces' does not exist in ClickHouse."
@@ -780,11 +793,11 @@ fi
 
 run_cmd "Tables in otel_traces" \
   kubectl exec -n "$NS" "$CH_POD" -- \
-    clickhouse-client --query "SHOW TABLES FROM otel_traces"
+    clickhouse-client --user "$CH_READ_USER" --password "$CH_READ_PW" --query "SHOW TABLES FROM otel_traces"
 
 for TABLE in otel_traces otel_traces_trace_id_ts; do
   TABLE_EXISTS=$(kubectl exec -n "$NS" "$CH_POD" -- \
-    clickhouse-client --query "SELECT name FROM system.tables WHERE database='otel_traces' AND name='${TABLE}'" 2>/dev/null)
+    clickhouse-client --user "$CH_READ_USER" --password "$CH_READ_PW" --query "SELECT name FROM system.tables WHERE database='otel_traces' AND name='${TABLE}'" 2>/dev/null)
   if [[ -z "$TABLE_EXISTS" ]]; then
     fail "Table 'otel_traces.${TABLE}' does not exist."
   fi
@@ -792,7 +805,7 @@ done
 
 # Check materialized view
 MV_EXISTS=$(kubectl exec -n "$NS" "$CH_POD" -- \
-  clickhouse-client --query "SELECT name FROM system.tables WHERE database='otel_traces' AND name='otel_traces_trace_id_ts_mv'" 2>/dev/null)
+  clickhouse-client --user "$CH_READ_USER" --password "$CH_READ_PW" --query "SELECT name FROM system.tables WHERE database='otel_traces' AND name='otel_traces_trace_id_ts_mv'" 2>/dev/null)
 if [[ -z "$MV_EXISTS" ]]; then
   fail "Materialized view 'otel_traces.otel_traces_trace_id_ts_mv' does not exist."
 fi
@@ -907,10 +920,10 @@ sleep 8
 
 run_cmd "Query ClickHouse for trace ${TRACE_ID}" \
   kubectl exec -n "$NS" "$CH_POD" -- \
-    clickhouse-client --query "SELECT ServiceName, SpanName, TraceId FROM otel_traces.otel_traces WHERE TraceId = '${TRACE_ID}' LIMIT 5"
+    clickhouse-client --user "$CH_READ_USER" --password "$CH_READ_PW" --query "SELECT ServiceName, SpanName, TraceId FROM otel_traces.otel_traces WHERE TraceId = '${TRACE_ID}' LIMIT 5"
 
 SMOKE_RESULT=$(kubectl exec -n "$NS" "$CH_POD" -- \
-  clickhouse-client --query "SELECT count() FROM otel_traces.otel_traces WHERE TraceId = '${TRACE_ID}'" 2>/dev/null)
+  clickhouse-client --user "$CH_READ_USER" --password "$CH_READ_PW" --query "SELECT count() FROM otel_traces.otel_traces WHERE TraceId = '${TRACE_ID}'" 2>/dev/null)
 
 if [[ "$SMOKE_RESULT" -gt 0 ]] 2>/dev/null; then
   pass "Trace ${TRACE_ID} arrived in ClickHouse (${SMOKE_RESULT} row(s)). End-to-end pipeline is working."
@@ -969,10 +982,10 @@ EOJSON2
 
   run_cmd "Query ClickHouse for trace ${NLB_TRACE_ID}" \
     kubectl exec -n "$NS" "$CH_POD" -- \
-      clickhouse-client --query "SELECT ServiceName, SpanName, TraceId FROM otel_traces.otel_traces WHERE TraceId = '${NLB_TRACE_ID}' LIMIT 5"
+      clickhouse-client --user "$CH_READ_USER" --password "$CH_READ_PW" --query "SELECT ServiceName, SpanName, TraceId FROM otel_traces.otel_traces WHERE TraceId = '${NLB_TRACE_ID}' LIMIT 5"
 
   NLB_SMOKE_RESULT=$(kubectl exec -n "$NS" "$CH_POD" -- \
-    clickhouse-client --query "SELECT count() FROM otel_traces.otel_traces WHERE TraceId = '${NLB_TRACE_ID}'" 2>/dev/null)
+    clickhouse-client --user "$CH_READ_USER" --password "$CH_READ_PW" --query "SELECT count() FROM otel_traces.otel_traces WHERE TraceId = '${NLB_TRACE_ID}'" 2>/dev/null)
 
   if [[ "$NLB_SMOKE_RESULT" -gt 0 ]] 2>/dev/null; then
     pass "Trace ${NLB_TRACE_ID} sent via OTel NLB arrived in ClickHouse. NLB → OTel → ClickHouse pipeline is working."

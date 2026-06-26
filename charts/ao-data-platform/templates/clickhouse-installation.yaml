@@ -78,8 +78,14 @@ spec:
             name: {{ .Values.clickhouse.readonlyUser.secret }}
             key: password
       readonly_user/networks/ip:
-        - "0.0.0.0/0"
+        {{- toYaml .Values.clickhouse.readonlyUser.networksIp | nindent 8 }}
       readonly_user/profile: readonly_settings
+      # Shared reader bundle (same as monte_carlo's reads): otel_traces.* + the system /
+      # information_schema metadata reads DataGrip/MCP need. Going explicit removes the implicit
+      # all-DB read a config user would otherwise have; readonly=2 (above) stays orthogonal and
+      # governs SET, not table access.
+      readonly_user/grants/query:
+        {{- include "ao-data-platform.readerGrants" . | nindent 8 }}
       {{- end }}
     {{- if .Values.clickhouse.readonlyUser.enabled }}
     profiles:
