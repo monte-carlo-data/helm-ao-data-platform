@@ -98,7 +98,9 @@ spec:
             key: password
       admin/networks/ip:
         {{- toYaml .Values.clickhouse.adminUser.networksIp | nindent 8 }}
-      admin/access_management: "1"
+      # GRANT ALL includes the ACCESS MANAGEMENT privilege group (CREATE USER / GRANT / …), so a
+      # separate access_management setting is unnecessary — and ClickHouse rejects combining any
+      # legacy access-control setting (access_management) with config-level `grants`.
       admin/grants/query:
         - "GRANT ALL ON *.* WITH GRANT OPTION"
       {{- end }}
