@@ -79,6 +79,27 @@ clickhouse:
         property: ""              # optional, for JSON secrets
         version: ""               # optional, required for Fake provider
       refreshInterval: 1h
+  # monte_carlo — the Monte Carlo read-only service account (data-source monitoring) and the
+  # agent's LLM-queue producer. Reads everything via the shared reader bundle and appends to the
+  # queue (llm_inputs/llm_batches) + conversation_eval_scores. NOT a readonly-profile user — it
+  # needs INSERT, so its read-mostly shape is enforced by grants alone. Created by the
+  # ExternalSecret below. (The agent's credential is configured in the consuming application, not
+  # here — the chart only provisions the user + password.)
+  monteCarloUser:
+    secret: ao-clickhouse-monte-carlo-credentials
+    # CIDR list allowed to authenticate as monte_carlo (external callers: the agent + monitoring).
+    # Default open; tightening to the caller's real source is handled separately.
+    networksIp:
+      - "0.0.0.0/0"
+    externalSecret:
+      secretStoreRef:
+        name: ""                  # user must provide
+        kind: ClusterSecretStore
+      remoteRef:
+        key: ""                   # user must provide
+        property: ""              # optional, for JSON secrets
+        version: ""               # optional, required for Fake provider
+      refreshInterval: 1h
   readonlyUser:
     enabled: false
     # Name of the K8s Secret containing a "password" key for the readonly_user.
