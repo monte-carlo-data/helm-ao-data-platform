@@ -48,6 +48,21 @@ spec:
         - "GRANT SELECT ON otel_traces.llm_results"
         - "GRANT INSERT ON otel_traces.llm_batches"
         - "GRANT INSERT ON otel_traces.llm_results"
+      # monte_carlo — Monte Carlo read-only service account + agent queue producer. Shared reader
+      # bundle plus the queue/eval-score INSERTs. NO readonly profile: readonly=2 would block these
+      # INSERTs, so the read-mostly shape is enforced by grants alone.
+      monte_carlo/password:
+        valueFrom:
+          secretKeyRef:
+            name: {{ .Values.clickhouse.monteCarloUser.secret }}
+            key: password
+      monte_carlo/networks/ip:
+        {{- toYaml .Values.clickhouse.monteCarloUser.networksIp | nindent 8 }}
+      monte_carlo/grants/query:
+        {{- include "ao-data-platform.readerGrants" . | nindent 8 }}
+        - "GRANT INSERT ON otel_traces.llm_inputs"
+        - "GRANT INSERT ON otel_traces.llm_batches"
+        - "GRANT INSERT ON otel_traces.conversation_eval_scores"
       {{- if .Values.clickhouse.readonlyUser.enabled }}
       readonly_user/password:
         valueFrom:
