@@ -19,6 +19,14 @@ spec:
             key: password
       otel/networks/ip:
         {{- toYaml .Values.clickhouse.otelNetworksIp | nindent 8 }}
+      {{- if .Values.clickhouse.otel.restrictGrants }}
+      # otel (ingest) — restricted to INSERT on the telemetry source tables. The MV cascade runs
+      # as schema_owner (the MV DEFINER), so otel needs nothing on the normalized targets. Gated
+      # so it can stay broad until external readers have moved to monte_carlo, then be flipped on.
+      otel/grants/query:
+        - "GRANT INSERT ON otel_traces.otel_traces"
+        - "GRANT INSERT ON otel_traces.otel_metrics"
+      {{- end }}
       # schema_owner — DDL/owner identity for the schema Job and the persistent MV DEFINER.
       # Full DDL on otel_traces + ALTER on system.* (system-log TTLs) + SYSTEM FLUSH LOGS;
       # deliberately NO access management.
