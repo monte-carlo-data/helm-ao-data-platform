@@ -13,7 +13,7 @@ clickhouse:
   # trace-id timestamp index, and the normalized spans. The schema job re-applies
   # this on every install and upgrade via `ALTER TABLE … MODIFY TTL`, so changing
   # it here takes effect on existing tables (unlike the system-log TTLs); the SQL
-  # files carry the same value as their create-time default. The SaaS terraform
+  # files carry the same value as their create-time default. A consuming terraform
   # module's `clickhouse_ttl_days` variable maps onto this key.
   #
   # Scope: telemetry only. The llm_* tables are the LLM worker's job-queue state
@@ -42,6 +42,26 @@ clickhouse:
       property: ""                # optional, for JSON secrets
       version: ""                 # optional, required for Fake provider
     refreshInterval: 1h
+  # schema_owner — owns the schema and is the materialized-view DEFINER. Used by the
+  # schema-migration Job for all DDL (CREATE DATABASE/TABLE/VIEW/MV), the telemetry-table
+  # TTL ALTERs, the system-log TTL ALTERs, and SYSTEM FLUSH LOGS. Because the MVs run under
+  # this user as their DEFINER, it must persist with its grants for the normalization
+  # pipeline to keep writing. Created by the ExternalSecret below.
+  schemaOwner:
+    secret: ao-clickhouse-schema-owner-credentials
+    # CIDR list allowed to authenticate as schema_owner (in-cluster). Default open; tighten per
+    # environment as needed. Per-caller network scoping is handled separately.
+    networksIp:
+      - "0.0.0.0/0"
+    externalSecret:
+      secretStoreRef:
+        name: ""                  # user must provide
+        kind: ClusterSecretStore
+      remoteRef:
+        key: ""                   # user must provide
+        property: ""              # optional, for JSON secrets
+        version: ""               # optional, required for Fake provider
+      refreshInterval: 1h
   readonlyUser:
     enabled: false
     # Name of the K8s Secret containing a "password" key for the readonly_user.
