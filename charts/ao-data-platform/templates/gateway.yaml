@@ -1,0 +1,39 @@
+{{- if .Values.gateway.enabled }}
+# Managed AKS Gateway API edge (application routing add-on). One Gateway, two HTTPS
+# listeners terminating public TLS per-hostname for the collector and ClickHouse.
+# Backends are ClusterIP; the internal self-signed path is untouched.
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: {{ include "ao-data-platform.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ao-data-platform.labels" . | nindent 4 }}
+spec:
+  gatewayClassName: {{ required "gateway.className is required when gateway.enabled" .Values.gateway.className }}
+  listeners:
+    - name: otel
+      hostname: {{ required "gateway.otelHostname is required when gateway.enabled" .Values.gateway.otelHostname | quote }}
+      port: 443
+      protocol: HTTPS
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: gateway-otel-tls
+      allowedRoutes:
+        namespaces:
+          from: Same
+    - name: clickhouse
+      hostname: {{ required "gateway.clickhouseHostname is required when gateway.enabled" .Values.gateway.clickhouseHostname | quote }}
+      port: 8443
+      protocol: HTTPS
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: gateway-clickhouse-tls
+      allowedRoutes:
+        namespaces:
+          from: Same
+{{- end }}
