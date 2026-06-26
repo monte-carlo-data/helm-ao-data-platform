@@ -19,6 +19,21 @@ spec:
             key: password
       otel/networks/ip:
         {{- toYaml .Values.clickhouse.otelNetworksIp | nindent 8 }}
+      # schema_owner — DDL/owner identity for the schema Job and the persistent MV DEFINER.
+      # Full DDL on otel_traces + ALTER on system.* (system-log TTLs) + SYSTEM FLUSH LOGS;
+      # deliberately NO access management.
+      schema_owner/password:
+        valueFrom:
+          secretKeyRef:
+            name: {{ .Values.clickhouse.schemaOwner.secret }}
+            key: password
+      schema_owner/networks/ip:
+        {{- toYaml .Values.clickhouse.schemaOwner.networksIp | nindent 8 }}
+      schema_owner/grants/query:
+        - "GRANT CREATE DATABASE ON *.*"
+        - "GRANT CREATE TABLE, CREATE VIEW, ALTER, SELECT, INSERT, DROP, OPTIMIZE ON otel_traces.*"
+        - "GRANT ALTER ON system.*"
+        - "GRANT SYSTEM FLUSH LOGS ON *.*"
       {{- if .Values.clickhouse.readonlyUser.enabled }}
       readonly_user/password:
         valueFrom:
