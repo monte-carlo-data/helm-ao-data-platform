@@ -1,0 +1,68 @@
+{{- if and .Values.gateway.enabled .Values.gateway.backendTLS.enabled }}
+# Re-encrypt the Gateway→backend hop. The Gateway terminates the public cert, then
+# opens a fresh TLS connection to the (still self-signed) collector and ClickHouse,
+# validating their certs against the in-cluster CA — so the internal-TLS posture is
+# preserved end to end (mirrors the AWS NLB re-encrypt).
+#
+# The CA lives in the cert-manager-issued Secret `ao-data-platform-ca`, but a
+# BackendTLSPolicy can only reference a ConfigMap — so trust-manager mirrors the CA
+# into one. The TF module installs trust-manager with its trust namespace set to this
+# release's namespace, so the Secret source below is resolvable.
+apiVersion: trust.cert-manager.io/v1alpha1
+kind: Bundle
+metadata:
+  name: {{ include "ao-data-platform.fullname" . }}-ca-bundle
+  labels:
+    {{- include "ao-data-platform.labels" . | nindent 4 }}
+spec:
+  sources:
+    - secret:
+        name: ao-data-platform-ca
+        key: ca.crt
+  target:
+    configMap:
+      key: ca.crt
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: {{ .Release.Namespace }}
+---
+apiVersion: gateway.networking.k8s.io/v1alpha3
+kind: BackendTLSPolicy
+metadata:
+  name: {{ include "ao-data-platform.fullname" . }}-otel
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ao-data-platform.labels" . | nindent 4 }}
+spec:
+  targetRefs:
+    - group: ""
+      kind: Service
+      name: opentelemetry-collector
+      sectionName: otlp-http
+  validation:
+    hostname: opentelemetry-collector.{{ .Release.Namespace }}.svc.cluster.local
+    caCertificateRefs:
+      - group: ""
+        kind: ConfigMap
+        name: {{ include "ao-data-platform.fullname" . }}-ca-bundle
+---
+apiVersion: gateway.networking.k8s.io/v1alpha3
+kind: BackendTLSPolicy
+metadata:
+  name: {{ include "ao-data-platform.fullname" . }}-clickhouse
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ao-data-platform.labels" . | nindent 4 }}
+spec:
+  targetRefs:
+    - group: ""
+      kind: Service
+      name: clickhouse-otel
+      sectionName: https
+  validation:
+    hostname: clickhouse-otel.{{ .Release.Namespace }}.svc.cluster.local
+    caCertificateRefs:
+      - group: ""
+        kind: ConfigMap
+        name: {{ include "ao-data-platform.fullname" . }}-ca-bundle
+{{- end }}

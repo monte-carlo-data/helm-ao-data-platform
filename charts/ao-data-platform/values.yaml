@@ -198,6 +198,12 @@ gateway:
   # Public hostnames for the two listeners (must resolve to the Gateway's LB IP).
   otelHostname: ""
   clickhouseHostname: ""
+  # Re-encrypt the Gateway→backend hop and validate the backends' self-signed certs
+  # against the in-cluster CA (preserves the internal-TLS posture). Requires trust-
+  # manager (installed by the TF module) to sync the CA Secret into a ConfigMap, and
+  # its trust namespace set to this release's namespace.
+  backendTLS:
+    enabled: true
   tls:
     source: letsencrypt # letsencrypt | keyvault
     letsencrypt:
