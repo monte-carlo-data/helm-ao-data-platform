@@ -33,6 +33,13 @@ clickhouse:
   # (otel → pod CIDR, separate reader/admin users) is a planned follow-up.
   otelNetworksIp:
     - "0.0.0.0/0"
+  otel:
+    # When true, otel is restricted (via config grants) to INSERT on the telemetry source tables
+    # only — the least-privilege ingest role for the OTel collector. The MV cascade runs as
+    # schema_owner (the MV DEFINER), so otel needs nothing on the normalized targets. Default
+    # false keeps otel broad (implicit full access) so it can be enabled in a later step, once any
+    # external readers have moved to the monte_carlo user and the MVs are reparented onto schema_owner.
+    restrictGrants: false
   externalSecret:
     secretStoreRef:
       name: ""                    # user must provide
@@ -222,8 +229,8 @@ opentelemetry-collector:
         - sh
         - -c
         - |
-          echo "Waiting for otel_traces database..."
-          until clickhouse-client --host clickhouse-otel --user otel --password "${CLICKHOUSE_PASSWORD}" --secure --port 9440 --query "SELECT 1 FROM system.databases WHERE name='otel_traces'" 2>/dev/null | grep -q 1; do
+          echo "Waiting for otel_traces.otel_traces table..."
+          until clickhouse-client --host clickhouse-otel --user otel --password "${CLICKHOUSE_PASSWORD}" --secure --port 9440 --query "EXISTS TABLE otel_traces.otel_traces" 2>/dev/null | grep -q 1; do
             sleep 2
           done
           echo "Database ready."
