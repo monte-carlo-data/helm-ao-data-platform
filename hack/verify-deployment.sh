@@ -834,6 +834,89 @@ fi
 pass "ClickHouse 'otel' user authenticated successfully."
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ClickHouse least-privilege user model
+#
+# Each user authenticates and holds the expected grants, and the security-critical
+# denials are enforced. Queries run as each user over the pod's local port via
+# `kubectl exec`, so this works while the users' networks/ip include loopback (the
+# default). Once per-caller network scoping restricts a user to specific external
+# CIDRs, the loopback path stops working for that user and these checks must move to
+# the Service endpoint.
+# ─────────────────────────────────────────────────────────────────────────────
+banner "ClickHouse least-privilege user model"
+
+# Both tolerate non-zero (set -euo pipefail is on): callers inspect the *output*, not the exit
+# status — a missing secret yields "" and a denied query yields the error text, so the explicit
+# guards/assertions below fire and print instead of the script dying silently mid-check.
+ch_pw() { kubectl get secret -n "$NS" "$1" -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || true; }
+ch_as() { kubectl exec -n "$NS" "$CH_POD" -- clickhouse-client --user "$1" --password "$2" --query "$3" </dev/null 2>&1 || true; }
+
+expect_grant() {  # label user pw needle
+  if ch_as "$2" "$3" "SHOW GRANTS" | grep -qiF "$4"; then pass "$1"; else fail "$1 — expected grant missing: $4"; fi
+}
+forbid_grant() {  # label user pw needle
+  if ch_as "$2" "$3" "SHOW GRANTS" | grep -qiF "$4"; then fail "$1 — unexpected grant present: $4"; else pass "$1"; fi
+}
+expect_ok() {     # label user pw sql
+  local o; o=$(ch_as "$2" "$3" "$4")
+  if echo "$o" | grep -qiE "exception|access_denied|not enough priv"; then fail "$1 — $o"; else pass "$1"; fi
+}
+expect_denied() { # label user pw sql
+  if ch_as "$2" "$3" "$4" | grep -q "ACCESS_DENIED"; then pass "$1"; else fail "$1 — expected ACCESS_DENIED"; fi
+}
+
+SO_PW=$(ch_pw ao-clickhouse-schema-owner-credentials)
+WK_PW=$(ch_pw ao-clickhouse-llm-worker-credentials)
+MC_PW=$(ch_pw ao-clickhouse-monte-carlo-credentials)
+AD_PW=$(ch_pw ao-clickhouse-admin-credentials)
+# otel password = $CH_PASSWORD (above); readonly_user = $CH_READ_PW (reader block).
+for s in "$SO_PW" "$WK_PW" "$MC_PW"; do
+  [[ -z "$s" ]] && fail "A per-user secret (schema_owner/llm_worker/monte_carlo) is missing — this cluster predates the least-privilege user model (chart not yet migrated)."
+done
+
+# schema_owner — owns the schema (DDL).
+expect_grant "schema_owner holds DDL on otel_traces" schema_owner "$SO_PW" "CREATE TABLE"
+
+# llm_worker — queue read/write only; must NOT read telemetry.
+expect_ok     "llm_worker reads the queue"        llm_worker "$WK_PW" "SELECT count() FROM otel_traces.llm_batches"
+expect_denied "llm_worker cannot read telemetry"  llm_worker "$WK_PW" "SELECT count() FROM otel_traces.spans_normalized"
+
+# monte_carlo — reads everything + produces to the queue, but must NOT write telemetry.
+expect_ok    "monte_carlo reads telemetry"          monte_carlo "$MC_PW" "SELECT count() FROM otel_traces.spans_normalized"
+expect_grant "monte_carlo can produce to the queue" monte_carlo "$MC_PW" "INSERT ON otel_traces.llm_inputs"
+forbid_grant "monte_carlo cannot write telemetry"   monte_carlo "$MC_PW" "INSERT ON otel_traces.otel_traces"
+
+# readonly_user — SELECT-only.
+expect_ok    "readonly_user reads telemetry" readonly_user "$CH_READ_PW" "SELECT count() FROM otel_traces.spans_normalized"
+forbid_grant "readonly_user is SELECT-only"  readonly_user "$CH_READ_PW" "INSERT"
+
+# otel — always an ingester; its grant shape varies by state, so just report whether
+# it has been tightened to INSERT-only (post-cutover) or is still broad (pre-cutover).
+if ch_as otel "$CH_PASSWORD" "SELECT count() FROM otel_traces.otel_traces" | grep -q "ACCESS_DENIED"; then
+  pass "otel is INSERT-only (restrictGrants enabled)"
+else
+  echo -e "  ${YELLOW}⚠ otel can still read telemetry — restrictGrants not yet enabled (expected pre-cutover)${RESET}"
+fi
+
+# admin — only when enabled; superuser, reachable over loopback (this exec is loopback).
+if [[ -n "$AD_PW" ]]; then
+  expect_grant "admin is a superuser" admin "$AD_PW" "GRANT ALL ON *.*"
+else
+  echo -e "  ${YELLOW}▸ admin user not enabled — skipping${RESET}"
+fi
+
+# Materialized views must run under schema_owner as their DEFINER.
+for mv in otel_traces_trace_id_ts_mv spans_normalized_mv conversations_normalized_mv; do
+  if ch_as schema_owner "$SO_PW" "SHOW CREATE TABLE otel_traces.$mv" | grep -q "DEFINER = schema_owner"; then
+    pass "MV $mv runs as schema_owner (DEFINER)"
+  else
+    fail "MV $mv is not owned by schema_owner — the normalization cascade will break once otel is restricted"
+  fi
+done
+
+pass "ClickHouse least-privilege user model verified."
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CHECK 30 — OTel Collector health check
 # ─────────────────────────────────────────────────────────────────────────────
 banner "OTel Collector health check endpoint responds"
