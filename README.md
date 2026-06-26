@@ -61,7 +61,9 @@ helm install external-secrets external-secrets/external-secrets \
 
 ### 4. Create a Fake ClusterSecretStore
 
-For local development, use the ESO Fake provider to generate a random password:
+For local development, use the ESO Fake provider. The chart always provisions the `otel`,
+`schema_owner`, `llm_worker`, and `monte_carlo` users, so seed a key for each (one shared
+dev password is fine here):
 
 ```bash
 CLICKHOUSE_PASSWORD="$(openssl rand -base64 16)"
@@ -78,6 +80,15 @@ spec:
         - key: clickhouse-otel-password
           value: "${CLICKHOUSE_PASSWORD}"
           version: "v1"
+        - key: clickhouse-schema-owner-password
+          value: "${CLICKHOUSE_PASSWORD}"
+          version: "v1"
+        - key: clickhouse-llm-worker-password
+          value: "${CLICKHOUSE_PASSWORD}"
+          version: "v1"
+        - key: clickhouse-monte-carlo-password
+          value: "${CLICKHOUSE_PASSWORD}"
+          version: "v1"
 EOF
 ```
 
@@ -89,14 +100,25 @@ helm dependency build charts/ao-data-platform/
 
 ### 6. Install the chart
 
-Wire the chart's `ExternalSecret` at the Fake store created above, and point the
-`llm-worker` at a worker image:
+Wire an `ExternalSecret` for each always-provisioned user at the Fake store, and point the
+`llm-worker` at a worker image. (`readonly_user` and `admin` are off by default; enable and
+wire them the same way under `clickhouse.readonlyUser` / `clickhouse.adminUser` if you need
+them.)
 
 ```bash
 helm upgrade --install ao-data-platform charts/ao-data-platform/ -n montecarlo --create-namespace \
   --set clickhouse.externalSecret.secretStoreRef.name=fake-secret-store \
   --set clickhouse.externalSecret.remoteRef.key=clickhouse-otel-password \
   --set clickhouse.externalSecret.remoteRef.version=v1 \
+  --set clickhouse.schemaOwner.externalSecret.secretStoreRef.name=fake-secret-store \
+  --set clickhouse.schemaOwner.externalSecret.remoteRef.key=clickhouse-schema-owner-password \
+  --set clickhouse.schemaOwner.externalSecret.remoteRef.version=v1 \
+  --set clickhouse.llmWorkerUser.externalSecret.secretStoreRef.name=fake-secret-store \
+  --set clickhouse.llmWorkerUser.externalSecret.remoteRef.key=clickhouse-llm-worker-password \
+  --set clickhouse.llmWorkerUser.externalSecret.remoteRef.version=v1 \
+  --set clickhouse.monteCarloUser.externalSecret.secretStoreRef.name=fake-secret-store \
+  --set clickhouse.monteCarloUser.externalSecret.remoteRef.key=clickhouse-monte-carlo-password \
+  --set clickhouse.monteCarloUser.externalSecret.remoteRef.version=v1 \
   --set llmWorker.image.repository=montecarlodata/ao-llm-worker \
   --set llmWorker.image.tag=latest
 ```
@@ -138,18 +160,31 @@ Supply environment-specific configuration in your own values file (referred to b
 `my-values.yaml`) and pass it with `-f`. The chart ships only `values.yaml` (defaults); it
 does not bundle environment overlays.
 
-### 1. Configure the ExternalSecret
+### 1. Configure the ExternalSecrets
 
-Point the chart's `ExternalSecret` at your AWS Secrets Manager `ClusterSecretStore`:
+Point an `ExternalSecret` for each always-provisioned user (`otel`, `schema_owner`,
+`llm_worker`, `monte_carlo`) at your AWS Secrets Manager `ClusterSecretStore`. Each user's
+`secretStoreRef.name` and `remoteRef.key` are required. (`readonly_user` and `admin` are off
+by default — enable and wire them the same way under `clickhouse.readonlyUser` /
+`clickhouse.adminUser` if needed.)
 
 ```yaml
 clickhouse:
-  externalSecret:
-    secretStoreRef:
-      name: aws-secretsmanager     # name of your ClusterSecretStore
-      kind: ClusterSecretStore
-    remoteRef:
-      key: ao/clickhouse-otel-password  # AWS Secrets Manager secret name
+  externalSecret:                                  # otel
+    secretStoreRef: {name: aws-secretsmanager, kind: ClusterSecretStore}
+    remoteRef: {key: ao/clickhouse-otel-password}  # AWS Secrets Manager secret name
+  schemaOwner:
+    externalSecret:
+      secretStoreRef: {name: aws-secretsmanager, kind: ClusterSecretStore}
+      remoteRef: {key: ao/clickhouse-schema-owner-password}
+  llmWorkerUser:
+    externalSecret:
+      secretStoreRef: {name: aws-secretsmanager, kind: ClusterSecretStore}
+      remoteRef: {key: ao/clickhouse-llm-worker-password}
+  monteCarloUser:
+    externalSecret:
+      secretStoreRef: {name: aws-secretsmanager, kind: ClusterSecretStore}
+      remoteRef: {key: ao/clickhouse-monte-carlo-password}
 ```
 
 ### 2. Configure ACM certificate ARNs
@@ -228,6 +263,9 @@ by `monte_carlo` and `readonly_user`.
 Each password-backed user has an ExternalSecret sourcing its password from your secret store (see the
 per-user `*.externalSecret` values below). Network *reachability* is typically restricted one layer
 up at the load balancer; per-caller CH-user-level network scoping is handled separately.
+
+`hack/verify-deployment.sh` runs its ClickHouse data checks as `readonly_user`, so set
+`clickhouse.readonlyUser.enabled=true` to use the script.
 
 ## Configuration
 
