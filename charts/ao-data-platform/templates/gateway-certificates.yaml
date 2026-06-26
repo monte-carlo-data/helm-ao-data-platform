@@ -11,7 +11,9 @@ metadata:
 spec:
   acme:
     server: {{ .Values.gateway.tls.letsencrypt.server }}
-    email: {{ required "gateway.tls.letsencrypt.email is required" .Values.gateway.tls.letsencrypt.email | quote }}
+    {{- with .Values.gateway.tls.letsencrypt.email }}
+    email: {{ . | quote }}  # optional ACME contact; omitted registers a contactless account
+    {{- end }}
     privateKeySecretRef:
       name: {{ include "ao-data-platform.fullname" . }}-letsencrypt-account-key
     solvers:
