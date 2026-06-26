@@ -186,6 +186,29 @@ tls:
     #   name: my-issuer
     #   kind: Issuer  # or ClusterIssuer
 
+# Public TLS termination via the managed AKS Gateway API (application routing add-on).
+# Opt-in and Azure-specific: when enabled, a single Gateway terminates public TLS for
+# the collector + ClickHouse (ClusterIP backends) at per-hostname HTTPS listeners. The
+# internal self-signed path (tls.* above) is untouched. Disabled by default → AWS and
+# any non-gateway install are unaffected. The Terraform module enables the add-on and
+# supplies the cert-manager Workload Identity used by the Let's Encrypt DNS-01 solver.
+gateway:
+  enabled: false
+  className: approuting-istio
+  # Public hostnames for the two listeners (must resolve to the Gateway's LB IP).
+  otelHostname: ""
+  clickhouseHostname: ""
+  tls:
+    source: letsencrypt # letsencrypt | keyvault
+    letsencrypt:
+      email: ""
+      server: https://acme-v02.api.letsencrypt.org/directory
+      azureDNS:
+        hostedZoneName: ""
+        resourceGroupName: ""
+        subscriptionID: ""
+        managedIdentityClientID: "" # cert-manager Workload Identity (from the TF module)
+
 # Altinity ClickHouse Operator
 altinity-clickhouse-operator:
   fullnameOverride: clickhouse-operator

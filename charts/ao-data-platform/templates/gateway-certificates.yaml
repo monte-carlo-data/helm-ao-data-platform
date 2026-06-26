@@ -1,0 +1,56 @@
+{{- if and .Values.gateway.enabled (eq .Values.gateway.tls.source "letsencrypt") }}
+# Let's Encrypt (DNS-01 via Azure DNS) certs for the two Gateway listeners. The
+# cert-manager Workload Identity referenced here is created by the Terraform module.
+# (BYO Key Vault certs are the alternative tls.source — see the module/docs.)
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: {{ include "ao-data-platform.fullname" . }}-letsencrypt-dns01
+  labels:
+    {{- include "ao-data-platform.labels" . | nindent 4 }}
+spec:
+  acme:
+    server: {{ .Values.gateway.tls.letsencrypt.server }}
+    email: {{ required "gateway.tls.letsencrypt.email is required" .Values.gateway.tls.letsencrypt.email | quote }}
+    privateKeySecretRef:
+      name: {{ include "ao-data-platform.fullname" . }}-letsencrypt-account-key
+    solvers:
+      - dns01:
+          azureDNS:
+            hostedZoneName: {{ required "gateway.tls.letsencrypt.azureDNS.hostedZoneName is required" .Values.gateway.tls.letsencrypt.azureDNS.hostedZoneName | quote }}
+            resourceGroupName: {{ required "gateway.tls.letsencrypt.azureDNS.resourceGroupName is required" .Values.gateway.tls.letsencrypt.azureDNS.resourceGroupName | quote }}
+            subscriptionID: {{ required "gateway.tls.letsencrypt.azureDNS.subscriptionID is required" .Values.gateway.tls.letsencrypt.azureDNS.subscriptionID | quote }}
+            environment: AzurePublicCloud
+            managedIdentity:
+              clientID: {{ required "gateway.tls.letsencrypt.azureDNS.managedIdentityClientID is required" .Values.gateway.tls.letsencrypt.azureDNS.managedIdentityClientID | quote }}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: gateway-otel-tls
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ao-data-platform.labels" . | nindent 4 }}
+spec:
+  secretName: gateway-otel-tls
+  dnsNames:
+    - {{ .Values.gateway.otelHostname | quote }}
+  issuerRef:
+    name: {{ include "ao-data-platform.fullname" . }}-letsencrypt-dns01
+    kind: ClusterIssuer
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: gateway-clickhouse-tls
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ao-data-platform.labels" . | nindent 4 }}
+spec:
+  secretName: gateway-clickhouse-tls
+  dnsNames:
+    - {{ .Values.gateway.clickhouseHostname | quote }}
+  issuerRef:
+    name: {{ include "ao-data-platform.fullname" . }}-letsencrypt-dns01
+    kind: ClusterIssuer
+{{- end }}
