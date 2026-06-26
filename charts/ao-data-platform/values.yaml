@@ -27,10 +27,10 @@ clickhouse:
   # Name of the K8s Secret containing a "password" key for the otel user.
   # This secret is created by the ExternalSecret below.
   otelSecret: ao-clickhouse-otel-credentials
-  # CIDR list allowed to authenticate as the otel user. Default is open
-  # (matches CH's default user model); the SaaS-deployed terraform module
-  # overrides this with the deployment's VPC CIDR. Per-user tightening
-  # (otel → pod CIDR, separate reader/admin users) is a planned follow-up.
+  # CIDR list allowed to authenticate as the otel user. Default is open. Network reachability is
+  # typically restricted one layer up at the load balancer's source ranges (set by the deploying
+  # environment); this CH-user-level list is independent of that. Per-caller CH-level network
+  # scoping (otel → pod CIDR, etc.) is handled separately.
   otelNetworksIp:
     - "0.0.0.0/0"
   otel:
