@@ -11,24 +11,26 @@ spec:
         layout:
           shardsCount: 1
           replicasCount: 1
+    # Adding a ClickHouse user? Also update values.yaml and templates/external-secret.yaml.
     users:
       otel/password:
         valueFrom:
           secretKeyRef:
-            name: {{ .Values.clickhouse.otelSecret }}
+            name: {{ .Values.clickhouse.otel.secret }}
             key: password
       otel/networks/ip:
-        {{- toYaml .Values.clickhouse.otelNetworksIp | nindent 8 }}
+        {{- toYaml .Values.clickhouse.otel.networksIp | nindent 8 }}
       {{- if .Values.clickhouse.otel.restrictGrants }}
       # otel (ingest) — restricted to INSERT on the telemetry source tables. The MV cascade runs
       # as schema_owner (the MV DEFINER), so otel needs nothing on the normalized targets. Gated
       # so it can stay broad until external readers have moved to monte_carlo, then be flipped on.
       otel/grants/query:
         - "GRANT INSERT ON otel_traces.otel_traces"
+        # otel_metrics is created at runtime by the collector's metrics exporter (not the schema Job), hence no SQL file.
         - "GRANT INSERT ON otel_traces.otel_metrics"
       {{- end }}
       # schema_owner — DDL/owner identity for the schema Job and the persistent MV DEFINER.
-      # Full DDL on otel_traces + ALTER on system.* (system-log TTLs) + SYSTEM FLUSH LOGS;
+      # Full DDL on otel_traces + ALTER on specific system-log tables (TTLs) + SYSTEM FLUSH LOGS;
       # deliberately NO access management.
       schema_owner/password:
         valueFrom:
@@ -38,9 +40,21 @@ spec:
       schema_owner/networks/ip:
         {{- toYaml .Values.clickhouse.schemaOwner.networksIp | nindent 8 }}
       schema_owner/grants/query:
+        # CREATE DATABASE cannot be scoped to a single database in ClickHouse — it is irreducibly
+        # global. A future reader should not attempt to narrow this to a specific database.
         - "GRANT CREATE DATABASE ON *.*"
         - "GRANT CREATE TABLE, CREATE VIEW, ALTER, SELECT, INSERT, DROP, OPTIMIZE ON otel_traces.*"
-        - "GRANT ALTER ON system.*"
+        # ALTER granted only on the specific system-log tables whose TTLs the schema Job manages
+        # (ALTER TABLE system.<log> MODIFY TTL). Derived from the modify_ttl_if_exists calls in
+        # templates/schema-job.yaml. Do not widen back to system.* — that would include system
+        # tables the schema Job never touches.
+        - "GRANT ALTER ON system.query_log"
+        - "GRANT ALTER ON system.query_thread_log"
+        - "GRANT ALTER ON system.query_views_log"
+        - "GRANT ALTER ON system.part_log"
+        - "GRANT ALTER ON system.trace_log"
+        - "GRANT ALTER ON system.metric_log"
+        - "GRANT ALTER ON system.text_log"
         - "GRANT SYSTEM FLUSH LOGS ON *.*"
       # llm_worker — the llm-worker Deployment. Reads the queue, appends results (no mutations).
       llm_worker/password:
@@ -71,22 +85,6 @@ spec:
         - "GRANT INSERT ON otel_traces.llm_inputs"
         - "GRANT INSERT ON otel_traces.llm_batches"
         - "GRANT INSERT ON otel_traces.conversation_eval_scores"
-      {{- if .Values.clickhouse.readonlyUser.enabled }}
-      readonly_user/password:
-        valueFrom:
-          secretKeyRef:
-            name: {{ .Values.clickhouse.readonlyUser.secret }}
-            key: password
-      readonly_user/networks/ip:
-        {{- toYaml .Values.clickhouse.readonlyUser.networksIp | nindent 8 }}
-      readonly_user/profile: readonly_settings
-      # Shared reader bundle (same as monte_carlo's reads): otel_traces.* + the system /
-      # information_schema metadata reads DataGrip/MCP need. Going explicit removes the implicit
-      # all-DB read a config user would otherwise have; readonly=2 (above) stays orthogonal and
-      # governs SET, not table access.
-      readonly_user/grants/query:
-        {{- include "ao-data-platform.readerGrants" . | nindent 8 }}
-      {{- end }}
       {{- if .Values.clickhouse.adminUser.enabled }}
       # admin — gated break-glass superuser: full access + user management + SYSTEM. Not for
       # service-to-service. Defaults to loopback-only (adminUser.networksIp), so it's usable only
@@ -103,6 +101,22 @@ spec:
       # legacy access-control setting (access_management) with config-level `grants`.
       admin/grants/query:
         - "GRANT ALL ON *.* WITH GRANT OPTION"
+      {{- end }}
+      {{- if .Values.clickhouse.readonlyUser.enabled }}
+      readonly_user/password:
+        valueFrom:
+          secretKeyRef:
+            name: {{ .Values.clickhouse.readonlyUser.secret }}
+            key: password
+      readonly_user/networks/ip:
+        {{- toYaml .Values.clickhouse.readonlyUser.networksIp | nindent 8 }}
+      readonly_user/profile: readonly_settings
+      # Shared reader bundle (same as monte_carlo's reads): otel_traces.* + the system /
+      # information_schema metadata reads DataGrip/MCP need. Going explicit removes the implicit
+      # all-DB read a config user would otherwise have; readonly=2 (above) stays orthogonal and
+      # governs SET, not table access.
+      readonly_user/grants/query:
+        {{- include "ao-data-platform.readerGrants" . | nindent 8 }}
       {{- end }}
     {{- if .Values.clickhouse.readonlyUser.enabled }}
     profiles:

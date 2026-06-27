@@ -109,9 +109,9 @@ them.)
 
 ```bash
 helm upgrade --install ao-data-platform charts/ao-data-platform/ -n montecarlo --create-namespace \
-  --set clickhouse.externalSecret.secretStoreRef.name=fake-secret-store \
-  --set clickhouse.externalSecret.remoteRef.key=clickhouse-otel-password \
-  --set clickhouse.externalSecret.remoteRef.version=v1 \
+  --set clickhouse.otel.externalSecret.secretStoreRef.name=fake-secret-store \
+  --set clickhouse.otel.externalSecret.remoteRef.key=clickhouse-otel-password \
+  --set clickhouse.otel.externalSecret.remoteRef.version=v1 \
   --set clickhouse.schemaOwner.externalSecret.secretStoreRef.name=fake-secret-store \
   --set clickhouse.schemaOwner.externalSecret.remoteRef.key=clickhouse-schema-owner-password \
   --set clickhouse.schemaOwner.externalSecret.remoteRef.version=v1 \
@@ -251,8 +251,8 @@ to the normalized target tables. The stock `default` superuser is removed.
 
 | User | Reads | Writes | Used by | Provisioned |
 |------|-------|--------|---------|-------------|
-| `schema_owner` | `otel_traces.*` + `system` | full DDL on `otel_traces.*`, `ALTER system.*`, `SYSTEM FLUSH LOGS` | schema-migration Job; the MV `DEFINER` | always |
-| `otel` | — | `INSERT` on the telemetry source tables when `clickhouse.otel.restrictGrants=true` (otherwise unrestricted) | OTel collector | always |
+| `schema_owner` | `otel_traces.*` | full DDL on `otel_traces.*`, `ALTER system.*`, `SYSTEM FLUSH LOGS` | schema-migration Job; the MV `DEFINER` | always |
+| `otel` | full read (`restrictGrants=false`, default); `—` when `restrictGrants=true` | `INSERT` on the telemetry source tables when `clickhouse.otel.restrictGrants=true` (otherwise unrestricted) | OTel collector | always |
 | `llm_worker` | `llm_batches`/`llm_inputs`/`llm_results` | `INSERT` on `llm_batches`/`llm_results` | llm-worker Deployment | always |
 | `monte_carlo` | reader bundle¹ | `INSERT` on `llm_inputs`/`llm_batches`/`conversation_eval_scores` | Monte Carlo (data-source monitoring + agent observability) | always |
 | `readonly_user` | reader bundle¹ | — (`readonly=2`, so JDBC `SET` works) | humans / MCP / JDBC clients | `clickhouse.readonlyUser.enabled=true` |
@@ -262,12 +262,84 @@ to the normalized target tables. The stock `default` superuser is removed.
 `information_schema.*` — the metadata reads JDBC/MCP clients and Monte Carlo monitoring need. Shared
 by `monte_carlo` and `readonly_user`.
 
+² **`otel_metrics`** (`otel_traces.otel_metrics`) is created at runtime by the OTel collector's
+metrics exporter, not by the schema migration Job. It has no SQL file under `charts/.../sql/`; the
+`INSERT` grant on it is provisioned unconditionally, and the table appears once the collector has
+written its first metrics payload.
+
 Each password-backed user has an ExternalSecret sourcing its password from your secret store (see the
 per-user `*.externalSecret` values below). Network *reachability* is typically restricted one layer
 up at the load balancer; per-caller CH-user-level network scoping is handled separately.
 
 `hack/verify-deployment.sh` runs its ClickHouse data checks as `readonly_user`, so set
 `clickhouse.readonlyUser.enabled=true` to use the script.
+
+### Upgrading an existing install (1.x → 2.0.0)
+
+Chart `2.0.0` is a **breaking major release**. Running `helm upgrade` from a 1.x single-user
+install without the steps below will error immediately — complete them first.
+
+#### 1. Update your values file — renamed keys
+
+The `otel`-user values keys were reorganised into a nested shape. Update any existing values file
+or `--set` overrides:
+
+| Old key (1.x) | New key (2.0.0) |
+|---|---|
+| `clickhouse.otelSecret` | `clickhouse.otel.secret` |
+| `clickhouse.otelNetworksIp` | `clickhouse.otel.networksIp` |
+| `clickhouse.externalSecret.*` | `clickhouse.otel.externalSecret.*` |
+
+Example (AWS Secrets Manager):
+
+```yaml
+clickhouse:
+  otel:
+    externalSecret:
+      secretStoreRef: {name: aws-secretsmanager, kind: ClusterSecretStore}
+      remoteRef: {key: ao/clickhouse-otel-password}
+```
+
+#### 2. Provision secrets and wire ExternalSecrets for the new users
+
+2.0.0 always provisions four users: `otel`, `schema_owner`, `llm_worker`, and `monte_carlo`. Create
+secrets in your backend for each and add their ExternalSecret blocks to your values file
+(see the "Configure the ExternalSecrets" step in the EKS walkthrough above for the full shape).
+
+#### 3. Deploy Release A — backward-compatible
+
+Set `clickhouse.otel.restrictGrants: false` (the default) and upgrade:
+
+```bash
+helm upgrade ao-data-platform oci://registry-1.docker.io/montecarlodata/ao-data-platform \
+  --version 2.0.0 -n montecarlo -f my-values.yaml
+```
+
+The `0014` MV-DEFINER reparent migration runs automatically as part of the schema Job. At this
+point all four users are live; `otel` still has unrestricted access so existing readers are
+unaffected.
+
+#### 4. Switch the Monte Carlo integration credential
+
+In your Monte Carlo environment, update the ClickHouse data-source credential from the `otel` user
+to the new `monte_carlo` user. Verify that dashboards and monitors are working before continuing.
+
+#### 5. Deploy Release B — lock down `otel`
+
+Once all external readers have moved to `monte_carlo`, set `restrictGrants: true` and redeploy:
+
+```yaml
+clickhouse:
+  otel:
+    restrictGrants: true
+```
+
+```bash
+helm upgrade ao-data-platform oci://registry-1.docker.io/montecarlodata/ao-data-platform \
+  --version 2.0.0 -n montecarlo -f my-values.yaml
+```
+
+`otel` is now INSERT-only. The upgrade is complete.
 
 ## Configuration
 
@@ -277,28 +349,28 @@ up at the load balancer; per-caller CH-user-level network scoping is handled sep
 | `clickhouse.ttlDays` | `30` | Retention in days for the telemetry tables (raw traces, trace-id index, normalized spans). Re-applied on every install/upgrade via `ALTER TABLE … MODIFY TTL`. Does **not** govern the `llm_*` worker queue tables (they keep a fixed TTL). See the telemetry-retention note above. |
 | `clickhouse.nodeSelector` | `{}` | Node selector for the ClickHouse pod (wired into the CHI's `podTemplate`) |
 | `clickhouse.tolerations` | `[]` | Tolerations for the ClickHouse pod (wired into the CHI's `podTemplate`) |
-| `clickhouse.otelSecret` | `ao-clickhouse-otel-credentials` | Name of the K8s Secret (created by ESO) with a `password` key |
-| `clickhouse.otelNetworksIp` | `["0.0.0.0/0"]` | CIDR list allowed to authenticate as the `otel` user (default open). Reachability is typically restricted at the load balancer; per-caller CH-level scoping is handled separately. |
+| `clickhouse.otel.secret` | `ao-clickhouse-otel-credentials` | Name of the K8s Secret (created by ESO) with a `password` key |
+| `clickhouse.otel.networksIp` | `["0.0.0.0/0"]` | CIDR list allowed to authenticate as the `otel` user (default open). Reachability is typically restricted at the load balancer; per-caller CH-level scoping is handled separately. |
 | `clickhouse.otel.restrictGrants` | `false` | When `true`, restrict `otel` to `INSERT` on the telemetry source tables (least-privilege ingest). Leave `false` until external readers have been switched to `monte_carlo`. |
-| `clickhouse.externalSecret.secretStoreRef.name` | `""` | Name of the `SecretStore` or `ClusterSecretStore` to use (for the `otel` password) |
-| `clickhouse.externalSecret.secretStoreRef.kind` | `ClusterSecretStore` | Kind of the secret store reference |
-| `clickhouse.externalSecret.remoteRef.key` | `""` | Key in the external secrets backend |
-| `clickhouse.externalSecret.remoteRef.property` | `""` | Property within a JSON secret (optional) |
-| `clickhouse.externalSecret.remoteRef.version` | `""` | Version of the secret (required for Fake provider) |
-| `clickhouse.externalSecret.refreshInterval` | `1h` | How often ESO syncs the secret |
+| `clickhouse.otel.externalSecret.secretStoreRef.name` | `""` | Name of the `SecretStore` or `ClusterSecretStore` to use (for the `otel` password) |
+| `clickhouse.otel.externalSecret.secretStoreRef.kind` | `ClusterSecretStore` | Kind of the secret store reference |
+| `clickhouse.otel.externalSecret.remoteRef.key` | `""` | Key in the external secrets backend |
+| `clickhouse.otel.externalSecret.remoteRef.property` | `""` | Property within a JSON secret (optional) |
+| `clickhouse.otel.externalSecret.remoteRef.version` | `""` | Version of the secret (required for Fake provider) |
+| `clickhouse.otel.externalSecret.refreshInterval` | `1h` | How often ESO syncs the secret |
 | `clickhouse.schemaOwner.secret` | `ao-clickhouse-schema-owner-credentials` | K8s Secret (ESO) for the always-provisioned `schema_owner` user. |
 | `clickhouse.schemaOwner.networksIp` | `["0.0.0.0/0"]` | CIDRs allowed to authenticate as `schema_owner`. |
-| `clickhouse.schemaOwner.externalSecret.*` | — | ExternalSecret config for `schema_owner` (same shape as `clickhouse.externalSecret.*`). |
+| `clickhouse.schemaOwner.externalSecret.*` | — | ExternalSecret config for `schema_owner` (same shape as `clickhouse.otel.externalSecret.*`). |
 | `clickhouse.llmWorkerUser.secret` | `ao-clickhouse-llm-worker-credentials` | K8s Secret (ESO) for the always-provisioned `llm_worker` user. |
 | `clickhouse.llmWorkerUser.networksIp` | `["0.0.0.0/0"]` | CIDRs allowed to authenticate as `llm_worker`. |
-| `clickhouse.llmWorkerUser.externalSecret.*` | — | ExternalSecret config for `llm_worker` (same shape as `clickhouse.externalSecret.*`). |
+| `clickhouse.llmWorkerUser.externalSecret.*` | — | ExternalSecret config for `llm_worker` (same shape as `clickhouse.otel.externalSecret.*`). |
 | `clickhouse.monteCarloUser.secret` | `ao-clickhouse-monte-carlo-credentials` | K8s Secret (ESO) for the always-provisioned `monte_carlo` user. |
 | `clickhouse.monteCarloUser.networksIp` | `["0.0.0.0/0"]` | CIDRs allowed to authenticate as `monte_carlo`. |
-| `clickhouse.monteCarloUser.externalSecret.*` | — | ExternalSecret config for `monte_carlo` (same shape as `clickhouse.externalSecret.*`). |
+| `clickhouse.monteCarloUser.externalSecret.*` | — | ExternalSecret config for `monte_carlo` (same shape as `clickhouse.otel.externalSecret.*`). |
 | `clickhouse.adminUser.enabled` | `false` | When `true`, provision the gated `admin` break-glass superuser (full access + user management + `SYSTEM`) and its ExternalSecret. |
 | `clickhouse.adminUser.secret` | `ao-clickhouse-admin-credentials` | K8s Secret (ESO) for `admin` (used when enabled). |
 | `clickhouse.adminUser.networksIp` | `["127.0.0.1","::1"]` | CIDRs allowed to authenticate as `admin`. Defaults to loopback only, so `admin` is reachable only by exec-ing into the ClickHouse pod; override only if you need remote admin. |
-| `clickhouse.adminUser.externalSecret.*` | — | ExternalSecret config for `admin` (same shape as `clickhouse.externalSecret.*`). |
+| `clickhouse.adminUser.externalSecret.*` | — | ExternalSecret config for `admin` (same shape as `clickhouse.otel.externalSecret.*`). |
 | `clickhouse.readonlyUser.enabled` | `false` | When `true`, the chart provisions a second SELECT-only ClickHouse user (`readonly_user`) with `readonly = 2` so standard JDBC clients (DataGrip etc.) can complete their handshake, the K8s Secret named by `clickhouse.readonlyUser.secret`, and a second ExternalSecret sourcing its password. |
 | `clickhouse.readonlyUser.secret` | `ao-clickhouse-readonly-user-credentials` | Name of the K8s Secret (created by ESO) holding the readonly_user password under the `password` key. |
 | `clickhouse.readonlyUser.networksIp` | `["0.0.0.0/0"]` | CIDRs allowed to authenticate as `readonly_user`. |

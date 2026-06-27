@@ -24,31 +24,35 @@ clickhouse:
   # Note: shrinking the value purges already-expired data lazily on the next
   # background merge, not immediately — see README for the manual-purge escape hatch.
   ttlDays: 30
-  # Name of the K8s Secret containing a "password" key for the otel user.
-  # This secret is created by the ExternalSecret below.
-  otelSecret: ao-clickhouse-otel-credentials
-  # CIDR list allowed to authenticate as the otel user. Default is open. Network reachability is
-  # typically restricted one layer up at the load balancer's source ranges (set by the deploying
-  # environment); this CH-user-level list is independent of that. Per-caller CH-level network
-  # scoping (otel → pod CIDR, etc.) is handled separately.
-  otelNetworksIp:
-    - "0.0.0.0/0"
+  # Adding a ClickHouse user? Also update templates/clickhouse-installation.yaml and templates/external-secret.yaml.
+  # otel — the OTel collector ingest identity. Writes raw telemetry into otel_traces.otel_traces
+  # (and otel_metrics when the metrics exporter is active). The MV cascade runs as schema_owner
+  # (the MV DEFINER), so otel needs nothing on the normalized targets.
   otel:
+    # Name of the K8s Secret containing a "password" key for the otel user.
+    # This secret is created by the ExternalSecret below.
+    secret: ao-clickhouse-otel-credentials
+    # CIDR list allowed to authenticate as the otel user. Default is open. Network reachability is
+    # typically restricted one layer up at the load balancer's source ranges (set by the deploying
+    # environment); this CH-user-level list is independent of that. Per-caller CH-level network
+    # scoping (otel → pod CIDR, etc.) is handled separately.
+    networksIp:
+      - "0.0.0.0/0"
     # When true, otel is restricted (via config grants) to INSERT on the telemetry source tables
     # only — the least-privilege ingest role for the OTel collector. The MV cascade runs as
     # schema_owner (the MV DEFINER), so otel needs nothing on the normalized targets. Default
     # false keeps otel broad (implicit full access) so it can be enabled in a later step, once any
     # external readers have moved to the monte_carlo user and the MVs are reparented onto schema_owner.
     restrictGrants: false
-  externalSecret:
-    secretStoreRef:
-      name: ""                    # user must provide
-      kind: ClusterSecretStore
-    remoteRef:
-      key: ""                     # user must provide
-      property: ""                # optional, for JSON secrets
-      version: ""                 # optional, required for Fake provider
-    refreshInterval: 1h
+    externalSecret:
+      secretStoreRef:
+        name: ""                  # user must provide
+        kind: ClusterSecretStore
+      remoteRef:
+        key: ""                   # user must provide
+        property: ""              # optional, for JSON secrets
+        version: ""               # optional, required for Fake provider
+      refreshInterval: 1h
   # schema_owner — owns the schema and is the materialized-view DEFINER. Used by the
   # schema-migration Job for all DDL (CREATE DATABASE/TABLE/VIEW/MV), the telemetry-table
   # TTL ALTERs, the system-log TTL ALTERs, and SYSTEM FLUSH LOGS. Because the MVs run under

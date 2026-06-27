@@ -849,7 +849,7 @@ banner "ClickHouse least-privilege user model"
 # status — a missing secret yields "" and a denied query yields the error text, so the explicit
 # guards/assertions below fire and print instead of the script dying silently mid-check.
 ch_pw() { kubectl get secret -n "$NS" "$1" -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || true; }
-ch_as() { kubectl exec -n "$NS" "$CH_POD" -- clickhouse-client --user "$1" --password "$2" --query "$3" </dev/null 2>&1 || true; }
+ch_as() { kubectl exec -n "$NS" "$CH_POD" -- env CLICKHOUSE_PASSWORD="$2" clickhouse-client --user "$1" --query "$3" </dev/null 2>&1 || true; }
 
 expect_grant() {  # label user pw needle
   if ch_as "$2" "$3" "SHOW GRANTS" | grep -qiF "$4"; then pass "$1"; else fail "$1 — expected grant missing: $4"; fi
@@ -862,7 +862,7 @@ expect_ok() {     # label user pw sql
   if echo "$o" | grep -qiE "exception|access_denied|not enough priv"; then fail "$1 — $o"; else pass "$1"; fi
 }
 expect_denied() { # label user pw sql
-  if ch_as "$2" "$3" "$4" | grep -q "ACCESS_DENIED"; then pass "$1"; else fail "$1 — expected ACCESS_DENIED"; fi
+  if ch_as "$2" "$3" "$4" | grep -qiE "access_denied|not enough priv"; then pass "$1"; else fail "$1 — expected ACCESS_DENIED"; fi
 }
 
 SO_PW=$(ch_pw ao-clickhouse-schema-owner-credentials)
@@ -870,29 +870,40 @@ WK_PW=$(ch_pw ao-clickhouse-llm-worker-credentials)
 MC_PW=$(ch_pw ao-clickhouse-monte-carlo-credentials)
 AD_PW=$(ch_pw ao-clickhouse-admin-credentials)
 # otel password = $CH_PASSWORD (above); readonly_user = $CH_READ_PW (reader block).
-for s in "$SO_PW" "$WK_PW" "$MC_PW"; do
-  [[ -z "$s" ]] && fail "A per-user secret (schema_owner/llm_worker/monte_carlo) is missing — this cluster predates the least-privilege user model (chart not yet migrated)."
+for pair in "schema_owner:$SO_PW" "llm_worker:$WK_PW" "monte_carlo:$MC_PW"; do
+  name="${pair%%:*}"; pw="${pair#*:}"
+  [[ -z "$pw" ]] && fail "ClickHouse per-user secret for '$name' is missing — this cluster predates the least-privilege user model (chart not yet migrated)."
 done
 
-# schema_owner — owns the schema (DDL).
-expect_grant "schema_owner holds DDL on otel_traces" schema_owner "$SO_PW" "CREATE TABLE"
+# schema_owner — owns the schema (DDL); deliberately has no access management rights.
+expect_grant   "schema_owner holds DDL on otel_traces"     schema_owner "$SO_PW" "CREATE TABLE"
+forbid_grant   "schema_owner has no access management"     schema_owner "$SO_PW" "ACCESS MANAGEMENT"
+expect_denied  "schema_owner cannot manage users"          schema_owner "$SO_PW" "CREATE USER ao_verify_canary IDENTIFIED BY 'x'"
 
 # llm_worker — queue read/write only; must NOT read telemetry.
-expect_ok     "llm_worker reads the queue"        llm_worker "$WK_PW" "SELECT count() FROM otel_traces.llm_batches"
-expect_denied "llm_worker cannot read telemetry"  llm_worker "$WK_PW" "SELECT count() FROM otel_traces.spans_normalized"
+expect_ok      "llm_worker reads the queue"                llm_worker "$WK_PW" "SELECT count() FROM otel_traces.llm_batches"
+expect_ok      "llm_worker can append results"             llm_worker "$WK_PW" "SELECT count() FROM otel_traces.llm_results"
+expect_denied  "llm_worker cannot read telemetry"          llm_worker "$WK_PW" "SELECT count() FROM otel_traces.spans_normalized"
+expect_denied  "llm_worker cannot write telemetry"         llm_worker "$WK_PW" "INSERT INTO otel_traces.otel_traces (Timestamp) VALUES (now())"
 
 # monte_carlo — reads everything + produces to the queue, but must NOT write telemetry.
-expect_ok    "monte_carlo reads telemetry"          monte_carlo "$MC_PW" "SELECT count() FROM otel_traces.spans_normalized"
-expect_grant "monte_carlo can produce to the queue" monte_carlo "$MC_PW" "INSERT ON otel_traces.llm_inputs"
-forbid_grant "monte_carlo cannot write telemetry"   monte_carlo "$MC_PW" "INSERT ON otel_traces.otel_traces"
+expect_ok      "monte_carlo reads telemetry"               monte_carlo "$MC_PW" "SELECT count() FROM otel_traces.spans_normalized"
+expect_grant   "monte_carlo can produce to the queue"      monte_carlo "$MC_PW" "INSERT ON otel_traces.llm_inputs"
+expect_grant   "monte_carlo can produce to llm_batches"    monte_carlo "$MC_PW" "INSERT ON otel_traces.llm_batches"
+expect_denied  "monte_carlo cannot write telemetry"        monte_carlo "$MC_PW" "INSERT INTO otel_traces.otel_traces (Timestamp) VALUES (now())"
+forbid_grant   "monte_carlo cannot write otel_metrics"     monte_carlo "$MC_PW" "GRANT INSERT ON otel_traces.otel_metrics"
 
-# readonly_user — SELECT-only.
-expect_ok    "readonly_user reads telemetry" readonly_user "$CH_READ_PW" "SELECT count() FROM otel_traces.spans_normalized"
-forbid_grant "readonly_user is SELECT-only"  readonly_user "$CH_READ_PW" "INSERT"
+# readonly_user — SELECT-only; readonly=2 profile blocks writes even without an explicit deny grant.
+expect_ok      "readonly_user reads telemetry"             readonly_user "$CH_READ_PW" "SELECT count() FROM otel_traces.spans_normalized"
+forbid_grant   "readonly_user is SELECT-only"              readonly_user "$CH_READ_PW" "GRANT INSERT"
+expect_denied  "readonly_user cannot write (runtime)"      readonly_user "$CH_READ_PW" "INSERT INTO otel_traces.otel_traces (Timestamp) VALUES (now())"
 
-# otel — always an ingester; its grant shape varies by state, so just report whether
-# it has been tightened to INSERT-only (post-cutover) or is still broad (pre-cutover).
-if ch_as otel "$CH_PASSWORD" "SELECT count() FROM otel_traces.otel_traces" | grep -q "ACCESS_DENIED"; then
+# otel — always an ingester; its grant shape varies by restrictGrants state.
+#   Set VERIFY_OTEL_RESTRICTED=true to assert the INSERT-only (post-cutover) posture;
+#   leave unset (default) to warn-and-pass for pre-cutover clusters.
+if [[ "${VERIFY_OTEL_RESTRICTED:-false}" == "true" ]]; then
+  expect_denied "otel is INSERT-only" otel "$CH_PASSWORD" "SELECT count() FROM otel_traces.otel_traces"
+elif ch_as otel "$CH_PASSWORD" "SELECT count() FROM otel_traces.otel_traces" | grep -qiE "access_denied|not enough priv"; then
   pass "otel is INSERT-only (restrictGrants enabled)"
 else
   echo -e "  ${YELLOW}⚠ otel can still read telemetry — restrictGrants not yet enabled (expected pre-cutover)${RESET}"
@@ -900,14 +911,14 @@ fi
 
 # admin — only when enabled; superuser, reachable over loopback (this exec is loopback).
 if [[ -n "$AD_PW" ]]; then
-  expect_grant "admin is a superuser" admin "$AD_PW" "GRANT ALL ON *.*"
+  expect_grant "admin is a superuser" admin "$AD_PW" "GRANT ALL ON *.* WITH GRANT OPTION"
 else
   echo -e "  ${YELLOW}▸ admin user not enabled — skipping${RESET}"
 fi
 
 # Materialized views must run under schema_owner as their DEFINER.
 for mv in otel_traces_trace_id_ts_mv spans_normalized_mv conversations_normalized_mv; do
-  if ch_as schema_owner "$SO_PW" "SHOW CREATE TABLE otel_traces.$mv" | grep -q "DEFINER = schema_owner"; then
+  if ch_as schema_owner "$SO_PW" "SHOW CREATE TABLE otel_traces.$mv" | grep -qiE "DEFINER *= *\`?schema_owner\`?"; then
     pass "MV $mv runs as schema_owner (DEFINER)"
   else
     fail "MV $mv is not owned by schema_owner — the normalization cascade will break once otel is restricted"

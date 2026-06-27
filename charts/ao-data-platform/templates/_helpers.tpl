@@ -68,11 +68,13 @@ ExternalSecret for a ClickHouse user password.
 One ExternalSecret per CH user that has a Secrets-Manager-backed password, factored here so the
 otel / schema_owner / llm_worker / monte_carlo / admin / readonly_user blocks don't each repeat it.
 Call with a dict: {root: $, name: <k8s secret name>, externalSecret: <the user's externalSecret cfg>}.
+Adding a ClickHouse user? Also update values.yaml and templates/clickhouse-installation.yaml.
 */}}
 {{- define "ao-data-platform.externalSecret" -}}
 {{- $root := .root -}}
 {{- $name := .name -}}
 {{- $es := .externalSecret -}}
+---
 apiVersion: external-secrets.io/v1
 kind: ExternalSecret
 metadata:
@@ -82,7 +84,7 @@ metadata:
 spec:
   refreshInterval: {{ $es.refreshInterval }}
   secretStoreRef:
-    name: {{ required (printf "externalSecret.secretStoreRef.name is required for secret %s" $name) $es.secretStoreRef.name }}
+    name: {{ required (printf "externalSecret.secretStoreRef.name is required for secret %s — set via clickhouse.<user>.externalSecret.secretStoreRef.name" $name) $es.secretStoreRef.name }}
     kind: {{ $es.secretStoreRef.kind }}
   target:
     name: {{ $name }}
@@ -90,7 +92,7 @@ spec:
   data:
     - secretKey: password
       remoteRef:
-        key: {{ required (printf "externalSecret.remoteRef.key is required for secret %s" $name) $es.remoteRef.key }}
+        key: {{ required (printf "externalSecret.remoteRef.key is required for secret %s — set via clickhouse.<user>.externalSecret.remoteRef.key" $name) $es.remoteRef.key }}
         {{- if $es.remoteRef.property }}
         property: {{ $es.remoteRef.property }}
         {{- end }}
@@ -104,7 +106,9 @@ Shared read-only grant bundle (the "reader bundle").
 Granted to both monte_carlo (reader + queue producer) and readonly_user (human/MCP/JDBC). Covers the
 telemetry DB plus the metadata reads DataGrip/MCP and Monte Carlo data-source monitoring need. Keep
 this as the single source of truth — adding a read target means editing it here once.
-Rendered into a CHI user's `<user>/grants/query` list; call with the root context.
+Emits YAML list items (`- "GRANT …"`) intended for inclusion under a CHI `<user>/grants/query`
+sequence. Must be called with `| nindent 8` to align with the surrounding 8-space indent used in
+templates/clickhouse-installation.yaml. Call with the root context (`.`).
 */}}
 {{- define "ao-data-platform.readerGrants" -}}
 - "GRANT SELECT ON otel_traces.*"
