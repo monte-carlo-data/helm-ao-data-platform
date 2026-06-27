@@ -104,7 +104,7 @@ helm dependency build charts/ao-data-platform/
 
 Wire an `ExternalSecret` for each always-provisioned user at the Fake store, and point the
 `llm-worker` at a worker image. (`readonly_user` and `admin` are off by default; enable and
-wire them the same way under `clickhouse.readonlyUser` / `clickhouse.adminUser` if you need
+wire them the same way under `clickhouse.readonlyUser` / `clickhouse.admin` if you need
 them.)
 
 ```bash
@@ -115,12 +115,12 @@ helm upgrade --install ao-data-platform charts/ao-data-platform/ -n montecarlo -
   --set clickhouse.schemaOwner.externalSecret.secretStoreRef.name=fake-secret-store \
   --set clickhouse.schemaOwner.externalSecret.remoteRef.key=clickhouse-schema-owner-password \
   --set clickhouse.schemaOwner.externalSecret.remoteRef.version=v1 \
-  --set clickhouse.llmWorkerUser.externalSecret.secretStoreRef.name=fake-secret-store \
-  --set clickhouse.llmWorkerUser.externalSecret.remoteRef.key=clickhouse-llm-worker-password \
-  --set clickhouse.llmWorkerUser.externalSecret.remoteRef.version=v1 \
-  --set clickhouse.monteCarloUser.externalSecret.secretStoreRef.name=fake-secret-store \
-  --set clickhouse.monteCarloUser.externalSecret.remoteRef.key=clickhouse-monte-carlo-password \
-  --set clickhouse.monteCarloUser.externalSecret.remoteRef.version=v1 \
+  --set clickhouse.llmWorker.externalSecret.secretStoreRef.name=fake-secret-store \
+  --set clickhouse.llmWorker.externalSecret.remoteRef.key=clickhouse-llm-worker-password \
+  --set clickhouse.llmWorker.externalSecret.remoteRef.version=v1 \
+  --set clickhouse.monteCarlo.externalSecret.secretStoreRef.name=fake-secret-store \
+  --set clickhouse.monteCarlo.externalSecret.remoteRef.key=clickhouse-monte-carlo-password \
+  --set clickhouse.monteCarlo.externalSecret.remoteRef.version=v1 \
   --set llmWorker.image.repository=montecarlodata/ao-llm-worker \
   --set llmWorker.image.tag=latest
 ```
@@ -168,7 +168,7 @@ Point an `ExternalSecret` for each always-provisioned user (`otel`, `schema_owne
 `llm_worker`, `monte_carlo`) at your AWS Secrets Manager `ClusterSecretStore`. Each user's
 `secretStoreRef.name` and `remoteRef.key` are required. (`readonly_user` and `admin` are off
 by default — enable and wire them the same way under `clickhouse.readonlyUser` /
-`clickhouse.adminUser` if needed.)
+`clickhouse.admin` if needed.)
 
 ```yaml
 clickhouse:
@@ -179,11 +179,11 @@ clickhouse:
     externalSecret:
       secretStoreRef: {name: aws-secretsmanager, kind: ClusterSecretStore}
       remoteRef: {key: ao/clickhouse-schema-owner-password}
-  llmWorkerUser:
+  llmWorker:
     externalSecret:
       secretStoreRef: {name: aws-secretsmanager, kind: ClusterSecretStore}
       remoteRef: {key: ao/clickhouse-llm-worker-password}
-  monteCarloUser:
+  monteCarlo:
     externalSecret:
       secretStoreRef: {name: aws-secretsmanager, kind: ClusterSecretStore}
       remoteRef: {key: ao/clickhouse-monte-carlo-password}
@@ -256,7 +256,7 @@ to the normalized target tables. The stock `default` superuser is removed.
 | `llm_worker` | `llm_batches`/`llm_inputs`/`llm_results` | `INSERT` on `llm_batches`/`llm_results` | llm-worker Deployment | always |
 | `monte_carlo` | reader bundle¹ | `INSERT` on `llm_inputs`/`llm_batches`/`conversation_eval_scores` | Monte Carlo (data-source monitoring + agent observability) | always |
 | `readonly_user` | reader bundle¹ | — (`readonly=2`, so JDBC `SET` works) | humans / MCP / JDBC clients | `clickhouse.readonlyUser.enabled=true` |
-| `admin` | all | all + user management + `SYSTEM` | break-glass DBA (not service-to-service; loopback-only by default) | `clickhouse.adminUser.enabled=true` |
+| `admin` | all | all + user management + `SYSTEM` | break-glass DBA (not service-to-service; loopback-only by default) | `clickhouse.admin.enabled=true` |
 
 ¹ **reader bundle** = `SELECT` on `otel_traces.*`, `system.tables/parts/query_log`, and
 `information_schema.*` — the metadata reads JDBC/MCP clients and Monte Carlo monitoring need. Shared
@@ -281,14 +281,20 @@ install without the steps below will error immediately — complete them first.
 
 #### 1. Update your values file — renamed keys
 
-The `otel`-user values keys were reorganised into a nested shape. Update any existing values file
-or `--set` overrides:
+Per-user value keys were reorganised so every user is a cohesive sub-map whose key mirrors its
+ClickHouse username. Update any existing values file or `--set` overrides:
 
 | Old key (1.x) | New key (2.0.0) |
 |---|---|
 | `clickhouse.otelSecret` | `clickhouse.otel.secret` |
 | `clickhouse.otelNetworksIp` | `clickhouse.otel.networksIp` |
 | `clickhouse.externalSecret.*` | `clickhouse.otel.externalSecret.*` |
+| `clickhouse.llmWorkerUser.*` | `clickhouse.llmWorker.*` |
+| `clickhouse.monteCarloUser.*` | `clickhouse.monteCarlo.*` |
+| `clickhouse.adminUser.*` | `clickhouse.admin.*` |
+
+(`clickhouse.otel`, `clickhouse.schemaOwner`, and `clickhouse.readonlyUser` are unchanged — each
+already matches its SQL username `otel` / `schema_owner` / `readonly_user`.)
 
 Example (AWS Secrets Manager):
 
@@ -361,16 +367,16 @@ helm upgrade ao-data-platform oci://registry-1.docker.io/montecarlodata/ao-data-
 | `clickhouse.schemaOwner.secret` | `ao-clickhouse-schema-owner-credentials` | K8s Secret (ESO) for the always-provisioned `schema_owner` user. |
 | `clickhouse.schemaOwner.networksIp` | `["0.0.0.0/0"]` | CIDRs allowed to authenticate as `schema_owner`. |
 | `clickhouse.schemaOwner.externalSecret.*` | — | ExternalSecret config for `schema_owner` (same shape as `clickhouse.otel.externalSecret.*`). |
-| `clickhouse.llmWorkerUser.secret` | `ao-clickhouse-llm-worker-credentials` | K8s Secret (ESO) for the always-provisioned `llm_worker` user. |
-| `clickhouse.llmWorkerUser.networksIp` | `["0.0.0.0/0"]` | CIDRs allowed to authenticate as `llm_worker`. |
-| `clickhouse.llmWorkerUser.externalSecret.*` | — | ExternalSecret config for `llm_worker` (same shape as `clickhouse.otel.externalSecret.*`). |
-| `clickhouse.monteCarloUser.secret` | `ao-clickhouse-monte-carlo-credentials` | K8s Secret (ESO) for the always-provisioned `monte_carlo` user. |
-| `clickhouse.monteCarloUser.networksIp` | `["0.0.0.0/0"]` | CIDRs allowed to authenticate as `monte_carlo`. |
-| `clickhouse.monteCarloUser.externalSecret.*` | — | ExternalSecret config for `monte_carlo` (same shape as `clickhouse.otel.externalSecret.*`). |
-| `clickhouse.adminUser.enabled` | `false` | When `true`, provision the gated `admin` break-glass superuser (full access + user management + `SYSTEM`) and its ExternalSecret. |
-| `clickhouse.adminUser.secret` | `ao-clickhouse-admin-credentials` | K8s Secret (ESO) for `admin` (used when enabled). |
-| `clickhouse.adminUser.networksIp` | `["127.0.0.1","::1"]` | CIDRs allowed to authenticate as `admin`. Defaults to loopback only, so `admin` is reachable only by exec-ing into the ClickHouse pod; override only if you need remote admin. |
-| `clickhouse.adminUser.externalSecret.*` | — | ExternalSecret config for `admin` (same shape as `clickhouse.otel.externalSecret.*`). |
+| `clickhouse.llmWorker.secret` | `ao-clickhouse-llm-worker-credentials` | K8s Secret (ESO) for the always-provisioned `llm_worker` user. |
+| `clickhouse.llmWorker.networksIp` | `["0.0.0.0/0"]` | CIDRs allowed to authenticate as `llm_worker`. |
+| `clickhouse.llmWorker.externalSecret.*` | — | ExternalSecret config for `llm_worker` (same shape as `clickhouse.otel.externalSecret.*`). |
+| `clickhouse.monteCarlo.secret` | `ao-clickhouse-monte-carlo-credentials` | K8s Secret (ESO) for the always-provisioned `monte_carlo` user. |
+| `clickhouse.monteCarlo.networksIp` | `["0.0.0.0/0"]` | CIDRs allowed to authenticate as `monte_carlo`. |
+| `clickhouse.monteCarlo.externalSecret.*` | — | ExternalSecret config for `monte_carlo` (same shape as `clickhouse.otel.externalSecret.*`). |
+| `clickhouse.admin.enabled` | `false` | When `true`, provision the gated `admin` break-glass superuser (full access + user management + `SYSTEM`) and its ExternalSecret. |
+| `clickhouse.admin.secret` | `ao-clickhouse-admin-credentials` | K8s Secret (ESO) for `admin` (used when enabled). |
+| `clickhouse.admin.networksIp` | `["127.0.0.1","::1"]` | CIDRs allowed to authenticate as `admin`. Defaults to loopback only, so `admin` is reachable only by exec-ing into the ClickHouse pod; override only if you need remote admin. |
+| `clickhouse.admin.externalSecret.*` | — | ExternalSecret config for `admin` (same shape as `clickhouse.otel.externalSecret.*`). |
 | `clickhouse.readonlyUser.enabled` | `false` | When `true`, the chart provisions a second SELECT-only ClickHouse user (`readonly_user`) with `readonly = 2` so standard JDBC clients (DataGrip etc.) can complete their handshake, the K8s Secret named by `clickhouse.readonlyUser.secret`, and a second ExternalSecret sourcing its password. |
 | `clickhouse.readonlyUser.secret` | `ao-clickhouse-readonly-user-credentials` | Name of the K8s Secret (created by ESO) holding the readonly_user password under the `password` key. |
 | `clickhouse.readonlyUser.networksIp` | `["0.0.0.0/0"]` | CIDRs allowed to authenticate as `readonly_user`. |

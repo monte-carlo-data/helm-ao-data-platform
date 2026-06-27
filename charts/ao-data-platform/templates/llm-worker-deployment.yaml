@@ -34,7 +34,7 @@ spec:
             - name: CLICKHOUSE_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.clickhouse.llmWorkerUser.secret }}
+                  name: {{ .Values.clickhouse.llmWorker.secret }}
                   key: password
             - name: SSL_CERT_FILE
               value: /tls/clickhouse-ca/ca.crt
@@ -55,7 +55,7 @@ spec:
             - name: CH_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.clickhouse.llmWorkerUser.secret }}
+                  name: {{ .Values.clickhouse.llmWorker.secret }}
                   key: password
             - name: CH_DATABASE
               value: otel_traces

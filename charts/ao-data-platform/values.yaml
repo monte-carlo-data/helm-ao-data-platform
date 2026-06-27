@@ -76,7 +76,7 @@ clickhouse:
   # llm_worker — identity for the llm-worker Deployment. Reads the LLM job queue and appends
   # results back (no mutations): SELECT on llm_batches/llm_inputs/llm_results, INSERT on
   # llm_batches/llm_results. Created by the ExternalSecret below.
-  llmWorkerUser:
+  llmWorker:
     secret: ao-clickhouse-llm-worker-credentials
     # CIDR list allowed to authenticate as llm_worker (in-cluster). Default open; tighten per env.
     networksIp:
@@ -96,7 +96,7 @@ clickhouse:
   # needs INSERT, so its read-mostly shape is enforced by grants alone. Created by the
   # ExternalSecret below. (The agent's credential is configured in the consuming application, not
   # here — the chart only provisions the user + password.)
-  monteCarloUser:
+  monteCarlo:
     secret: ao-clickhouse-monte-carlo-credentials
     # CIDR list allowed to authenticate as monte_carlo (external callers: the agent + monitoring).
     # Default open; tightening to the caller's real source is handled separately.
@@ -117,7 +117,7 @@ clickhouse:
   # service-to-service: routine grant changes go through the chart (config grants + upgrade), not
   # this user. It exists for SYSTEM / BACKUP / ad-hoc DDL the operator never performs and which no
   # other user can do once the default superuser is removed.
-  adminUser:
+  admin:
     enabled: false
     secret: ao-clickhouse-admin-credentials
     # CIDR list allowed to authenticate as admin. Defaults to loopback only, so admin is usable
