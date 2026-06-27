@@ -910,8 +910,11 @@ else
 fi
 
 # admin — only when enabled; superuser, reachable over loopback (this exec is loopback).
+# SHOW GRANTS renders as `GRANT ALL ON *.* TO admin WITH GRANT OPTION`, so the grant-all and
+# the grant-option are non-contiguous — check each substring separately (expect_grant is grep -F).
 if [[ -n "$AD_PW" ]]; then
-  expect_grant "admin is a superuser" admin "$AD_PW" "GRANT ALL ON *.* WITH GRANT OPTION"
+  expect_grant "admin is a superuser"      admin "$AD_PW" "GRANT ALL ON *.*"
+  expect_grant "admin can delegate grants" admin "$AD_PW" "WITH GRANT OPTION"
 else
   echo -e "  ${YELLOW}▸ admin user not enabled — skipping${RESET}"
 fi
