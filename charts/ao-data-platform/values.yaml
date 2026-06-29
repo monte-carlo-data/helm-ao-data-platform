@@ -257,6 +257,9 @@ llmWorker:
     region: us-east-1
   serviceAccount:
     annotations: {}
+  # Additional labels for the worker pod template — set per-environment as needed
+  # (e.g. to opt into an identity/admission webhook).
+  podLabels: {}
   # Extra env vars (e.g., MAX_WORKERS, POLL_INTERVAL)
   env: []
   # Resource requests/limits for the llm-worker container. Modest dev
