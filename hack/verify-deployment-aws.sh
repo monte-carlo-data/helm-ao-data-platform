@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 #
-# verify-deployment.sh — Post-deployment verification for the ao-data-platform Helm chart.
+# verify-deployment-aws.sh — Post-deployment verification for the ao-data-platform
+# Helm chart on AWS (EKS). The Azure/AKS counterpart is verify-deployment-azure.sh
+# in this directory.
 #
 # Runs each check sequentially, printing the command, its output, and a
 # pass/fail explanation.  Stops immediately on the first failure.
 #
 # Usage:
-#   ./verify-deployment.sh -n <namespace> -r <aws-region>
+#   ./verify-deployment-aws.sh -n <namespace> -r <aws-region>
 #
 # Requirements: kubectl, aws cli, jq, openssl, dig, base64
 
