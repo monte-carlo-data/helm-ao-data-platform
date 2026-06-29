@@ -862,7 +862,8 @@ expect_ok() {     # label user pw sql
   if echo "$o" | grep -qiE "exception|access_denied|not enough priv"; then fail "$1 — $o"; else pass "$1"; fi
 }
 expect_denied() { # label user pw sql
-  if ch_as "$2" "$3" "$4" | grep -qiE "access_denied|not enough priv"; then pass "$1"; else fail "$1 — expected ACCESS_DENIED"; fi
+  local o; o=$(ch_as "$2" "$3" "$4")
+  if echo "$o" | grep -qiE "access_denied|not enough priv"; then pass "$1"; else fail "$1 — expected ACCESS_DENIED, got: $o"; fi
 }
 
 SO_PW=$(ch_pw ao-clickhouse-schema-owner-credentials)
@@ -878,11 +879,14 @@ done
 # schema_owner — owns the schema (DDL); deliberately has no access management rights.
 expect_grant   "schema_owner holds DDL on otel_traces"     schema_owner "$SO_PW" "CREATE TABLE"
 forbid_grant   "schema_owner has no access management"     schema_owner "$SO_PW" "ACCESS MANAGEMENT"
-expect_denied  "schema_owner cannot manage users"          schema_owner "$SO_PW" "CREATE USER ao_verify_canary IDENTIFIED BY 'x'"
+# SHOW USERS is an access-management-gated op that creates no entity, so it stays correct on
+# re-runs. A CREATE USER probe could false-FAIL on a leftover user (ALREADY_EXISTS, not denied),
+# and schema_owner lacks the privilege to drop it for cleanup.
+expect_denied  "schema_owner cannot manage users"          schema_owner "$SO_PW" "SHOW USERS"
 
 # llm_worker — queue read/write only; must NOT read telemetry.
 expect_ok      "llm_worker reads the queue"                llm_worker "$WK_PW" "SELECT count() FROM otel_traces.llm_batches"
-expect_ok      "llm_worker can append results"             llm_worker "$WK_PW" "SELECT count() FROM otel_traces.llm_results"
+expect_grant   "llm_worker can append results"             llm_worker "$WK_PW" "INSERT ON otel_traces.llm_results"
 expect_denied  "llm_worker cannot read telemetry"          llm_worker "$WK_PW" "SELECT count() FROM otel_traces.spans_normalized"
 expect_denied  "llm_worker cannot write telemetry"         llm_worker "$WK_PW" "INSERT INTO otel_traces.otel_traces (Timestamp) VALUES (now())"
 
