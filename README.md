@@ -202,7 +202,7 @@ CI authenticates to Docker Hub with a scoped access token (`DOCKER_LOGIN` / `DOC
 Pull a published version directly:
 
 ```bash
-helm pull oci://registry-1.docker.io/montecarlodata/ao-data-platform --version 1.5.0
+helm pull oci://registry-1.docker.io/montecarlodata/ao-data-platform --version 1.5.1
 ```
 
 ## Configuration
