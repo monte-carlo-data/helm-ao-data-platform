@@ -1,0 +1,14 @@
+# Minimal values that let `helm template` fully render in CI.
+#
+# `helm lint` does not fully render subchart values, so a typo or wrong nesting
+# in a deep path (e.g. the operator's `altinity-clickhouse-operator.configs.files`
+# label allowlist) would pass lint while being silently ignored. The lint job
+# renders the chart with these values to catch that, but the ClickHouse user has a
+# required ExternalSecret field with no default — supply a placeholder here so the
+# render reaches every template. These are CI placeholders only and are never deployed.
+clickhouse:
+  externalSecret:
+    secretStoreRef:
+      name: ci-placeholder
+    remoteRef:
+      key: ci-placeholder
