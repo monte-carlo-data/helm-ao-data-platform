@@ -300,6 +300,8 @@ opentelemetry-collector:
         - name: CLICKHOUSE_PASSWORD
           valueFrom:
             secretKeyRef:
+              # Keep in sync with clickhouse.otel.secret — this sub-chart value is plain YAML
+              # (not templated), so overriding clickhouse.otel.secret does not propagate here.
               name: ao-clickhouse-otel-credentials
               key: password
         - name: SSL_CERT_FILE
@@ -313,6 +315,8 @@ opentelemetry-collector:
     - name: CLICKHOUSE_PASSWORD
       valueFrom:
         secretKeyRef:
+          # Keep in sync with clickhouse.otel.secret — this sub-chart value is plain YAML
+          # (not templated), so overriding clickhouse.otel.secret does not propagate here.
           name: ao-clickhouse-otel-credentials
           key: password
     - name: SSL_CERT_FILE
