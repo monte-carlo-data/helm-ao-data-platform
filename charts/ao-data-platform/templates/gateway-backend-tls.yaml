@@ -26,7 +26,7 @@ spec:
       matchLabels:
         kubernetes.io/metadata.name: {{ .Release.Namespace }}
 ---
-apiVersion: gateway.networking.k8s.io/v1alpha3
+apiVersion: gateway.networking.k8s.io/v1
 kind: BackendTLSPolicy
 metadata:
   name: {{ include "ao-data-platform.fullname" . }}-otel
@@ -46,7 +46,7 @@ spec:
         kind: ConfigMap
         name: {{ include "ao-data-platform.fullname" . }}-ca-bundle
 ---
-apiVersion: gateway.networking.k8s.io/v1alpha3
+apiVersion: gateway.networking.k8s.io/v1
 kind: BackendTLSPolicy
 metadata:
   name: {{ include "ao-data-platform.fullname" . }}-clickhouse
