@@ -16,6 +16,9 @@ spec:
       labels:
         {{- include "ao-data-platform.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: llm-worker
+        {{- with .Values.llmWorker.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
       serviceAccountName: llm-worker
       initContainers:
