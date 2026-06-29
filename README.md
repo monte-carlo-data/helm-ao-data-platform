@@ -172,9 +172,10 @@ by default — enable and wire them the same way under `clickhouse.readonlyUser`
 
 ```yaml
 clickhouse:
-  externalSecret:                                  # otel
-    secretStoreRef: {name: aws-secretsmanager, kind: ClusterSecretStore}
-    remoteRef: {key: ao/clickhouse-otel-password}  # AWS Secrets Manager secret name
+  otel:
+    externalSecret:                                  # otel
+      secretStoreRef: {name: aws-secretsmanager, kind: ClusterSecretStore}
+      remoteRef: {key: ao/clickhouse-otel-password}  # AWS Secrets Manager secret name
   schemaOwner:
     externalSecret:
       secretStoreRef: {name: aws-secretsmanager, kind: ClusterSecretStore}
@@ -239,7 +240,7 @@ CI authenticates to Docker Hub with a scoped access token (`DOCKER_LOGIN` / `DOC
 Pull a published version directly:
 
 ```bash
-helm pull oci://registry-1.docker.io/montecarlodata/ao-data-platform --version 1.5.1
+helm pull oci://registry-1.docker.io/montecarlodata/ao-data-platform --version 2.0.0
 ```
 
 ## ClickHouse user model
@@ -251,7 +252,7 @@ to the normalized target tables. The stock `default` superuser is removed.
 
 | User | Reads | Writes | Used by | Provisioned |
 |------|-------|--------|---------|-------------|
-| `schema_owner` | `otel_traces.*` | full DDL on `otel_traces.*`, `ALTER system.*`, `SYSTEM FLUSH LOGS` | schema-migration Job; the MV `DEFINER` | always |
+| `schema_owner` | `otel_traces.*` | full DDL on `otel_traces.*`, `ALTER` on 7 system-log tables³, `SYSTEM FLUSH LOGS` | schema-migration Job; the MV `DEFINER` | always |
 | `otel` | full read (`restrictGrants=false`, default); `—` when `restrictGrants=true` | `INSERT` on the telemetry source tables when `clickhouse.otel.restrictGrants=true` (otherwise unrestricted) | OTel collector | always |
 | `llm_worker` | `llm_batches`/`llm_inputs`/`llm_results` | `INSERT` on `llm_batches`/`llm_results` | llm-worker Deployment | always |
 | `monte_carlo` | reader bundle¹ | `INSERT` on `llm_inputs`/`llm_batches`/`conversation_eval_scores` | Monte Carlo (data-source monitoring + agent observability) | always |
@@ -266,6 +267,11 @@ by `monte_carlo` and `readonly_user`.
 metrics exporter, not by the schema migration Job. It has no SQL file under `charts/.../sql/`; the
 `INSERT` grant on it is provisioned unconditionally, and the table appears once the collector has
 written its first metrics payload.
+
+³ **7 system-log tables** = `ALTER` on exactly `system.query_log`, `system.query_thread_log`,
+`system.query_views_log`, `system.part_log`, `system.trace_log`, `system.metric_log`, and
+`system.text_log` — the log tables whose TTLs the schema Job manages. The grant is *not* `system.*`;
+it is scoped to these seven so it cannot touch system tables the Job never modifies.
 
 Each password-backed user has an ExternalSecret sourcing its password from your secret store (see the
 per-user `*.externalSecret` values below). Network *reachability* is typically restricted one layer
