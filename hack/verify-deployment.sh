@@ -892,6 +892,8 @@ expect_denied  "llm_worker cannot write telemetry"         llm_worker "$WK_PW" "
 
 # monte_carlo — reads everything + produces to the queue, but must NOT write telemetry.
 expect_ok      "monte_carlo reads telemetry"               monte_carlo "$MC_PW" "SELECT count() FROM otel_traces.spans_normalized"
+# system.numbers backs time-bucket / gap-fill queries (e.g. getTraceTimeSeries); reader bundle grant.
+expect_ok      "monte_carlo can read system.numbers"       monte_carlo "$MC_PW" "SELECT number FROM system.numbers LIMIT 1"
 expect_grant   "monte_carlo can produce to the queue"      monte_carlo "$MC_PW" "INSERT ON otel_traces.llm_inputs"
 expect_grant   "monte_carlo can produce to llm_batches"    monte_carlo "$MC_PW" "INSERT ON otel_traces.llm_batches"
 expect_denied  "monte_carlo cannot write telemetry"        monte_carlo "$MC_PW" "INSERT INTO otel_traces.otel_traces (Timestamp) VALUES (now())"
@@ -899,6 +901,7 @@ forbid_grant   "monte_carlo cannot write otel_metrics"     monte_carlo "$MC_PW" 
 
 # readonly_user — SELECT-only; readonly=2 profile blocks writes even without an explicit deny grant.
 expect_ok      "readonly_user reads telemetry"             readonly_user "$CH_READ_PW" "SELECT count() FROM otel_traces.spans_normalized"
+expect_ok      "readonly_user can read system.numbers"     readonly_user "$CH_READ_PW" "SELECT number FROM system.numbers LIMIT 1"
 forbid_grant   "readonly_user is SELECT-only"              readonly_user "$CH_READ_PW" "GRANT INSERT"
 expect_denied  "readonly_user cannot write (runtime)"      readonly_user "$CH_READ_PW" "INSERT INTO otel_traces.otel_traces (Timestamp) VALUES (now())"
 

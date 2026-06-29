@@ -115,5 +115,8 @@ templates/clickhouse-installation.yaml. Call with the root context (`.`).
 - "GRANT SELECT ON system.tables"
 - "GRANT SELECT ON system.parts"
 - "GRANT SELECT ON system.query_log"
+# system.numbers is the generator table for time-bucket / gap-fill queries (e.g. the
+# getTraceTimeSeries time series), not a metadata read — but reader clients need it.
+- "GRANT SELECT ON system.numbers"
 - "GRANT SELECT ON information_schema.*"
 {{- end }}

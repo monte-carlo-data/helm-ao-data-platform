@@ -259,9 +259,10 @@ to the normalized target tables. The stock `default` superuser is removed.
 | `readonly_user` | reader bundle¹ | — (`readonly=2`, so JDBC `SET` works) | humans / MCP / JDBC clients | `clickhouse.readonlyUser.enabled=true` |
 | `admin` | all | all + user management + `SYSTEM` | break-glass DBA (not service-to-service; loopback-only by default) | `clickhouse.admin.enabled=true` |
 
-¹ **reader bundle** = `SELECT` on `otel_traces.*`, `system.tables/parts/query_log`, and
-`information_schema.*` — the metadata reads JDBC/MCP clients and Monte Carlo monitoring need. Shared
-by `monte_carlo` and `readonly_user`.
+¹ **reader bundle** = `SELECT` on `otel_traces.*`, `system.tables/parts/query_log`,
+`system.numbers`, and `information_schema.*` — the metadata reads JDBC/MCP clients and Monte Carlo
+monitoring need, plus `system.numbers` for time-bucket / gap-fill queries (e.g. the trace
+time-series). Shared by `monte_carlo` and `readonly_user`.
 
 ² **`otel_metrics`** (`otel_traces.otel_metrics`) is created at runtime by the OTel collector's
 metrics exporter, not by the schema migration Job. It has no SQL file under `charts/.../sql/`; the
