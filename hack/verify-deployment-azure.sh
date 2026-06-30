@@ -15,12 +15,15 @@
 # The AWS deep cloud-API checks (aws ec2 describe-volumes, elbv2 target-health)
 # are intentionally not reimplemented in `az`: the K8s-level signals here (LB or
 # Gateway provisioned with an address, PVCs Bound on Azure managed disks) cover
-# deployment health; end-to-end connectivity is proven by a trace-ingestion test.
+# deployment health, and a final end-to-end trace-ingestion test then proves data
+# actually flows OTLP → collector → ClickHouse.
 #
 # Usage:
 #   ./verify-deployment-azure.sh -n <namespace>
 #
-# Requirements: kubectl (authenticated to the cluster), jq, openssl, base64.
+# Requirements: kubectl (authenticated to the cluster), jq, openssl, base64. The
+# end-to-end check queries ClickHouse as readonly_user, so it requires
+# clickhouse.readonlyUser.enabled=true (same as verify-deployment-aws.sh).
 
 set -euo pipefail
 
@@ -78,14 +81,20 @@ fail() {
 
 svc_annotation() {
   local svc="$1" key="$2"
-  kubectl get svc -n "$NS" "$svc" -o json 2>/dev/null | jq -r ".metadata.annotations[\"${key}\"] // empty"
+  kubectl get svc -n "$NS" "$svc" -o json 2>/dev/null | jq -r --arg k "$key" '.metadata.annotations[$k] // empty'
 }
 
-# Detect public-TLS Gateway mode vs the internal-LB path — the module supports
-# both, and the TLS/LB checks branch on it. Gateway mode terminates public TLS at
-# the managed Gateway and fronts the workloads as ClusterIP; the internal-LB path
-# exposes them directly as internal LoadBalancer Services.
-if kubectl get gateway.gateway.networking.k8s.io -n "$NS" ao-data-platform >/dev/null 2>&1; then
+# Detect managed-Gateway mode vs the internal-LB path — the module supports both, and the
+# TLS/LB checks branch on it. Gateway mode terminates TLS at the managed Gateway (on an
+# internal LB) and fronts the workloads as ClusterIP; the internal-LB path exposes them
+# directly as internal LoadBalancer Services. Resolve the Gateway by the chart's app label
+# (release-name-independent) and capture its real name: the chart derives the Gateway /
+# HTTPRoute / BackendTLSPolicy names from the fullname helper, which is prefixed with the
+# Helm release name unless that name already contains "ao-data-platform".
+GW_NAME=$(kubectl get gateway.gateway.networking.k8s.io -n "$NS" \
+  -l app.kubernetes.io/name=ao-data-platform \
+  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+if [[ -n "$GW_NAME" ]]; then
   GATEWAY_MODE=true
 else
   GATEWAY_MODE=false
@@ -373,31 +382,31 @@ pass "All PVCs are Bound on disk.csi.azure.com volumes (encrypted at rest by def
 # CHECK 13 — Service load balancers are internal and provisioned
 # ─────────────────────────────────────────────────────────────────────────────
 if [[ "$GATEWAY_MODE" == "true" ]]; then
-  banner "Gateway is programmed with a public LB, HTTPRoutes, and re-encrypt BackendTLSPolicies"
+  banner "Gateway is programmed with an internal LB, HTTPRoutes, and re-encrypt BackendTLSPolicies"
 
-  run_cmd "Gateway" kubectl get gateway -n "$NS" ao-data-platform
+  run_cmd "Gateway" kubectl get gateway -n "$NS" "$GW_NAME"
 
-  GW_PROGRAMMED=$(kubectl get gateway -n "$NS" ao-data-platform \
+  GW_PROGRAMMED=$(kubectl get gateway -n "$NS" "$GW_NAME" \
     -o jsonpath='{.status.conditions[?(@.type=="Programmed")].status}' 2>/dev/null || true)
-  [[ "$GW_PROGRAMMED" != "True" ]] && fail "Gateway ao-data-platform is not Programmed (got '${GW_PROGRAMMED}')."
+  [[ "$GW_PROGRAMMED" != "True" ]] && fail "Gateway ${GW_NAME} is not Programmed (got '${GW_PROGRAMMED}')."
 
-  GW_ADDR=$(kubectl get gateway -n "$NS" ao-data-platform \
+  GW_ADDR=$(kubectl get gateway -n "$NS" "$GW_NAME" \
     -o jsonpath='{.status.addresses[0].value}' 2>/dev/null || true)
-  [[ -z "$GW_ADDR" ]] && fail "Gateway ao-data-platform has no assigned LB address."
+  [[ -z "$GW_ADDR" ]] && fail "Gateway ${GW_NAME} has no assigned LB address."
   echo -e "    gateway LB address: ${GW_ADDR}"
 
-  for HR in ao-data-platform-otel ao-data-platform-clickhouse; do
+  for HR in "${GW_NAME}-otel" "${GW_NAME}-clickhouse"; do
     kubectl get httproute -n "$NS" "$HR" >/dev/null 2>&1 || fail "HTTPRoute ${HR} not found."
   done
 
   # BackendTLSPolicy Accepted = the gateway re-encrypts to the (self-signed) backends.
-  for BTP in ao-data-platform-otel ao-data-platform-clickhouse; do
+  for BTP in "${GW_NAME}-otel" "${GW_NAME}-clickhouse"; do
     ACCEPTED=$(kubectl get backendtlspolicy -n "$NS" "$BTP" \
       -o jsonpath='{.status.ancestors[0].conditions[?(@.type=="Accepted")].status}' 2>/dev/null || true)
     [[ "$ACCEPTED" != "True" ]] && fail "BackendTLSPolicy ${BTP} is not Accepted (got '${ACCEPTED}')."
   done
 
-  pass "Gateway programmed (LB ${GW_ADDR}), both HTTPRoutes present, BackendTLSPolicies Accepted (re-encrypt active)."
+  pass "Gateway ${GW_NAME} programmed (internal LB ${GW_ADDR}), both HTTPRoutes present, BackendTLSPolicies Accepted (re-encrypt active)."
 else
   banner "ClickHouse and OTel Services are internal LBs with an assigned IP"
 
@@ -419,6 +428,76 @@ else
   done
 
   pass "ClickHouse and OTel Services are internal load balancers with assigned IPs."
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHECK 14 — End-to-end smoke test: OTLP trace → collector → ClickHouse
+# ─────────────────────────────────────────────────────────────────────────────
+banner "End-to-end smoke test: send a trace via OTLP and verify it lands in ClickHouse"
+
+# Read-only ClickHouse credential for the query below. Like verify-deployment-aws.sh, the
+# data check runs as readonly_user, so clickhouse.readonlyUser.enabled=true is required.
+CH_READ_USER="readonly_user"
+CH_READ_PW=$(kubectl get secret -n "$NS" ao-clickhouse-readonly-user-credentials \
+  -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || true)
+if [[ -z "$CH_READ_PW" ]]; then
+  fail "readonly_user credential (secret ao-clickhouse-readonly-user-credentials) not found — set clickhouse.readonlyUser.enabled=true to run the end-to-end trace check."
+fi
+
+# Random 16-byte trace id / 8-byte span id (openssl is already a requirement; this is
+# portable, unlike GNU-only date +%N).
+TRACE_ID=$(openssl rand -hex 16)
+SPAN_ID=$(openssl rand -hex 8)
+NOW_NS="$(date +%s)000000000"
+
+TRACE_JSON=$(cat <<EOJSON
+{
+  "resourceSpans": [{
+    "resource": {"attributes": [{"key": "service.name", "value": {"stringValue": "verify-deployment-smoke-test"}}]},
+    "scopeSpans": [{
+      "spans": [{
+        "traceId": "${TRACE_ID}",
+        "spanId": "${SPAN_ID}",
+        "name": "smoke-test-span",
+        "kind": 1,
+        "startTimeUnixNano": "${NOW_NS}",
+        "endTimeUnixNano": "${NOW_NS}",
+        "status": {}
+      }]
+    }]
+  }]
+}
+EOJSON
+)
+
+echo ""
+echo -e "  ${YELLOW}▸ Sending a test trace to the OTel collector (in-cluster OTLP/HTTP)${RESET}"
+echo "    TraceId: ${TRACE_ID}"
+# Ephemeral curl pod → the collector Service directly (this isolates the data path:
+# collector → ClickHouse; the gateway/LB edge is already covered by CHECK 13). -k because
+# the collector serves its in-cluster self-signed cert on 4318.
+SEND_RESULT=$(kubectl run -n "$NS" verify-smoke-test-azure --rm -i --restart=Never \
+  --image=curlimages/curl -- \
+  -sk -X POST "https://opentelemetry-collector:4318/v1/traces" \
+  -H "Content-Type: application/json" \
+  -d "$TRACE_JSON" 2>/dev/null | grep -v '^pod "' || true)
+echo "    Collector response: ${SEND_RESULT}"
+
+echo ""
+echo -e "  ${YELLOW}▸ Querying ClickHouse for the trace (allowing for batch-processor flush)...${RESET}"
+SMOKE_COUNT=0
+for _ in 1 2 3 4 5 6; do
+  sleep 5
+  SMOKE_COUNT=$(kubectl exec -n "$NS" "$CH_POD" -- \
+    clickhouse-client --user "$CH_READ_USER" --password "$CH_READ_PW" \
+    --query "SELECT count() FROM otel_traces.otel_traces WHERE TraceId = '${TRACE_ID}'" 2>/dev/null || echo 0)
+  [[ "$SMOKE_COUNT" =~ ^[0-9]+$ && "$SMOKE_COUNT" -gt 0 ]] && break
+done
+
+if [[ "$SMOKE_COUNT" =~ ^[0-9]+$ && "$SMOKE_COUNT" -gt 0 ]]; then
+  pass "Trace ${TRACE_ID} landed in ClickHouse (${SMOKE_COUNT} row(s)) — end-to-end OTLP → collector → ClickHouse works."
+else
+  fail "Trace ${TRACE_ID} did not arrive in ClickHouse within ~30s — the end-to-end pipeline may be broken (collector ingest, schema, or backend TLS)."
 fi
 
 echo ""
