@@ -211,6 +211,64 @@ helm upgrade --install ao-data-platform charts/ao-data-platform/ -n montecarlo -
   -f my-values.yaml
 ```
 
+## Deploying to Azure (AKS)
+
+On Azure the chart exposes the collector and ClickHouse through the **managed AKS Gateway API**
+(the application-routing add-on), terminating TLS at per-hostname HTTPS listeners and re-encrypting
+to the in-cluster backends. This path is **opt-in** (`gateway.enabled=true`) and **disabled by
+default**, so AWS and local installs are unaffected.
+
+The Gateway's load balancer is **always internal** (private IP only) — the collector and ClickHouse
+endpoints are never publicly reachable and are reached over private connectivity. There is no
+public-access option; internal is hardcoded.
+
+### Prerequisites
+
+- An AKS cluster with the **application-routing add-on** enabled, providing the Gateway API CRDs
+  and the `approuting-istio` GatewayClass (`gateway.className`)
+- [cert-manager](https://cert-manager.io/) and [trust-manager](https://cert-manager.io/docs/trust/trust-manager/),
+  with trust-manager's trust namespace set to the release namespace
+- [External Secrets Operator](https://external-secrets.io/) with a `ClusterSecretStore` for Azure
+  Key Vault (the ClickHouse user passwords)
+- A Workload Identity for the cert-manager DNS-01 solver, with access to the DNS zone
+- A DNS zone for the listener hostnames — Let's Encrypt validates via DNS-01 (DNS records, not
+  endpoint reachability), so it issues publicly-trusted certs even though the endpoints are private.
+  Point `gateway.otelHostname` / `gateway.clickhouseHostname` at the Gateway's private LB IP.
+
+The companion Azure Terraform module provisions all of the above (add-on, cert-manager, trust-manager,
+ESO, Key Vault, Workload Identities) and renders the matching values; deploying the chart standalone
+means reproducing those prerequisites yourself.
+
+### Enabling the gateway
+
+Supply environment-specific configuration in your own values file and pass it with `-f`:
+
+```yaml
+gateway:
+  enabled: true
+  otelHostname: otel.<your-zone>          # resolves to the Gateway's private LB IP
+  clickhouseHostname: clickhouse.<your-zone>
+  tls:
+    source: letsencrypt                   # only supported source
+    letsencrypt:
+      email: ""                           # optional ACME contact
+      azureDNS:
+        hostedZoneName: <your-zone>
+        resourceGroupName: <dns-rg>
+        subscriptionID: <subscription-id>
+        managedIdentityClientID: <cert-manager-workload-identity-client-id>
+```
+
+```bash
+helm dependency build charts/ao-data-platform/
+helm upgrade --install ao-data-platform charts/ao-data-platform/ -n montecarlo --create-namespace \
+  -f my-values.yaml
+```
+
+`gateway.backendTLS.enabled` (default `true`) re-encrypts the Gateway→backend hop and requires
+`tls.enabled=true` — both are validated at render time, so an invalid combination fails the install
+rather than breaking silently. Verify with `kubectl get gateway,httproute,certificate -n montecarlo`.
+
 ## CI / CD
 
 CircleCI runs on every push:
