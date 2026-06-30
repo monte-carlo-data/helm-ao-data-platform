@@ -2,6 +2,9 @@
 {{- if ne .Values.gateway.tls.source "letsencrypt" }}
 {{- fail "gateway.tls.source must be \"letsencrypt\" — the Key Vault (BYO-cert) source is reserved for a future release and not yet implemented." }}
 {{- end }}
+{{- if and .Values.gateway.backendTLS.enabled (not .Values.tls.enabled) }}
+{{- fail "gateway.backendTLS.enabled requires tls.enabled=true — backend re-encrypt validates the ClickHouse https/8443 listener, which only exists when internal TLS is on. Set tls.enabled=true, or gateway.backendTLS.enabled=false." }}
+{{- end }}
 # Managed AKS Gateway API (application routing add-on). One Gateway, two HTTPS
 # listeners terminating TLS per-hostname for the collector and ClickHouse.
 # Backends are ClusterIP; the internal self-signed path is untouched.

@@ -204,7 +204,9 @@ gateway:
   # Re-encrypt the Gateway→backend hop and validate the backends' self-signed certs
   # against the in-cluster CA (preserves the internal-TLS posture). Requires trust-
   # manager (installed by the TF module) to sync the CA Secret into a ConfigMap, and
-  # its trust namespace set to this release's namespace.
+  # its trust namespace set to this release's namespace. Requires tls.enabled=true —
+  # the ClickHouse https/8443 listener this validates only exists when internal TLS is
+  # on (enforced at render time).
   backendTLS:
     enabled: true
   tls:
