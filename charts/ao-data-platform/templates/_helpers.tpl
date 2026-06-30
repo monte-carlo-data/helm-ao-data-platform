@@ -62,3 +62,61 @@ Selector labels.
 app.kubernetes.io/name: {{ include "ao-data-platform.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
+
+{{/*
+ExternalSecret for a ClickHouse user password.
+One ExternalSecret per CH user that has a Secrets-Manager-backed password, factored here so the
+otel / schema_owner / llm_worker / monte_carlo / admin / readonly_user blocks don't each repeat it.
+Call with a dict: {root: $, name: <k8s secret name>, externalSecret: <the user's externalSecret cfg>}.
+Adding a ClickHouse user? Also update values.yaml and templates/clickhouse-installation.yaml.
+*/}}
+{{- define "ao-data-platform.externalSecret" -}}
+{{- $root := .root -}}
+{{- $name := .name -}}
+{{- $es := .externalSecret -}}
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "ao-data-platform.labels" $root | nindent 4 }}
+spec:
+  refreshInterval: {{ $es.refreshInterval }}
+  secretStoreRef:
+    name: {{ required (printf "externalSecret.secretStoreRef.name is required for secret %s — set via clickhouse.<user>.externalSecret.secretStoreRef.name" $name) $es.secretStoreRef.name }}
+    kind: {{ $es.secretStoreRef.kind }}
+  target:
+    name: {{ $name }}
+    creationPolicy: Owner
+  data:
+    - secretKey: password
+      remoteRef:
+        key: {{ required (printf "externalSecret.remoteRef.key is required for secret %s — set via clickhouse.<user>.externalSecret.remoteRef.key" $name) $es.remoteRef.key }}
+        {{- if $es.remoteRef.property }}
+        property: {{ $es.remoteRef.property }}
+        {{- end }}
+        {{- if $es.remoteRef.version }}
+        version: {{ $es.remoteRef.version }}
+        {{- end }}
+{{- end }}
+
+{{/*
+Shared read-only grant bundle (the "reader bundle").
+Granted to both monte_carlo (reader + queue producer) and readonly_user (human/MCP/JDBC). Covers the
+telemetry DB plus the metadata reads DataGrip/MCP and Monte Carlo data-source monitoring need. Keep
+this as the single source of truth — adding a read target means editing it here once.
+Emits YAML list items (`- "GRANT …"`) intended for inclusion under a CHI `<user>/grants/query`
+sequence. Must be called with `| nindent 8` to align with the surrounding 8-space indent used in
+templates/clickhouse-installation.yaml. Call with the root context (`.`).
+*/}}
+{{- define "ao-data-platform.readerGrants" -}}
+- "GRANT SELECT ON otel_traces.*"
+- "GRANT SELECT ON system.tables"
+- "GRANT SELECT ON system.parts"
+- "GRANT SELECT ON system.query_log"
+# system.numbers is the generator table for time-bucket / gap-fill queries (e.g. the
+# getTraceTimeSeries time series), not a metadata read — but reader clients need it.
+- "GRANT SELECT ON system.numbers"
+- "GRANT SELECT ON information_schema.*"
+{{- end }}

@@ -763,16 +763,29 @@ done
 pass "OTel Collector TLS certificates on ports 4317 and 4318 are valid and verified against the CA."
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Read-only credential for the schema/data checks below (CHECK 28+). These run as readonly_user,
+# so enable it (readonlyUser.enabled=true) to run this verification. Avoids the removed `default`
+# user and the write-scoped otel / schema_owner identities.
+# ─────────────────────────────────────────────────────────────────────────────
+CH_READ_USER="readonly_user"
+CH_READ_PW=$(kubectl get secret -n "$NS" ao-clickhouse-readonly-user-credentials \
+  -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || true)
+if [[ -z "$CH_READ_PW" ]]; then
+  fail "readonly_user credential not found — enable readonlyUser (readonlyUser.enabled=true) to run the ClickHouse data checks."
+fi
+echo -e "  ${YELLOW}▸ Using ClickHouse reader 'readonly_user' for schema/data checks${RESET}"
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CHECK 28 — ClickHouse database and schema
 # ─────────────────────────────────────────────────────────────────────────────
 banner "ClickHouse database 'otel_traces' and tables exist"
 
 run_cmd "Databases" \
   kubectl exec -n "$NS" "$CH_POD" -- \
-    clickhouse-client --query "SHOW DATABASES"
+    clickhouse-client --user "$CH_READ_USER" --password "$CH_READ_PW" --query "SHOW DATABASES"
 
 DB_EXISTS=$(kubectl exec -n "$NS" "$CH_POD" -- \
-  clickhouse-client --query "SELECT name FROM system.databases WHERE name='otel_traces'" 2>/dev/null)
+  clickhouse-client --user "$CH_READ_USER" --password "$CH_READ_PW" --query "SELECT name FROM system.databases WHERE name='otel_traces'" 2>/dev/null)
 
 if [[ -z "$DB_EXISTS" ]]; then
   fail "Database 'otel_traces' does not exist in ClickHouse."
@@ -780,11 +793,11 @@ fi
 
 run_cmd "Tables in otel_traces" \
   kubectl exec -n "$NS" "$CH_POD" -- \
-    clickhouse-client --query "SHOW TABLES FROM otel_traces"
+    clickhouse-client --user "$CH_READ_USER" --password "$CH_READ_PW" --query "SHOW TABLES FROM otel_traces"
 
 for TABLE in otel_traces otel_traces_trace_id_ts; do
   TABLE_EXISTS=$(kubectl exec -n "$NS" "$CH_POD" -- \
-    clickhouse-client --query "SELECT name FROM system.tables WHERE database='otel_traces' AND name='${TABLE}'" 2>/dev/null)
+    clickhouse-client --user "$CH_READ_USER" --password "$CH_READ_PW" --query "SELECT name FROM system.tables WHERE database='otel_traces' AND name='${TABLE}'" 2>/dev/null)
   if [[ -z "$TABLE_EXISTS" ]]; then
     fail "Table 'otel_traces.${TABLE}' does not exist."
   fi
@@ -792,7 +805,7 @@ done
 
 # Check materialized view
 MV_EXISTS=$(kubectl exec -n "$NS" "$CH_POD" -- \
-  clickhouse-client --query "SELECT name FROM system.tables WHERE database='otel_traces' AND name='otel_traces_trace_id_ts_mv'" 2>/dev/null)
+  clickhouse-client --user "$CH_READ_USER" --password "$CH_READ_PW" --query "SELECT name FROM system.tables WHERE database='otel_traces' AND name='otel_traces_trace_id_ts_mv'" 2>/dev/null)
 if [[ -z "$MV_EXISTS" ]]; then
   fail "Materialized view 'otel_traces.otel_traces_trace_id_ts_mv' does not exist."
 fi
@@ -819,6 +832,110 @@ if [[ "$AUTH_RESULT" != "auth_ok" ]]; then
 fi
 
 pass "ClickHouse 'otel' user authenticated successfully."
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ClickHouse least-privilege user model
+#
+# Each user authenticates and holds the expected grants, and the security-critical
+# denials are enforced. Queries run as each user over the pod's local port via
+# `kubectl exec`, so this works while the users' networks/ip include loopback (the
+# default). Once per-caller network scoping restricts a user to specific external
+# CIDRs, the loopback path stops working for that user and these checks must move to
+# the Service endpoint.
+# ─────────────────────────────────────────────────────────────────────────────
+banner "ClickHouse least-privilege user model"
+
+# Both tolerate non-zero (set -euo pipefail is on): callers inspect the *output*, not the exit
+# status — a missing secret yields "" and a denied query yields the error text, so the explicit
+# guards/assertions below fire and print instead of the script dying silently mid-check.
+ch_pw() { kubectl get secret -n "$NS" "$1" -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || true; }
+ch_as() { kubectl exec -n "$NS" "$CH_POD" -- env CLICKHOUSE_PASSWORD="$2" clickhouse-client --user "$1" --query "$3" </dev/null 2>&1 || true; }
+
+expect_grant() {  # label user pw needle
+  if ch_as "$2" "$3" "SHOW GRANTS" | grep -qiF "$4"; then pass "$1"; else fail "$1 — expected grant missing: $4"; fi
+}
+forbid_grant() {  # label user pw needle
+  if ch_as "$2" "$3" "SHOW GRANTS" | grep -qiF "$4"; then fail "$1 — unexpected grant present: $4"; else pass "$1"; fi
+}
+expect_ok() {     # label user pw sql
+  local o; o=$(ch_as "$2" "$3" "$4")
+  if echo "$o" | grep -qiE "exception|access_denied|not enough priv"; then fail "$1 — $o"; else pass "$1"; fi
+}
+expect_denied() { # label user pw sql
+  local o; o=$(ch_as "$2" "$3" "$4")
+  if echo "$o" | grep -qiE "access_denied|not enough priv"; then pass "$1"; else fail "$1 — expected ACCESS_DENIED, got: $o"; fi
+}
+
+SO_PW=$(ch_pw ao-clickhouse-schema-owner-credentials)
+WK_PW=$(ch_pw ao-clickhouse-llm-worker-credentials)
+MC_PW=$(ch_pw ao-clickhouse-monte-carlo-credentials)
+AD_PW=$(ch_pw ao-clickhouse-admin-credentials)
+# otel password = $CH_PASSWORD (above); readonly_user = $CH_READ_PW (reader block).
+for pair in "schema_owner:$SO_PW" "llm_worker:$WK_PW" "monte_carlo:$MC_PW"; do
+  name="${pair%%:*}"; pw="${pair#*:}"
+  [[ -z "$pw" ]] && fail "ClickHouse per-user secret for '$name' is missing — this cluster predates the least-privilege user model (chart not yet migrated)."
+done
+
+# schema_owner — owns the schema (DDL); deliberately has no access management rights.
+expect_grant   "schema_owner holds DDL on otel_traces"     schema_owner "$SO_PW" "CREATE TABLE"
+forbid_grant   "schema_owner has no access management"     schema_owner "$SO_PW" "ACCESS MANAGEMENT"
+# SHOW USERS is an access-management-gated op that creates no entity, so it stays correct on
+# re-runs. A CREATE USER probe could false-FAIL on a leftover user (ALREADY_EXISTS, not denied),
+# and schema_owner lacks the privilege to drop it for cleanup.
+expect_denied  "schema_owner cannot manage users"          schema_owner "$SO_PW" "SHOW USERS"
+
+# llm_worker — queue read/write only; must NOT read telemetry.
+expect_ok      "llm_worker reads the queue"                llm_worker "$WK_PW" "SELECT count() FROM otel_traces.llm_batches"
+expect_grant   "llm_worker can append results"             llm_worker "$WK_PW" "INSERT ON otel_traces.llm_results"
+expect_denied  "llm_worker cannot read telemetry"          llm_worker "$WK_PW" "SELECT count() FROM otel_traces.spans_normalized"
+expect_denied  "llm_worker cannot write telemetry"         llm_worker "$WK_PW" "INSERT INTO otel_traces.otel_traces (Timestamp) VALUES (now())"
+
+# monte_carlo — reads everything + produces to the queue, but must NOT write telemetry.
+expect_ok      "monte_carlo reads telemetry"               monte_carlo "$MC_PW" "SELECT count() FROM otel_traces.spans_normalized"
+# system.numbers backs time-bucket / gap-fill queries (e.g. getTraceTimeSeries); reader bundle grant.
+expect_ok      "monte_carlo can read system.numbers"       monte_carlo "$MC_PW" "SELECT number FROM system.numbers LIMIT 1"
+expect_grant   "monte_carlo can produce to the queue"      monte_carlo "$MC_PW" "INSERT ON otel_traces.llm_inputs"
+expect_grant   "monte_carlo can produce to llm_batches"    monte_carlo "$MC_PW" "INSERT ON otel_traces.llm_batches"
+expect_denied  "monte_carlo cannot write telemetry"        monte_carlo "$MC_PW" "INSERT INTO otel_traces.otel_traces (Timestamp) VALUES (now())"
+forbid_grant   "monte_carlo cannot write otel_metrics"     monte_carlo "$MC_PW" "GRANT INSERT ON otel_traces.otel_metrics"
+
+# readonly_user — SELECT-only; readonly=2 profile blocks writes even without an explicit deny grant.
+expect_ok      "readonly_user reads telemetry"             readonly_user "$CH_READ_PW" "SELECT count() FROM otel_traces.spans_normalized"
+expect_ok      "readonly_user can read system.numbers"     readonly_user "$CH_READ_PW" "SELECT number FROM system.numbers LIMIT 1"
+forbid_grant   "readonly_user is SELECT-only"              readonly_user "$CH_READ_PW" "GRANT INSERT"
+expect_denied  "readonly_user cannot write (runtime)"      readonly_user "$CH_READ_PW" "INSERT INTO otel_traces.otel_traces (Timestamp) VALUES (now())"
+
+# otel — always an ingester; its grant shape varies by restrictGrants state.
+#   Set VERIFY_OTEL_RESTRICTED=true to assert the INSERT-only (post-cutover) posture;
+#   leave unset (default) to warn-and-pass for pre-cutover clusters.
+if [[ "${VERIFY_OTEL_RESTRICTED:-false}" == "true" ]]; then
+  expect_denied "otel is INSERT-only" otel "$CH_PASSWORD" "SELECT count() FROM otel_traces.otel_traces"
+elif ch_as otel "$CH_PASSWORD" "SELECT count() FROM otel_traces.otel_traces" | grep -qiE "access_denied|not enough priv"; then
+  pass "otel is INSERT-only (restrictGrants enabled)"
+else
+  echo -e "  ${YELLOW}⚠ otel can still read telemetry — restrictGrants not yet enabled (expected pre-cutover)${RESET}"
+fi
+
+# admin — only when enabled; superuser, reachable over loopback (this exec is loopback).
+# SHOW GRANTS renders as `GRANT ALL ON *.* TO admin WITH GRANT OPTION`, so the grant-all and
+# the grant-option are non-contiguous — check each substring separately (expect_grant is grep -F).
+if [[ -n "$AD_PW" ]]; then
+  expect_grant "admin is a superuser"      admin "$AD_PW" "GRANT ALL ON *.*"
+  expect_grant "admin can delegate grants" admin "$AD_PW" "WITH GRANT OPTION"
+else
+  echo -e "  ${YELLOW}▸ admin user not enabled — skipping${RESET}"
+fi
+
+# Materialized views must run under schema_owner as their DEFINER.
+for mv in otel_traces_trace_id_ts_mv spans_normalized_mv conversations_normalized_mv; do
+  if ch_as schema_owner "$SO_PW" "SHOW CREATE TABLE otel_traces.$mv" | grep -qiE "DEFINER *= *\`?schema_owner\`?"; then
+    pass "MV $mv runs as schema_owner (DEFINER)"
+  else
+    fail "MV $mv is not owned by schema_owner — the normalization cascade will break once otel is restricted"
+  fi
+done
+
+pass "ClickHouse least-privilege user model verified."
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CHECK 30 — OTel Collector health check
@@ -907,10 +1024,10 @@ sleep 8
 
 run_cmd "Query ClickHouse for trace ${TRACE_ID}" \
   kubectl exec -n "$NS" "$CH_POD" -- \
-    clickhouse-client --query "SELECT ServiceName, SpanName, TraceId FROM otel_traces.otel_traces WHERE TraceId = '${TRACE_ID}' LIMIT 5"
+    clickhouse-client --user "$CH_READ_USER" --password "$CH_READ_PW" --query "SELECT ServiceName, SpanName, TraceId FROM otel_traces.otel_traces WHERE TraceId = '${TRACE_ID}' LIMIT 5"
 
 SMOKE_RESULT=$(kubectl exec -n "$NS" "$CH_POD" -- \
-  clickhouse-client --query "SELECT count() FROM otel_traces.otel_traces WHERE TraceId = '${TRACE_ID}'" 2>/dev/null)
+  clickhouse-client --user "$CH_READ_USER" --password "$CH_READ_PW" --query "SELECT count() FROM otel_traces.otel_traces WHERE TraceId = '${TRACE_ID}'" 2>/dev/null)
 
 if [[ "$SMOKE_RESULT" -gt 0 ]] 2>/dev/null; then
   pass "Trace ${TRACE_ID} arrived in ClickHouse (${SMOKE_RESULT} row(s)). End-to-end pipeline is working."
@@ -969,10 +1086,10 @@ EOJSON2
 
   run_cmd "Query ClickHouse for trace ${NLB_TRACE_ID}" \
     kubectl exec -n "$NS" "$CH_POD" -- \
-      clickhouse-client --query "SELECT ServiceName, SpanName, TraceId FROM otel_traces.otel_traces WHERE TraceId = '${NLB_TRACE_ID}' LIMIT 5"
+      clickhouse-client --user "$CH_READ_USER" --password "$CH_READ_PW" --query "SELECT ServiceName, SpanName, TraceId FROM otel_traces.otel_traces WHERE TraceId = '${NLB_TRACE_ID}' LIMIT 5"
 
   NLB_SMOKE_RESULT=$(kubectl exec -n "$NS" "$CH_POD" -- \
-    clickhouse-client --query "SELECT count() FROM otel_traces.otel_traces WHERE TraceId = '${NLB_TRACE_ID}'" 2>/dev/null)
+    clickhouse-client --user "$CH_READ_USER" --password "$CH_READ_PW" --query "SELECT count() FROM otel_traces.otel_traces WHERE TraceId = '${NLB_TRACE_ID}'" 2>/dev/null)
 
   if [[ "$NLB_SMOKE_RESULT" -gt 0 ]] 2>/dev/null; then
     pass "Trace ${NLB_TRACE_ID} sent via OTel NLB arrived in ClickHouse. NLB → OTel → ClickHouse pipeline is working."

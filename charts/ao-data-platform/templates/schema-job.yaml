@@ -40,7 +40,7 @@ spec:
               # Single point of truth for the client invocation (host/auth/TLS),
               # used by the readiness probe, the migration loop, and the TTL step.
               ch() {
-                clickhouse-client --host clickhouse-otel --user otel --password "${CLICKHOUSE_PASSWORD}"{{ if .Values.tls.enabled }} --secure --port 9440{{ end }} "$@"
+                clickhouse-client --host clickhouse-otel --user schema_owner --password "${CLICKHOUSE_PASSWORD}"{{ if .Values.tls.enabled }} --secure --port 9440{{ end }} "$@"
               }
               # MODIFY TTL with materialize_ttl_after_modify=0: update table metadata
               # only — TTL is enforced by normal background merges, avoiding a heavy
@@ -108,7 +108,7 @@ spec:
             - name: CLICKHOUSE_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.clickhouse.otelSecret }}
+                  name: {{ .Values.clickhouse.schemaOwner.secret }}
                   key: password
             {{- if .Values.tls.enabled }}
             - name: SSL_CERT_FILE

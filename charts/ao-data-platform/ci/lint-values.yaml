@@ -3,12 +3,32 @@
 # `helm lint` does not fully render subchart values, so a typo or wrong nesting
 # in a deep path (e.g. the operator's `altinity-clickhouse-operator.configs.files`
 # label allowlist) would pass lint while being silently ignored. The lint job
-# renders the chart with these values to catch that, but the ClickHouse user has a
-# required ExternalSecret field with no default — supply a placeholder here so the
-# render reaches every template. These are CI placeholders only and are never deployed.
+# renders the chart with these values to catch that, but the always-on ClickHouse
+# users have required ExternalSecret fields with no defaults — supply placeholders
+# here so the render reaches every template. These are CI placeholders only and
+# are never deployed.
 clickhouse:
-  externalSecret:
-    secretStoreRef:
-      name: ci-placeholder
-    remoteRef:
-      key: ci-placeholder
+  otel:
+    externalSecret:
+      secretStoreRef:
+        name: ci-placeholder
+      remoteRef:
+        key: ci-placeholder
+  schemaOwner:
+    externalSecret:
+      secretStoreRef:
+        name: ci-placeholder
+      remoteRef:
+        key: ci-placeholder
+  llmWorker:
+    externalSecret:
+      secretStoreRef:
+        name: ci-placeholder
+      remoteRef:
+        key: ci-placeholder
+  monteCarlo:
+    externalSecret:
+      secretStoreRef:
+        name: ci-placeholder
+      remoteRef:
+        key: ci-placeholder

@@ -13,7 +13,7 @@ clickhouse:
   # trace-id timestamp index, and the normalized spans. The schema job re-applies
   # this on every install and upgrade via `ALTER TABLE … MODIFY TTL`, so changing
   # it here takes effect on existing tables (unlike the system-log TTLs); the SQL
-  # files carry the same value as their create-time default. The SaaS terraform
+  # files carry the same value as their create-time default. A consuming terraform
   # module's `clickhouse_ttl_days` variable maps onto this key.
   #
   # Scope: telemetry only. The llm_* tables are the LLM worker's job-queue state
@@ -24,29 +24,127 @@ clickhouse:
   # Note: shrinking the value purges already-expired data lazily on the next
   # background merge, not immediately — see README for the manual-purge escape hatch.
   ttlDays: 30
-  # Name of the K8s Secret containing a "password" key for the otel user.
-  # This secret is created by the ExternalSecret below.
-  otelSecret: ao-clickhouse-otel-credentials
-  # CIDR list allowed to authenticate as the otel user. Default is open
-  # (matches CH's default user model); the SaaS-deployed terraform module
-  # overrides this with the deployment's VPC CIDR. Per-user tightening
-  # (otel → pod CIDR, separate reader/admin users) is a planned follow-up.
-  otelNetworksIp:
-    - "0.0.0.0/0"
-  externalSecret:
-    secretStoreRef:
-      name: ""                    # user must provide
-      kind: ClusterSecretStore
-    remoteRef:
-      key: ""                     # user must provide
-      property: ""                # optional, for JSON secrets
-      version: ""                 # optional, required for Fake provider
-    refreshInterval: 1h
+  # Adding a ClickHouse user? Also update templates/clickhouse-installation.yaml and templates/external-secret.yaml.
+  # otel — the OTel collector ingest identity. Writes raw telemetry into otel_traces.otel_traces
+  # (and otel_metrics when the metrics exporter is active). The MV cascade runs as schema_owner
+  # (the MV DEFINER), so otel needs nothing on the normalized targets.
+  otel:
+    # Name of the K8s Secret containing a "password" key for the otel user.
+    # This secret is created by the ExternalSecret below.
+    secret: ao-clickhouse-otel-credentials
+    # CIDR list allowed to authenticate as the otel user. Default is open. Network reachability is
+    # typically restricted one layer up at the load balancer's source ranges (set by the deploying
+    # environment); this CH-user-level list is independent of that. Per-caller CH-level network
+    # scoping (otel → pod CIDR, etc.) is handled separately.
+    networksIp:
+      - "0.0.0.0/0"
+    # When true, otel is restricted (via config grants) to INSERT on the telemetry source tables
+    # only — the least-privilege ingest role for the OTel collector. The MV cascade runs as
+    # schema_owner (the MV DEFINER), so otel needs nothing on the normalized targets. Default
+    # false keeps otel broad (implicit full access) so it can be enabled in a later step, once any
+    # external readers have moved to the monte_carlo user and the MVs are reparented onto schema_owner.
+    restrictGrants: false
+    externalSecret:
+      secretStoreRef:
+        name: ""                  # user must provide
+        kind: ClusterSecretStore
+      remoteRef:
+        key: ""                   # user must provide
+        property: ""              # optional, for JSON secrets
+        version: ""               # optional, required for Fake provider
+      refreshInterval: 1h
+  # schema_owner — owns the schema and is the materialized-view DEFINER. Used by the
+  # schema-migration Job for all DDL (CREATE DATABASE/TABLE/VIEW/MV), the telemetry-table
+  # TTL ALTERs, the system-log TTL ALTERs, and SYSTEM FLUSH LOGS. Because the MVs run under
+  # this user as their DEFINER, it must persist with its grants for the normalization
+  # pipeline to keep writing. Created by the ExternalSecret below.
+  schemaOwner:
+    secret: ao-clickhouse-schema-owner-credentials
+    # CIDR list allowed to authenticate as schema_owner (in-cluster). Default open; tighten per
+    # environment as needed. Per-caller network scoping is handled separately.
+    networksIp:
+      - "0.0.0.0/0"
+    externalSecret:
+      secretStoreRef:
+        name: ""                  # user must provide
+        kind: ClusterSecretStore
+      remoteRef:
+        key: ""                   # user must provide
+        property: ""              # optional, for JSON secrets
+        version: ""               # optional, required for Fake provider
+      refreshInterval: 1h
+  # llm_worker — identity for the llm-worker Deployment. Reads the LLM job queue and appends
+  # results back (no mutations): SELECT on llm_batches/llm_inputs/llm_results, INSERT on
+  # llm_batches/llm_results. Created by the ExternalSecret below.
+  llmWorker:
+    secret: ao-clickhouse-llm-worker-credentials
+    # CIDR list allowed to authenticate as llm_worker (in-cluster). Default open; tighten per env.
+    networksIp:
+      - "0.0.0.0/0"
+    externalSecret:
+      secretStoreRef:
+        name: ""                  # user must provide
+        kind: ClusterSecretStore
+      remoteRef:
+        key: ""                   # user must provide
+        property: ""              # optional, for JSON secrets
+        version: ""               # optional, required for Fake provider
+      refreshInterval: 1h
+  # monte_carlo — the Monte Carlo read-only service account (data-source monitoring) and the
+  # agent's LLM-queue producer. Reads everything via the shared reader bundle and appends to the
+  # queue (llm_inputs/llm_batches) + conversation_eval_scores. NOT a readonly-profile user — it
+  # needs INSERT, so its read-mostly shape is enforced by grants alone. Created by the
+  # ExternalSecret below. (The agent's credential is configured in the consuming application, not
+  # here — the chart only provisions the user + password.)
+  monteCarlo:
+    secret: ao-clickhouse-monte-carlo-credentials
+    # CIDR list allowed to authenticate as monte_carlo (external callers: the agent + monitoring).
+    # Default open; tightening to the caller's real source is handled separately.
+    networksIp:
+      - "0.0.0.0/0"
+    externalSecret:
+      secretStoreRef:
+        name: ""                  # user must provide
+        kind: ClusterSecretStore
+      remoteRef:
+        key: ""                   # user must provide
+        property: ""              # optional, for JSON secrets
+        version: ""               # optional, required for Fake provider
+      refreshInterval: 1h
+  # admin — gated break-glass superuser: full access + user management + SYSTEM. OFF by default.
+  # By default it is reachable only over loopback (see networksIp), so using it requires exec-ing
+  # into the ClickHouse pod — i.e. "who can be admin" reduces to who can exec into the pod. NOT for
+  # service-to-service: routine grant changes go through the chart (config grants + upgrade), not
+  # this user. It exists for SYSTEM / BACKUP / ad-hoc DDL the operator never performs and which no
+  # other user can do once the default superuser is removed.
+  admin:
+    enabled: false
+    secret: ao-clickhouse-admin-credentials
+    # CIDR list allowed to authenticate as admin. Defaults to loopback only, so admin is usable
+    # solely by exec-ing into the ClickHouse pod and connecting locally. Override only if you
+    # genuinely need remote admin; remote reads should use readonly_user instead. (::1 is included
+    # because clickhouse-client commonly resolves localhost to IPv6 loopback.)
+    networksIp:
+      - "127.0.0.1"
+      - "::1"
+    externalSecret:
+      secretStoreRef:
+        name: ""                  # user must provide
+        kind: ClusterSecretStore
+      remoteRef:
+        key: ""                   # user must provide
+        property: ""              # optional, for JSON secrets
+        version: ""               # optional, required for Fake provider
+      refreshInterval: 1h
   readonlyUser:
     enabled: false
     # Name of the K8s Secret containing a "password" key for the readonly_user.
     # Created by the gated ExternalSecret below when enabled = true.
     secret: ao-clickhouse-readonly-user-credentials
+    # CIDR list allowed to authenticate as readonly_user (human/MCP/JDBC clients). Default open;
+    # per-caller tightening is handled separately.
+    networksIp:
+      - "0.0.0.0/0"
     externalSecret:
       secretStoreRef:
         name: ""                  # user must provide
@@ -193,8 +291,8 @@ opentelemetry-collector:
         - sh
         - -c
         - |
-          echo "Waiting for otel_traces database..."
-          until clickhouse-client --host clickhouse-otel --user otel --password "${CLICKHOUSE_PASSWORD}" --secure --port 9440 --query "SELECT 1 FROM system.databases WHERE name='otel_traces'" 2>/dev/null | grep -q 1; do
+          echo "Waiting for otel_traces.otel_traces table..."
+          until clickhouse-client --host clickhouse-otel --user otel --password "${CLICKHOUSE_PASSWORD}" --secure --port 9440 --query "EXISTS TABLE otel_traces.otel_traces" 2>/dev/null | grep -q 1; do
             sleep 2
           done
           echo "Database ready."
@@ -202,6 +300,8 @@ opentelemetry-collector:
         - name: CLICKHOUSE_PASSWORD
           valueFrom:
             secretKeyRef:
+              # Keep in sync with clickhouse.otel.secret — this sub-chart value is plain YAML
+              # (not templated), so overriding clickhouse.otel.secret does not propagate here.
               name: ao-clickhouse-otel-credentials
               key: password
         - name: SSL_CERT_FILE
@@ -215,6 +315,8 @@ opentelemetry-collector:
     - name: CLICKHOUSE_PASSWORD
       valueFrom:
         secretKeyRef:
+          # Keep in sync with clickhouse.otel.secret — this sub-chart value is plain YAML
+          # (not templated), so overriding clickhouse.otel.secret does not propagate here.
           name: ao-clickhouse-otel-credentials
           key: password
     - name: SSL_CERT_FILE
