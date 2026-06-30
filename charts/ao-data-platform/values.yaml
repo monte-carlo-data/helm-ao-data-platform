@@ -208,7 +208,9 @@ gateway:
   backendTLS:
     enabled: true
   tls:
-    source: letsencrypt # letsencrypt | keyvault
+    # letsencrypt is the only supported source. Key Vault (BYO certs) is reserved for a
+    # future release; any other value fails at render time.
+    source: letsencrypt
     letsencrypt:
       email: ""
       server: https://acme-v02.api.letsencrypt.org/directory
