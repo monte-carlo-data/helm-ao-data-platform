@@ -22,10 +22,11 @@ The ClickHouse instance ships with production hardening: a capped memory ceiling
 ## Prerequisites
 
 - Helm 3
-- A Kubernetes cluster (k3s for local dev, EKS for AWS)
+- A Kubernetes cluster (k3s for local dev, EKS for AWS, AKS for Azure)
 - [cert-manager](https://cert-manager.io/) installed in the cluster (for TLS, enabled by default)
 - [External Secrets Operator](https://external-secrets.io/) installed in the cluster
-- A `SecretStore` or `ClusterSecretStore` configured to access your secrets backend (AWS Secrets Manager, Fake provider for local dev, etc.)
+- A `SecretStore` or `ClusterSecretStore` configured to access your secrets backend (AWS Secrets Manager, Azure Key Vault, Fake provider for local dev, etc.)
+- [trust-manager](https://cert-manager.io/docs/trust/trust-manager/) — **only** for the Azure Gateway path with backend re-encrypt (`gateway.enabled` + `gateway.backendTLS.enabled`, the default when the gateway is on), which renders a trust-manager `Bundle`. The Azure Terraform module installs it; without it, apply fails with a CRD-not-found error.
 
 The chart does not ship a default `llmWorker.image` — supply your own (`llmWorker.image.repository` / `llmWorker.image.tag`) or the `llm-worker` Deployment will not start. The public worker image is published as `montecarlodata/ao-llm-worker`.
 
