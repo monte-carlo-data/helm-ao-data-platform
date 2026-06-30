@@ -13,3 +13,23 @@ Verify the deployment:
 
   # OTel collector
   kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/name=opentelemetry-collector
+{{- if .Values.gateway.enabled }}
+
+The Azure Gateway path is enabled. It requires (the Terraform module installs these):
+  - cert-manager, plus the Workload Identity referenced by
+    gateway.tls.letsencrypt.azureDNS.managedIdentityClientID (issues the listener certs)
+{{- if .Values.gateway.backendTLS.enabled }}
+  - trust-manager, with its trust namespace set to {{ .Release.Namespace }} (mirrors the
+    in-cluster CA into the ConfigMap the BackendTLSPolicy validates against)
+{{- end }}
+
+The Gateway's load balancer is internal (private IP only). Point gateway.otelHostname and
+gateway.clickhouseHostname at that private IP via your DNS zone — Let's Encrypt DNS-01 still
+issues publicly-trusted certs for them.
+
+  # Gateway + routes (look for PROGRAMMED=True)
+  kubectl get gateway,httproute -n {{ .Release.Namespace }}
+
+  # Listener certs (look for READY=True)
+  kubectl get certificate -n {{ .Release.Namespace }} gateway-otel-tls gateway-clickhouse-tls
+{{- end }}
