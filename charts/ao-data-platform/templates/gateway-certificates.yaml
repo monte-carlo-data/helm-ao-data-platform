@@ -27,6 +27,12 @@ spec:
             managedIdentity:
               clientID: {{ required "gateway.tls.letsencrypt.azureDNS.managedIdentityClientID is required" .Values.gateway.tls.letsencrypt.azureDNS.managedIdentityClientID | quote }}
 ---
+# The listener Certificate / secretName values are deliberately stable literals (not the
+# fullname helper): they must match the certificateRefs in gateway.yaml and follow the
+# chart's existing internal-TLS naming convention (e.g. otel-collector-tls,
+# ao-data-platform-ca in tls-issuer.yaml). The chart assumes one release per namespace —
+# the cluster-scoped ClusterIssuer above uses the fullname helper to stay unique across
+# namespaces, while these namespaced resources use fixed names.
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
