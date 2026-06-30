@@ -26,7 +26,7 @@ The ClickHouse instance ships with production hardening: a capped memory ceiling
 - [cert-manager](https://cert-manager.io/) installed in the cluster (for TLS, enabled by default)
 - [External Secrets Operator](https://external-secrets.io/) installed in the cluster
 - A `SecretStore` or `ClusterSecretStore` configured to access your secrets backend (AWS Secrets Manager, Azure Key Vault, Fake provider for local dev, etc.)
-- [trust-manager](https://cert-manager.io/docs/trust/trust-manager/) — **only** for the Azure Gateway path with backend re-encrypt (`gateway.enabled` + `gateway.backendTLS.enabled`, the default when the gateway is on), which renders a trust-manager `Bundle`. The Azure Terraform module installs it; without it, apply fails with a CRD-not-found error.
+- [trust-manager](https://cert-manager.io/docs/trust/trust-manager/) — **only** for the Azure Gateway path with backend re-encrypt (`gateway.enabled` + `gateway.backendTLS.enabled`, the default when the gateway is on), which renders a trust-manager `Bundle`. The [Azure Terraform module](https://github.com/monte-carlo-data/terraform-azurerm-ao-data-platform) installs it; without it, apply fails with a CRD-not-found error.
 
 The chart does not ship a default `llmWorker.image` — supply your own (`llmWorker.image.repository` / `llmWorker.image.tag`) or the `llm-worker` Deployment will not start. The public worker image is published as `montecarlodata/ao-llm-worker`.
 
@@ -219,9 +219,7 @@ to the in-cluster backends. This path is **opt-in** (`gateway.enabled=true`) and
 default**, so AWS and local installs are unaffected.
 
 The Gateway's load balancer is **always internal** (private IP only) — the collector and ClickHouse
-endpoints are never publicly reachable and are reached over private connectivity. There is no
-public-access option; internal is hardcoded.
-
+endpoints are never publicly reachable and are reached over private connectivity.
 ### Prerequisites
 
 - An AKS cluster with the **application-routing add-on** enabled, providing the Gateway API CRDs
@@ -235,7 +233,8 @@ public-access option; internal is hardcoded.
   endpoint reachability), so it issues publicly-trusted certs even though the endpoints are private.
   Point `gateway.otelHostname` / `gateway.clickhouseHostname` at the Gateway's private LB IP.
 
-The companion Azure Terraform module provisions all of the above (add-on, cert-manager, trust-manager,
+The companion [Azure Terraform module](https://github.com/monte-carlo-data/terraform-azurerm-ao-data-platform)
+provisions all of the above (add-on, cert-manager, trust-manager,
 ESO, Key Vault, Workload Identities) and renders the matching values; deploying the chart standalone
 means reproducing those prerequisites yourself.
 
