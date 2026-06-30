@@ -186,16 +186,19 @@ tls:
     #   name: my-issuer
     #   kind: Issuer  # or ClusterIssuer
 
-# Public TLS termination via the managed AKS Gateway API (application routing add-on).
-# Opt-in and Azure-specific: when enabled, a single Gateway terminates public TLS for
-# the collector + ClickHouse (ClusterIP backends) at per-hostname HTTPS listeners. The
-# internal self-signed path (tls.* above) is untouched. Disabled by default → AWS and
-# any non-gateway install are unaffected. The Terraform module enables the add-on and
-# supplies the cert-manager Workload Identity used by the Let's Encrypt DNS-01 solver.
+# Internal TLS termination via the managed AKS Gateway API (application routing add-on).
+# Opt-in and Azure-specific: when enabled, a single Gateway terminates TLS for the
+# collector + ClickHouse (ClusterIP backends) at per-hostname HTTPS listeners. The
+# Gateway's Azure load balancer is always internal (private IP) — these endpoints are
+# never publicly reachable. The internal self-signed path (tls.* above) is untouched. 
+# Disabled by default. The Terraform module enables the add-on and supplies the cert-manager 
+# Workload Identity used by the Let's Encrypt DNS-01 solver.
 gateway:
   enabled: false
   className: approuting-istio
-  # Public hostnames for the two listeners (must resolve to the Gateway's LB IP).
+  # Hostnames for the two listeners. Must resolve to the Gateway's private LB IP (e.g.
+  # via a private DNS zone). Let's Encrypt DNS-01 still issues publicly-trusted certs for
+  # these names — validation is via DNS records, not endpoint reachability.
   otelHostname: ""
   clickhouseHostname: ""
   # Re-encrypt the Gateway→backend hop and validate the backends' self-signed certs
