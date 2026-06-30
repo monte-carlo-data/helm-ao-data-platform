@@ -211,6 +211,9 @@ helm upgrade --install ao-data-platform charts/ao-data-platform/ -n montecarlo -
   -f my-values.yaml
 ```
 
+For a full post-deploy check, run `hack/verify-deployment-aws.sh -n <namespace> -r <region>` —
+it verifies pods, ClickHouse, the OTel collector, certs, and the NLB/DNS endpoints.
+
 ## Deploying to Azure (AKS)
 
 On Azure the chart exposes the collector and ClickHouse through the **managed AKS Gateway API**
@@ -267,6 +270,10 @@ helm upgrade --install ao-data-platform charts/ao-data-platform/ -n montecarlo -
 `gateway.backendTLS.enabled` (default `true`) re-encrypts the Gateway→backend hop and requires
 `tls.enabled=true` — both are validated at render time, so an invalid combination fails the install
 rather than breaking silently. Verify with `kubectl get gateway,httproute,certificate -n montecarlo`.
+
+For a full post-deploy check, run `hack/verify-deployment-azure.sh -n <namespace>` — it
+auto-detects gateway vs internal-LB mode and verifies pods, ClickHouse, the OTel collector,
+certs, and (in gateway mode) the Gateway/HTTPRoute/BackendTLSPolicy resources.
 
 ## CI / CD
 
@@ -336,8 +343,9 @@ Each password-backed user has an ExternalSecret sourcing its password from your 
 per-user `*.externalSecret` values below). Network *reachability* is typically restricted one layer
 up at the load balancer; per-caller CH-user-level network scoping is handled separately.
 
-`hack/verify-deployment.sh` runs its ClickHouse data checks as `readonly_user`, so set
-`clickhouse.readonlyUser.enabled=true` to use the script.
+The `hack/verify-deployment-aws.sh` and `hack/verify-deployment-azure.sh` scripts run their
+ClickHouse data checks as `readonly_user`, so set `clickhouse.readonlyUser.enabled=true` to
+use them.
 
 ### Upgrading an existing install (1.x → 2.0.0)
 
