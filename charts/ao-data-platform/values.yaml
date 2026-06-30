@@ -88,9 +88,38 @@ tls:
     #   name: my-issuer
     #   kind: Issuer  # or ClusterIssuer
 
-# Altinity ClickHouse Operator — defaults are fine
+# Altinity ClickHouse Operator
 altinity-clickhouse-operator:
   fullnameOverride: clickhouse-operator
+  # Restrict which of the CHI's metadata.labels the operator propagates onto the
+  # resources it generates (StatefulSet, Pod, PVC/volumeClaimTemplates).
+  #
+  # This is an allowlist (`include`): when non-empty, ONLY the listed label keys
+  # are propagated; every other label stays on the CHI but is not stamped onto
+  # child resources. An allowlist is used rather than an `exclude` blocklist
+  # deliberately — the StatefulSet's volumeClaimTemplates are immutable, so any
+  # change to a propagated label there cannot be patched in place and forces the
+  # operator to delete+recreate the StatefulSet (onUpdateFailure: recreate),
+  # which bounces ClickHouse. A blocklist would let a future volatile label slip
+  # through and silently reintroduce that bounce; an allowlist freezes the
+  # propagated set so no new label can ever mutate the immutable volumeClaimTemplates.
+  #
+  # In particular this keeps the volatile `helm.sh/chart` label (which encodes the
+  # chart version) off the volumeClaimTemplates, so a chart-version bump with no
+  # functional change does not recreate ClickHouse.
+  #
+  # NOTE: this only governs labels propagated FROM the CHI's metadata.labels. The
+  # operator's own `clickhouse.altinity.com/*` labels — which it uses for its
+  # StatefulSet/Service selectors and resource ownership — are managed separately
+  # and are unaffected by this setting.
+  configs:
+    files:
+      config.yaml:
+        label:
+          include:
+            - app.kubernetes.io/name
+            - app.kubernetes.io/instance
+            - app.kubernetes.io/managed-by
 
 # LLM Worker — polls ClickHouse for pending batches, calls AWS Bedrock, writes results back
 llmWorker:

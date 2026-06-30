@@ -44,6 +44,31 @@ jobs:
       - run:
           name: Lint chart
           command: helm lint charts/ao-data-platform
+      - run:
+          name: Render chart and verify operator label allowlist
+          # `helm lint` does not fully render subchart values, so a typo or wrong
+          # nesting in a deep path would pass lint while being silently ignored.
+          # Render the whole chart (a clean render is itself a template-correctness
+          # guard) and assert the operator's `label.include` allowlist actually
+          # reaches the generated operator config — the exact gap a no-op
+          # chart-version bump exploited to recreate the ClickHouse StatefulSet.
+          command: |
+            helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml > rendered.yaml
+            keys=$(awk '
+              /^    label:/ { inlabel = 1 }
+              inlabel && /^      include:/ { found = 1; next }
+              found && /^      - / { print $2; next }
+              found && !/^      - / { found = 0 }
+            ' rendered.yaml | sort | tr "\n" " ")
+            expected="app.kubernetes.io/instance app.kubernetes.io/managed-by app.kubernetes.io/name "
+            if [ "$keys" != "$expected" ]; then
+              echo "Operator label allowlist did not render as expected."
+              echo "Expected: $expected"
+              echo "Rendered: $keys"
+              exit 1
+            fi
+            echo "Operator label.include allowlist rendered correctly."
 
   publish-dev:
     docker:
