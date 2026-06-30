@@ -400,11 +400,24 @@ helm upgrade ao-data-platform oci://registry-1.docker.io/montecarlodata/ao-data-
 | `llmWorker.image.repository` | `""` | Image repository for the `llm-worker` (required — e.g. `montecarlodata/ao-llm-worker`) |
 | `llmWorker.image.tag` | `""` | Image tag for the `llm-worker` |
 | `llmWorker.aws.region` | `us-east-1` | AWS region passed to the `llm-worker` |
+| `llmWorker.podLabels` | `{}` | Extra labels merged onto the `llm-worker` pod template (e.g. to opt the pod into an identity/admission webhook). |
 | `opentelemetry-collector.service.type` | `ClusterIP` | OTel Collector Service type (`ClusterIP`, `LoadBalancer`) |
 | `opentelemetry-collector.service.annotations` | `{}` | Annotations on the OTel Collector Service (e.g. AWS NLB, external-dns) |
 | `tls.enabled` | `true` | Enable TLS between services (requires cert-manager) |
 | `tls.certManager.createCA` | `true` | Create a self-signed CA; set to `false` if you have your own issuer |
 | `tls.certManager.existingIssuerRef` | `{}` | Use an existing issuer instead of the generated CA (e.g. `{name: my-issuer, kind: ClusterIssuer}`) |
+| `gateway.enabled` | `false` | Enable the managed AKS Gateway API path (Azure-specific). The Gateway's load balancer is always internal (private IP). See [Deploying to Azure (AKS)](#deploying-to-azure-aks). |
+| `gateway.className` | `approuting-istio` | GatewayClass for the managed application-routing add-on. |
+| `gateway.otelHostname` | `""` | Hostname for the OTel collector listener (required when `gateway.enabled`). Must resolve to the Gateway's private LB IP. |
+| `gateway.clickhouseHostname` | `""` | Hostname for the ClickHouse listener (required when `gateway.enabled`). Must resolve to the Gateway's private LB IP. |
+| `gateway.backendTLS.enabled` | `true` | Re-encrypt the Gateway→backend hop and validate backend certs against the in-cluster CA. Requires `tls.enabled=true` and trust-manager (enforced at render time). |
+| `gateway.tls.source` | `letsencrypt` | Listener cert source. Only `letsencrypt` is supported; Key Vault (BYO certs) is reserved for a future release. |
+| `gateway.tls.letsencrypt.email` | `""` | ACME contact email (optional; omitted registers a contactless account). |
+| `gateway.tls.letsencrypt.server` | Let's Encrypt production | ACME server URL. |
+| `gateway.tls.letsencrypt.azureDNS.hostedZoneName` | `""` | DNS zone for the DNS-01 solver (required when `gateway.enabled`). |
+| `gateway.tls.letsencrypt.azureDNS.resourceGroupName` | `""` | Resource group of the DNS zone (required when `gateway.enabled`). |
+| `gateway.tls.letsencrypt.azureDNS.subscriptionID` | `""` | Subscription ID of the DNS zone (required when `gateway.enabled`). |
+| `gateway.tls.letsencrypt.azureDNS.managedIdentityClientID` | `""` | cert-manager Workload Identity client ID for the DNS-01 solver (required when `gateway.enabled`). |
 
 ### Node scheduling and workload isolation
 
