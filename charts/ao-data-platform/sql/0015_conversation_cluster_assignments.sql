@@ -9,8 +9,9 @@
 -- 30-day TTL DELETE matches the source conversations' retention so assignment rows
 -- age out with the conversations they annotate (the only read path joins by
 -- (service_name, conversation_id) — an orphaned assignment whose conversation has
--- been dropped is unreadable). "Uncategorized" is a reserved cluster_key, not a
--- Postgres row.
+-- been dropped is unreadable). classified_at >= turn_start, so an assignment is
+-- never deleted before its conversation. "Uncategorized" is a reserved
+-- cluster_key, not a Postgres row.
 --
 -- Latest-wins is NOT enforced by the engine: this is a plain MergeTree, not a
 -- ReplacingMergeTree, and classified_at is not in the ORDER BY. Every read MUST
