@@ -22,10 +22,11 @@ The ClickHouse instance ships with production hardening: a capped memory ceiling
 ## Prerequisites
 
 - Helm 3
-- A Kubernetes cluster (k3s for local dev, EKS for AWS)
+- A Kubernetes cluster (k3s for local dev, EKS for AWS, AKS for Azure)
 - [cert-manager](https://cert-manager.io/) installed in the cluster (for TLS, enabled by default)
 - [External Secrets Operator](https://external-secrets.io/) installed in the cluster
-- A `SecretStore` or `ClusterSecretStore` configured to access your secrets backend (AWS Secrets Manager, Fake provider for local dev, etc.)
+- A `SecretStore` or `ClusterSecretStore` configured to access your secrets backend (AWS Secrets Manager, Azure Key Vault, Fake provider for local dev, etc.)
+- [trust-manager](https://cert-manager.io/docs/trust/trust-manager/) — **only** for the Azure Gateway path with backend re-encrypt (`gateway.enabled` + `gateway.backendTLS.enabled`, the default when the gateway is on), which renders a trust-manager `Bundle`. The [Azure Terraform module](https://github.com/monte-carlo-data/terraform-azurerm-ao-data-platform) installs it; without it, apply fails with a CRD-not-found error.
 
 The chart does not ship a default `llmWorker.image` — supply your own (`llmWorker.image.repository` / `llmWorker.image.tag`) or the `llm-worker` Deployment will not start. The public worker image is published as `montecarlodata/ao-llm-worker`.
 
@@ -210,6 +211,63 @@ helm upgrade --install ao-data-platform charts/ao-data-platform/ -n montecarlo -
   -f my-values.yaml
 ```
 
+## Deploying to Azure (AKS)
+
+On Azure the chart exposes the collector and ClickHouse through the **managed AKS Gateway API**
+(the application-routing add-on), terminating TLS at per-hostname HTTPS listeners and re-encrypting
+to the in-cluster backends. This path is **opt-in** (`gateway.enabled=true`) and **disabled by
+default**, so AWS and local installs are unaffected.
+
+The Gateway's load balancer is **always internal** (private IP only) — the collector and ClickHouse
+endpoints are never publicly reachable and are reached over private connectivity.
+### Prerequisites
+
+- An AKS cluster with the **application-routing add-on** enabled, providing the Gateway API CRDs
+  and the `approuting-istio` GatewayClass (`gateway.className`)
+- [cert-manager](https://cert-manager.io/) and [trust-manager](https://cert-manager.io/docs/trust/trust-manager/),
+  with trust-manager's trust namespace set to the release namespace
+- [External Secrets Operator](https://external-secrets.io/) with a `ClusterSecretStore` for Azure
+  Key Vault (the ClickHouse user passwords)
+- A Workload Identity for the cert-manager DNS-01 solver, with access to the DNS zone
+- A DNS zone for the listener hostnames — Let's Encrypt validates via DNS-01 (DNS records, not
+  endpoint reachability), so it issues publicly-trusted certs even though the endpoints are private.
+  Point `gateway.otelHostname` / `gateway.clickhouseHostname` at the Gateway's private LB IP.
+
+The companion [Azure Terraform module](https://github.com/monte-carlo-data/terraform-azurerm-ao-data-platform)
+provisions all of the above (add-on, cert-manager, trust-manager,
+ESO, Key Vault, Workload Identities) and renders the matching values; deploying the chart standalone
+means reproducing those prerequisites yourself.
+
+### Enabling the gateway
+
+Supply environment-specific configuration in your own values file and pass it with `-f`:
+
+```yaml
+gateway:
+  enabled: true
+  otelHostname: otel.<your-zone>          # resolves to the Gateway's private LB IP
+  clickhouseHostname: clickhouse.<your-zone>
+  tls:
+    source: letsencrypt                   # only supported source
+    letsencrypt:
+      email: ""                           # optional ACME contact
+      azureDNS:
+        hostedZoneName: <your-zone>
+        resourceGroupName: <dns-rg>
+        subscriptionID: <subscription-id>
+        managedIdentityClientID: <cert-manager-workload-identity-client-id>
+```
+
+```bash
+helm dependency build charts/ao-data-platform/
+helm upgrade --install ao-data-platform charts/ao-data-platform/ -n montecarlo --create-namespace \
+  -f my-values.yaml
+```
+
+`gateway.backendTLS.enabled` (default `true`) re-encrypts the Gateway→backend hop and requires
+`tls.enabled=true` — both are validated at render time, so an invalid combination fails the install
+rather than breaking silently. Verify with `kubectl get gateway,httproute,certificate -n montecarlo`.
+
 ## CI / CD
 
 CircleCI runs on every push:
@@ -240,7 +298,7 @@ CI authenticates to Docker Hub with a scoped access token (`DOCKER_LOGIN` / `DOC
 Pull a published version directly:
 
 ```bash
-helm pull oci://registry-1.docker.io/montecarlodata/ao-data-platform --version 2.0.0
+helm pull oci://registry-1.docker.io/montecarlodata/ao-data-platform --version 2.1.0
 ```
 
 ## ClickHouse user model
@@ -399,11 +457,24 @@ helm upgrade ao-data-platform oci://registry-1.docker.io/montecarlodata/ao-data-
 | `llmWorker.image.repository` | `""` | Image repository for the `llm-worker` (required — e.g. `montecarlodata/ao-llm-worker`) |
 | `llmWorker.image.tag` | `""` | Image tag for the `llm-worker` |
 | `llmWorker.aws.region` | `us-east-1` | AWS region passed to the `llm-worker` |
+| `llmWorker.podLabels` | `{}` | Extra labels merged onto the `llm-worker` pod template (e.g. to opt the pod into an identity/admission webhook). |
 | `opentelemetry-collector.service.type` | `ClusterIP` | OTel Collector Service type (`ClusterIP`, `LoadBalancer`) |
 | `opentelemetry-collector.service.annotations` | `{}` | Annotations on the OTel Collector Service (e.g. AWS NLB, external-dns) |
 | `tls.enabled` | `true` | Enable TLS between services (requires cert-manager) |
 | `tls.certManager.createCA` | `true` | Create a self-signed CA; set to `false` if you have your own issuer |
 | `tls.certManager.existingIssuerRef` | `{}` | Use an existing issuer instead of the generated CA (e.g. `{name: my-issuer, kind: ClusterIssuer}`) |
+| `gateway.enabled` | `false` | Enable the managed AKS Gateway API path (Azure-specific). The Gateway's load balancer is always internal (private IP). See [Deploying to Azure (AKS)](#deploying-to-azure-aks). |
+| `gateway.className` | `approuting-istio` | GatewayClass for the managed application-routing add-on. |
+| `gateway.otelHostname` | `""` | Hostname for the OTel collector listener (required when `gateway.enabled`). Must resolve to the Gateway's private LB IP. |
+| `gateway.clickhouseHostname` | `""` | Hostname for the ClickHouse listener (required when `gateway.enabled`). Must resolve to the Gateway's private LB IP. |
+| `gateway.backendTLS.enabled` | `true` | Re-encrypt the Gateway→backend hop and validate backend certs against the in-cluster CA. Requires `tls.enabled=true` and trust-manager (enforced at render time). |
+| `gateway.tls.source` | `letsencrypt` | Listener cert source. Only `letsencrypt` is supported; Key Vault (BYO certs) is reserved for a future release. |
+| `gateway.tls.letsencrypt.email` | `""` | ACME contact email (optional; omitted registers a contactless account). |
+| `gateway.tls.letsencrypt.server` | Let's Encrypt production | ACME server URL. |
+| `gateway.tls.letsencrypt.azureDNS.hostedZoneName` | `""` | DNS zone for the DNS-01 solver (required when `gateway.enabled`). |
+| `gateway.tls.letsencrypt.azureDNS.resourceGroupName` | `""` | Resource group of the DNS zone (required when `gateway.enabled`). |
+| `gateway.tls.letsencrypt.azureDNS.subscriptionID` | `""` | Subscription ID of the DNS zone (required when `gateway.enabled`). |
+| `gateway.tls.letsencrypt.azureDNS.managedIdentityClientID` | `""` | cert-manager Workload Identity client ID for the DNS-01 solver (required when `gateway.enabled`). |
 
 ### Node scheduling and workload isolation
 

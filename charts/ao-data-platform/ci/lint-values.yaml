@@ -32,3 +32,19 @@ clickhouse:
         name: ci-placeholder
       remoteRef:
         key: ci-placeholder
+
+# Exercise the (default-off) Azure Gateway path so its four templates — gateway,
+# gateway-httproutes, gateway-certificates, gateway-backend-tls — render in CI.
+# tls.enabled defaults true, so the backendTLS re-encrypt path renders against a valid
+# config. CI placeholders only; never deployed.
+gateway:
+  enabled: true
+  otelHostname: otel.ci-placeholder.internal
+  clickhouseHostname: clickhouse.ci-placeholder.internal
+  tls:
+    letsencrypt:
+      azureDNS:
+        hostedZoneName: ci-placeholder.internal
+        resourceGroupName: ci-placeholder
+        subscriptionID: ci-placeholder
+        managedIdentityClientID: ci-placeholder

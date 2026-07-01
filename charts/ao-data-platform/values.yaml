@@ -186,6 +186,42 @@ tls:
     #   name: my-issuer
     #   kind: Issuer  # or ClusterIssuer
 
+# Internal TLS termination via the managed AKS Gateway API (application routing add-on).
+# Opt-in and Azure-specific: when enabled, a single Gateway terminates TLS for the
+# collector + ClickHouse (ClusterIP backends) at per-hostname HTTPS listeners. The
+# Gateway's Azure load balancer is always internal (private IP) — these endpoints are
+# never publicly reachable. The internal self-signed path (tls.* above) is untouched. 
+# Disabled by default. The Terraform module enables the add-on and supplies the cert-manager 
+# Workload Identity used by the Let's Encrypt DNS-01 solver.
+gateway:
+  enabled: false
+  className: approuting-istio
+  # Hostnames for the two listeners. Must resolve to the Gateway's private LB IP (e.g.
+  # via a private DNS zone). Let's Encrypt DNS-01 still issues publicly-trusted certs for
+  # these names — validation is via DNS records, not endpoint reachability.
+  otelHostname: ""
+  clickhouseHostname: ""
+  # Re-encrypt the Gateway→backend hop and validate the backends' self-signed certs
+  # against the in-cluster CA (preserves the internal-TLS posture). Requires trust-
+  # manager (installed by the TF module) to sync the CA Secret into a ConfigMap, and
+  # its trust namespace set to this release's namespace. Requires tls.enabled=true —
+  # the ClickHouse https/8443 listener this validates only exists when internal TLS is
+  # on (enforced at render time).
+  backendTLS:
+    enabled: true
+  tls:
+    # letsencrypt is the only supported source. Key Vault (BYO certs) is reserved for a
+    # future release; any other value fails at render time.
+    source: letsencrypt
+    letsencrypt:
+      email: ""
+      server: https://acme-v02.api.letsencrypt.org/directory
+      azureDNS:
+        hostedZoneName: ""
+        resourceGroupName: ""
+        subscriptionID: ""
+        managedIdentityClientID: "" # cert-manager Workload Identity (from the TF module)
+
 # Altinity ClickHouse Operator
 altinity-clickhouse-operator:
   fullnameOverride: clickhouse-operator
@@ -228,6 +264,9 @@ llmWorker:
     region: us-east-1
   serviceAccount:
     annotations: {}
+  # Additional labels for the worker pod template — set per-environment as needed
+  # (e.g. to opt into an identity/admission webhook).
+  podLabels: {}
   # Extra env vars (e.g., MAX_WORKERS, POLL_INTERVAL)
   env: []
   # Resource requests/limits for the llm-worker container. Modest dev

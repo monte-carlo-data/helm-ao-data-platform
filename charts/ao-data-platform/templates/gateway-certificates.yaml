@@ -1,0 +1,65 @@
+{{- if and .Values.gateway.enabled (eq .Values.gateway.tls.source "letsencrypt") }}
+# Let's Encrypt (DNS-01 via Azure DNS) certs for the two Gateway listeners. The
+# cert-manager Workload Identity referenced here is created by the Terraform module.
+# (letsencrypt is currently the only supported tls.source; a BYO Key Vault source is
+# reserved for a future release.)
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: {{ include "ao-data-platform.fullname" . }}-letsencrypt-dns01
+  labels:
+    {{- include "ao-data-platform.labels" . | nindent 4 }}
+spec:
+  acme:
+    server: {{ .Values.gateway.tls.letsencrypt.server }}
+    {{- with .Values.gateway.tls.letsencrypt.email }}
+    email: {{ . | quote }}  # optional ACME contact; omitted registers a contactless account
+    {{- end }}
+    privateKeySecretRef:
+      name: {{ include "ao-data-platform.fullname" . }}-letsencrypt-account-key
+    solvers:
+      - dns01:
+          azureDNS:
+            hostedZoneName: {{ required "gateway.tls.letsencrypt.azureDNS.hostedZoneName is required" .Values.gateway.tls.letsencrypt.azureDNS.hostedZoneName | quote }}
+            resourceGroupName: {{ required "gateway.tls.letsencrypt.azureDNS.resourceGroupName is required" .Values.gateway.tls.letsencrypt.azureDNS.resourceGroupName | quote }}
+            subscriptionID: {{ required "gateway.tls.letsencrypt.azureDNS.subscriptionID is required" .Values.gateway.tls.letsencrypt.azureDNS.subscriptionID | quote }}
+            environment: AzurePublicCloud
+            managedIdentity:
+              clientID: {{ required "gateway.tls.letsencrypt.azureDNS.managedIdentityClientID is required" .Values.gateway.tls.letsencrypt.azureDNS.managedIdentityClientID | quote }}
+---
+# The listener Certificate / secretName values are deliberately stable literals (not the
+# fullname helper): they must match the certificateRefs in gateway.yaml and follow the
+# chart's existing internal-TLS naming convention (e.g. otel-collector-tls,
+# ao-data-platform-ca in tls-issuer.yaml). The chart assumes one release per namespace —
+# the cluster-scoped ClusterIssuer above uses the fullname helper to stay unique across
+# namespaces, while these namespaced resources use fixed names.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: gateway-otel-tls
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ao-data-platform.labels" . | nindent 4 }}
+spec:
+  secretName: gateway-otel-tls
+  dnsNames:
+    - {{ .Values.gateway.otelHostname | quote }}
+  issuerRef:
+    name: {{ include "ao-data-platform.fullname" . }}-letsencrypt-dns01
+    kind: ClusterIssuer
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: gateway-clickhouse-tls
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ao-data-platform.labels" . | nindent 4 }}
+spec:
+  secretName: gateway-clickhouse-tls
+  dnsNames:
+    - {{ .Values.gateway.clickhouseHostname | quote }}
+  issuerRef:
+    name: {{ include "ao-data-platform.fullname" . }}-letsencrypt-dns01
+    kind: ClusterIssuer
+{{- end }}
