@@ -69,6 +69,42 @@ jobs:
               exit 1
             fi
             echo "Operator label.include allowlist rendered correctly."
+      - run:
+          name: Gateway disabled renders no gateway resources
+          # The default posture is gateway.enabled=false. Assert none of the
+          # gateway-only kinds leak into a non-gateway render.
+          command: |
+            helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --set gateway.enabled=false > gw-off.yaml
+            if grep -Eq '^kind: (Gateway|HTTPRoute|BackendTLSPolicy|Bundle)$' gw-off.yaml; then
+              echo "Gateway disabled but gateway resources rendered:"
+              grep -En '^kind: (Gateway|HTTPRoute|BackendTLSPolicy|Bundle)$' gw-off.yaml
+              exit 1
+            fi
+            echo "Gateway disabled: no Gateway/HTTPRoute/BackendTLSPolicy/Bundle rendered."
+      - run:
+          name: Invalid gateway.tls.source fails render
+          # Only letsencrypt is implemented; any other source must fail fast at render.
+          command: |
+            if helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --set gateway.tls.source=keyvault > /dev/null 2>&1; then
+              echo "Expected render to fail for gateway.tls.source=keyvault, but it succeeded."
+              exit 1
+            fi
+            echo "Invalid gateway.tls.source correctly failed the render."
+      - run:
+          name: Gateway with tls.enabled=false fails render
+          # The Gateway re-encrypts to the internal-TLS backends, so it requires tls.enabled=true.
+          command: |
+            if helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --set tls.enabled=false > /dev/null 2>&1; then
+              echo "Expected render to fail for gateway.enabled=true with tls.enabled=false, but it succeeded."
+              exit 1
+            fi
+            echo "Gateway with tls.enabled=false correctly failed the render."
 
   publish-dev:
     docker:

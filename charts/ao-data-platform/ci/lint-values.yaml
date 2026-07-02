@@ -35,8 +35,8 @@ clickhouse:
 
 # Exercise the (default-off) Azure Gateway path so its four templates — gateway,
 # gateway-httproutes, gateway-certificates, gateway-backend-tls — render in CI.
-# tls.enabled defaults true, so the backendTLS re-encrypt path renders against a valid
-# config. CI placeholders only; never deployed.
+# tls.enabled defaults true, so the Gateway→backend re-encrypt path renders against a
+# valid config. CI placeholders only; never deployed.
 gateway:
   enabled: true
   otelHostname: otel.ci-placeholder.internal
