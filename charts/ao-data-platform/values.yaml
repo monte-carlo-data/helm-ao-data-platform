@@ -190,9 +190,11 @@ tls:
 # Opt-in and Azure-specific: when enabled, a single Gateway terminates TLS for the
 # collector + ClickHouse (ClusterIP backends) at per-hostname HTTPS listeners. The
 # Gateway's Azure load balancer is always internal (private IP) — these endpoints are
-# never publicly reachable. The internal self-signed path (tls.* above) is untouched. 
-# Disabled by default. The Terraform module enables the add-on and supplies the cert-manager 
-# Workload Identity used by the Let's Encrypt DNS-01 solver.
+# never publicly reachable. The internal self-signed path (tls.* above) is untouched.
+# Requires tls.enabled=true: the Gateway always re-encrypts to the backends, so it needs
+# the internal-TLS listeners (enforced at render time). Disabled by default. The Terraform
+# module enables the add-on and supplies the cert-manager Workload Identity used by the
+# Let's Encrypt DNS-01 solver.
 gateway:
   enabled: false
   className: approuting-istio
@@ -201,14 +203,10 @@ gateway:
   # these names — validation is via DNS records, not endpoint reachability.
   otelHostname: ""
   clickhouseHostname: ""
-  # Re-encrypt the Gateway→backend hop and validate the backends' self-signed certs
-  # against the in-cluster CA (preserves the internal-TLS posture). Requires trust-
-  # manager (installed by the TF module) to sync the CA Secret into a ConfigMap, and
-  # its trust namespace set to this release's namespace. Requires tls.enabled=true —
-  # the ClickHouse https/8443 listener this validates only exists when internal TLS is
-  # on (enforced at render time).
-  backendTLS:
-    enabled: true
+  # Restrict the Gateway's (internal) load balancer to these source CIDRs — the Azure
+  # analog of the AWS NLB source-range restriction. Empty = no restriction (any client
+  # with network reach to the private LB). Unioned across both listeners (shared LB).
+  allowedSourceRanges: []
   tls:
     # letsencrypt is the only supported source. Key Vault (BYO certs) is reserved for a
     # future release; any other value fails at render time.

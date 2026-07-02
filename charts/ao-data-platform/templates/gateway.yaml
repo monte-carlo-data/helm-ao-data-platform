@@ -2,8 +2,8 @@
 {{- if ne .Values.gateway.tls.source "letsencrypt" }}
 {{- fail "gateway.tls.source must be \"letsencrypt\" — the Key Vault (BYO-cert) source is reserved for a future release and not yet implemented." }}
 {{- end }}
-{{- if and .Values.gateway.backendTLS.enabled (not .Values.tls.enabled) }}
-{{- fail "gateway.backendTLS.enabled requires tls.enabled=true — backend re-encrypt validates the ClickHouse https/8443 listener, which only exists when internal TLS is on. Set tls.enabled=true, or gateway.backendTLS.enabled=false." }}
+{{- if not .Values.tls.enabled }}
+{{- fail "gateway.enabled requires tls.enabled=true — the Gateway always re-encrypts to the ClickHouse https/8443 listener, which only exists when internal TLS is on. Set tls.enabled=true, or gateway.enabled=false." }}
 {{- end }}
 # Managed AKS Gateway API (application routing add-on). One Gateway, two HTTPS
 # listeners terminating TLS per-hostname for the collector and ClickHouse.
@@ -24,6 +24,10 @@ spec:
     annotations:
       # Provision the managed Gateway's Azure LB as internal (private IP only).
       service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+      {{- with .Values.gateway.allowedSourceRanges }}
+      # Restrict the (internal) LB to these source CIDRs (unioned across both listeners).
+      service.beta.kubernetes.io/azure-allowed-ip-ranges: {{ join "," . | quote }}
+      {{- end }}
   gatewayClassName: {{ required "gateway.className is required when gateway.enabled" .Values.gateway.className }}
   listeners:
     - name: otel

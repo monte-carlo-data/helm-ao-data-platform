@@ -1,4 +1,4 @@
-{{- if and .Values.gateway.enabled .Values.gateway.backendTLS.enabled }}
+{{- if and .Values.gateway.enabled .Values.tls.enabled }}
 # Re-encrypt the Gateway→backend hop. The Gateway terminates the public cert, then
 # opens a fresh TLS connection to the (still self-signed) collector and ClickHouse,
 # validating their certs against the in-cluster CA — so the internal-TLS posture is
