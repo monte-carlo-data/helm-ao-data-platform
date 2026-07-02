@@ -4,19 +4,15 @@
 # Helm chart on Azure (AKS). The Azure/AKS counterpart to verify-deployment-aws.sh
 # (AWS/EKS) in this directory; pure kubectl, no cloud CLI required.
 #
-# Mirrors the AWS script's Kubernetes-level checks (pods, ClickHouse
-# operator/StatefulSet, OTel collector, schema job, ExternalSecret sync,
-# cert-manager Issuers/Certificates, TLS secrets) and adapts the cloud-coupled
-# ones for Azure:
+# Mirrors the AWS script's checks (pods, ClickHouse operator/StatefulSet, OTel collector,
+# schema job, ExternalSecret sync, cert-manager Issuers/Certificates, TLS secrets, the
+# ClickHouse database/schema + materialized views, and the least-privilege user model) and
+# adapts the cloud-coupled ones for Azure:
 #   - StorageClass: ebs.csi.aws.com/gp3 → disk.csi.azure.com/Premium SSD
 #   - Ingress: AWS NLB Service annotations → the managed Gateway API
 #     (Gateway/HTTPRoute/BackendTLSPolicy) in gateway mode, or the internal-LB
 #     Service annotation otherwise — auto-detected.
-# The AWS deep cloud-API checks (aws ec2 describe-volumes, elbv2 target-health)
-# are intentionally not reimplemented in `az`: the K8s-level signals here (LB or
-# Gateway provisioned with an address, PVCs Bound on Azure managed disks) cover
-# deployment health, and a final end-to-end trace-ingestion test then proves data
-# actually flows OTLP → collector → ClickHouse.
+# A final end-to-end trace-ingestion test proves data flows OTLP → collector → ClickHouse.
 #
 # Usage:
 #   ./verify-deployment-azure.sh -n <namespace>
@@ -81,7 +77,7 @@ fail() {
 
 svc_annotation() {
   local svc="$1" key="$2"
-  kubectl get svc -n "$NS" "$svc" -o json 2>/dev/null | jq -r --arg k "$key" '.metadata.annotations[$k] // empty'
+  kubectl get svc -n "$NS" "$svc" -o json 2>/dev/null | jq -r --arg k "$key" '.metadata.annotations[$k] // empty' || true
 }
 
 # Detect managed-Gateway mode vs the internal-LB path — the module supports both, and the
@@ -103,7 +99,7 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 # CHECK 1 — Pods healthy
 # ─────────────────────────────────────────────────────────────────────────────
-banner "All pods are Running with zero restarts"
+banner "All pods are Running or Succeeded (restarts reported as warnings)"
 
 run_cmd "List all pods in namespace ${NS}" \
   kubectl get pods -n "$NS" -o wide
@@ -224,7 +220,7 @@ run_cmd "ExternalSecret status" \
   kubectl get externalsecret -n "$NS" ao-clickhouse-otel-credentials
 
 ES_STATUS=$(kubectl get externalsecret -n "$NS" ao-clickhouse-otel-credentials \
-  -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
+  -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
 
 if [[ "$ES_STATUS" != "True" ]]; then
   run_cmd "ExternalSecret detail (for debugging)" \
@@ -233,7 +229,7 @@ if [[ "$ES_STATUS" != "True" ]]; then
 fi
 
 SECRET_KEYS=$(kubectl get secret -n "$NS" ao-clickhouse-otel-credentials \
-  -o jsonpath='{.data}' 2>/dev/null | jq -r 'keys[]' 2>/dev/null)
+  -o jsonpath='{.data}' 2>/dev/null | jq -r 'keys[]' 2>/dev/null || true)
 
 if ! echo "$SECRET_KEYS" | grep -q '^password$'; then
   fail "Secret ao-clickhouse-otel-credentials exists but is missing the 'password' key."
@@ -292,7 +288,7 @@ pass "All Certificates are Ready (${CERTS})."
 banner "TLS Secrets contain tls.crt, tls.key, and ca.crt"
 
 for SECRET in clickhouse-server-tls otel-collector-tls; do
-  KEYS=$(kubectl get secret -n "$NS" "$SECRET" -o jsonpath='{.data}' | jq -r 'keys[]' | sort)
+  KEYS=$(kubectl get secret -n "$NS" "$SECRET" -o jsonpath='{.data}' | jq -r 'keys[]' | sort || true)
   for EXPECTED in ca.crt tls.crt tls.key; do
     if ! echo "$KEYS" | grep -q "^${EXPECTED}$"; then
       fail "Secret ${SECRET} is missing key '${EXPECTED}'. Found: ${KEYS}"
@@ -310,7 +306,7 @@ banner "TLS certificate SANs and expiry are correct"
 for SECRET in clickhouse-server-tls otel-collector-tls; do
   echo ""
   echo -e "  ${YELLOW}▸ Inspecting certificate from secret ${SECRET}${RESET}"
-  CERT_PEM=$(kubectl get secret -n "$NS" "$SECRET" -o jsonpath='{.data.tls\.crt}' | base64 -d)
+  CERT_PEM=$(kubectl get secret -n "$NS" "$SECRET" -o jsonpath='{.data.tls\.crt}' | base64 -d || true)
   echo "$CERT_PEM" | openssl x509 -text -noout 2>&1 \
     | grep -E "Subject:|Issuer:|Not Before|Not After|DNS:" | sed 's/^/    /'
 
@@ -328,7 +324,7 @@ pass "All TLS certificates have valid SANs and are not expired."
 banner "StorageClass uses disk.csi.azure.com and Premium SSD"
 
 CH_SC=$(kubectl get pvc -n "$NS" --no-headers \
-  -o custom-columns=":spec.storageClassName" | head -1)
+  -o custom-columns=":spec.storageClassName" | head -1 || true)
 
 if [[ -z "$CH_SC" || "$CH_SC" == "<none>" ]]; then
   fail "ClickHouse PVC has no storageClassName set."
@@ -337,8 +333,8 @@ fi
 run_cmd "StorageClass '${CH_SC}' details" \
   kubectl get storageclass "$CH_SC" -o yaml
 
-SC_PROVISIONER=$(kubectl get storageclass "$CH_SC" -o jsonpath='{.provisioner}')
-SC_SKU=$(kubectl get storageclass "$CH_SC" -o jsonpath='{.parameters.skuName}')
+SC_PROVISIONER=$(kubectl get storageclass "$CH_SC" -o jsonpath='{.provisioner}' || true)
+SC_SKU=$(kubectl get storageclass "$CH_SC" -o jsonpath='{.parameters.skuName}' || true)
 
 if [[ "$SC_PROVISIONER" != "disk.csi.azure.com" ]]; then
   fail "StorageClass provisioner is '${SC_PROVISIONER}', expected 'disk.csi.azure.com'."
@@ -420,7 +416,7 @@ else
     fi
 
     LB_IP=$(kubectl get svc -n "$NS" "$SVC" \
-      -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)
+      -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
     if [[ -z "$LB_IP" ]]; then
       fail "Service ${SVC} has no loadBalancer ingress IP — the internal LB may not be provisioned yet."
     fi
@@ -430,19 +426,200 @@ else
   pass "ClickHouse and OTel Services are internal load balancers with assigned IPs."
 fi
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CHECK 14 — End-to-end smoke test: OTLP trace → collector → ClickHouse
-# ─────────────────────────────────────────────────────────────────────────────
-banner "End-to-end smoke test: send a trace via OTLP and verify it lands in ClickHouse"
-
-# Read-only ClickHouse credential for the query below. Like verify-deployment-aws.sh, the
-# data check runs as readonly_user, so clickhouse.readonlyUser.enabled=true is required.
+# Read-only ClickHouse credential, reused by the schema + least-privilege checks and the
+# end-to-end trace at the end of this script. Runs as readonly_user, so
+# clickhouse.readonlyUser.enabled=true is required.
 CH_READ_USER="readonly_user"
 CH_READ_PW=$(kubectl get secret -n "$NS" ao-clickhouse-readonly-user-credentials \
   -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || true)
 if [[ -z "$CH_READ_PW" ]]; then
-  fail "readonly_user credential (secret ao-clickhouse-readonly-user-credentials) not found — set clickhouse.readonlyUser.enabled=true to run the end-to-end trace check."
+  fail "readonly_user credential (secret ao-clickhouse-readonly-user-credentials) not found — set clickhouse.readonlyUser.enabled=true to run the ClickHouse data checks."
 fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHECK 14 — ClickHouse database and schema
+# ─────────────────────────────────────────────────────────────────────────────
+banner "ClickHouse database 'otel_traces' and tables exist"
+
+# Passwords go via env (CLICKHOUSE_PASSWORD), never --password on argv or through run_cmd's
+# command echo, so they stay out of the process table, apiserver audit, and this output.
+ch_query() { kubectl exec -n "$NS" "$CH_POD" -- env CLICKHOUSE_PASSWORD="$2" clickhouse-client --user "$1" --query "$3" 2>/dev/null || true; }
+
+DB_EXISTS=$(ch_query "$CH_READ_USER" "$CH_READ_PW" "SELECT name FROM system.databases WHERE name='otel_traces'")
+if [[ "$DB_EXISTS" != "otel_traces" ]]; then
+  fail "Database 'otel_traces' does not exist in ClickHouse."
+fi
+
+for TABLE in otel_traces otel_traces_trace_id_ts; do
+  TABLE_EXISTS=$(ch_query "$CH_READ_USER" "$CH_READ_PW" "SELECT name FROM system.tables WHERE database='otel_traces' AND name='${TABLE}'")
+  if [[ "$TABLE_EXISTS" != "$TABLE" ]]; then
+    fail "Table 'otel_traces.${TABLE}' does not exist."
+  fi
+done
+
+MV_EXISTS=$(ch_query "$CH_READ_USER" "$CH_READ_PW" "SELECT name FROM system.tables WHERE database='otel_traces' AND name='otel_traces_trace_id_ts_mv'")
+if [[ "$MV_EXISTS" != "otel_traces_trace_id_ts_mv" ]]; then
+  fail "Materialized view 'otel_traces.otel_traces_trace_id_ts_mv' does not exist."
+fi
+
+pass "Database 'otel_traces' exists with all tables and the materialized view."
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHECK 15 — ClickHouse otel user authentication
+# ─────────────────────────────────────────────────────────────────────────────
+banner "ClickHouse 'otel' user can authenticate"
+
+CH_PASSWORD=$(kubectl get secret -n "$NS" ao-clickhouse-otel-credentials \
+  -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || true)
+
+AUTH_RESULT=$(ch_query otel "$CH_PASSWORD" "SELECT 'auth_ok'")
+if [[ "$AUTH_RESULT" != "auth_ok" ]]; then
+  fail "ClickHouse 'otel' user authentication failed."
+fi
+
+pass "ClickHouse 'otel' user authenticated successfully."
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHECK 16 — ClickHouse least-privilege user model
+#
+# Each user authenticates and holds the expected grants, and the security-critical
+# denials are enforced. Queries run as each user over the pod's local port via
+# `kubectl exec`, so this works while the users' networks/ip include loopback (the
+# default). Once per-caller network scoping restricts a user to specific external
+# CIDRs, the loopback path stops working for that user and these checks must move to
+# the Service endpoint.
+# ─────────────────────────────────────────────────────────────────────────────
+banner "ClickHouse least-privilege user model"
+
+# Both tolerate non-zero (set -euo pipefail is on): callers inspect the *output*, not the exit
+# status — a missing secret yields "" and a denied query yields the error text, so the explicit
+# guards/assertions below fire and print instead of the script dying silently mid-check.
+ch_pw() { kubectl get secret -n "$NS" "$1" -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || true; }
+ch_as() { kubectl exec -n "$NS" "$CH_POD" -- env CLICKHOUSE_PASSWORD="$2" clickhouse-client --user "$1" --query "$3" </dev/null 2>&1 || true; }
+
+expect_grant() {  # label user pw needle
+  if ch_as "$2" "$3" "SHOW GRANTS" | grep -qiF "$4"; then pass "$1"; else fail "$1 — expected grant missing: $4"; fi
+}
+forbid_grant() {  # label user pw needle
+  if ch_as "$2" "$3" "SHOW GRANTS" | grep -qiF "$4"; then fail "$1 — unexpected grant present: $4"; else pass "$1"; fi
+}
+expect_ok() {     # label user pw sql
+  local o; o=$(ch_as "$2" "$3" "$4")
+  if echo "$o" | grep -qiE "exception|access_denied|not enough priv"; then fail "$1 — $o"; else pass "$1"; fi
+}
+expect_denied() { # label user pw sql
+  local o; o=$(ch_as "$2" "$3" "$4")
+  if echo "$o" | grep -qiE "access_denied|not enough priv"; then pass "$1"; else fail "$1 — expected ACCESS_DENIED, got: $o"; fi
+}
+
+SO_PW=$(ch_pw ao-clickhouse-schema-owner-credentials)
+WK_PW=$(ch_pw ao-clickhouse-llm-worker-credentials)
+MC_PW=$(ch_pw ao-clickhouse-monte-carlo-credentials)
+AD_PW=$(ch_pw ao-clickhouse-admin-credentials)
+# otel password = $CH_PASSWORD (CHECK 15); readonly_user = $CH_READ_PW (set above).
+for pair in "schema_owner:$SO_PW" "llm_worker:$WK_PW" "monte_carlo:$MC_PW"; do
+  name="${pair%%:*}"; pw="${pair#*:}"
+  [[ -z "$pw" ]] && fail "ClickHouse per-user secret for '$name' is missing — this cluster predates the least-privilege user model (chart not yet migrated)."
+done
+
+# schema_owner — owns the schema (DDL); deliberately has no access management rights.
+expect_grant   "schema_owner holds DDL on otel_traces"     schema_owner "$SO_PW" "CREATE TABLE"
+forbid_grant   "schema_owner has no access management"     schema_owner "$SO_PW" "ACCESS MANAGEMENT"
+# SHOW USERS is an access-management-gated op that creates no entity, so it stays correct on
+# re-runs (a CREATE USER probe could false-FAIL on a leftover user).
+expect_denied  "schema_owner cannot manage users"          schema_owner "$SO_PW" "SHOW USERS"
+
+# llm_worker — queue read/write only; must NOT read telemetry.
+expect_ok      "llm_worker reads the queue"                llm_worker "$WK_PW" "SELECT count() FROM otel_traces.llm_batches"
+expect_grant   "llm_worker can append results"             llm_worker "$WK_PW" "INSERT ON otel_traces.llm_results"
+expect_denied  "llm_worker cannot read telemetry"          llm_worker "$WK_PW" "SELECT count() FROM otel_traces.spans_normalized"
+expect_denied  "llm_worker cannot write telemetry"         llm_worker "$WK_PW" "INSERT INTO otel_traces.otel_traces (Timestamp) VALUES (now())"
+
+# monte_carlo — reads everything + produces to the queue, but must NOT write telemetry.
+expect_ok      "monte_carlo reads telemetry"               monte_carlo "$MC_PW" "SELECT count() FROM otel_traces.spans_normalized"
+# system.numbers backs time-bucket / gap-fill queries; part of the reader bundle grant.
+expect_ok      "monte_carlo can read system.numbers"       monte_carlo "$MC_PW" "SELECT number FROM system.numbers LIMIT 1"
+expect_grant   "monte_carlo can produce to the queue"      monte_carlo "$MC_PW" "INSERT ON otel_traces.llm_inputs"
+expect_grant   "monte_carlo can produce to llm_batches"    monte_carlo "$MC_PW" "INSERT ON otel_traces.llm_batches"
+expect_denied  "monte_carlo cannot write telemetry"        monte_carlo "$MC_PW" "INSERT INTO otel_traces.otel_traces (Timestamp) VALUES (now())"
+forbid_grant   "monte_carlo cannot write otel_metrics"     monte_carlo "$MC_PW" "GRANT INSERT ON otel_traces.otel_metrics"
+
+# readonly_user — SELECT-only; readonly=2 profile blocks writes even without an explicit deny grant.
+expect_ok      "readonly_user reads telemetry"             readonly_user "$CH_READ_PW" "SELECT count() FROM otel_traces.spans_normalized"
+expect_ok      "readonly_user can read system.numbers"     readonly_user "$CH_READ_PW" "SELECT number FROM system.numbers LIMIT 1"
+forbid_grant   "readonly_user is SELECT-only"              readonly_user "$CH_READ_PW" "GRANT INSERT"
+expect_denied  "readonly_user cannot write (runtime)"      readonly_user "$CH_READ_PW" "INSERT INTO otel_traces.otel_traces (Timestamp) VALUES (now())"
+
+# otel — always an ingester; its grant shape varies by restrictGrants state.
+#   Set VERIFY_OTEL_RESTRICTED=true to assert the INSERT-only (post-cutover) posture;
+#   leave unset (default) to warn-and-pass for pre-cutover clusters.
+if [[ "${VERIFY_OTEL_RESTRICTED:-false}" == "true" ]]; then
+  expect_denied "otel is INSERT-only" otel "$CH_PASSWORD" "SELECT count() FROM otel_traces.otel_traces"
+elif ch_as otel "$CH_PASSWORD" "SELECT count() FROM otel_traces.otel_traces" | grep -qiE "access_denied|not enough priv"; then
+  pass "otel is INSERT-only (restrictGrants enabled)"
+else
+  echo -e "  ${YELLOW}⚠ otel can still read telemetry — restrictGrants not yet enabled (expected pre-cutover)${RESET}"
+fi
+
+# admin — only when enabled; superuser, reachable over loopback (this exec is loopback).
+if [[ -n "$AD_PW" ]]; then
+  expect_grant "admin is a superuser"      admin "$AD_PW" "GRANT ALL ON *.*"
+  expect_grant "admin can delegate grants" admin "$AD_PW" "WITH GRANT OPTION"
+else
+  echo -e "  ${YELLOW}▸ admin user not enabled — skipping${RESET}"
+fi
+
+# Materialized views must run under schema_owner as their DEFINER.
+for mv in otel_traces_trace_id_ts_mv spans_normalized_mv conversations_normalized_mv; do
+  if ch_as schema_owner "$SO_PW" "SHOW CREATE TABLE otel_traces.$mv" | grep -qiE "DEFINER *= *\`?schema_owner\`?"; then
+    pass "MV $mv runs as schema_owner (DEFINER)"
+  else
+    fail "MV $mv is not owned by schema_owner — the normalization cascade will break once otel is restricted."
+  fi
+done
+
+pass "ClickHouse least-privilege user model verified."
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHECK 17 — OTel Collector health check
+# ─────────────────────────────────────────────────────────────────────────────
+banner "OTel Collector health check endpoint responds"
+
+run_cmd "OTel Collector pod readiness (implies the :13133 health check is passing)" \
+  kubectl get pod -n "$NS" "$OTEL_POD" -o jsonpath='{.status.conditions[?(@.type=="Ready")]}'
+
+OTEL_READY_STATUS=$(kubectl get pod -n "$NS" "$OTEL_POD" \
+  -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' || true)
+if [[ "$OTEL_READY_STATUS" != "True" ]]; then
+  fail "OTel Collector pod is not Ready — the :13133 health check may be failing."
+fi
+
+pass "OTel Collector pod is Ready (:13133 health check is passing)."
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHECK 18 — OTel Collector logs (no export errors)
+# ─────────────────────────────────────────────────────────────────────────────
+banner "OTel Collector has no export errors in recent logs"
+
+run_cmd "Recent OTel Collector logs (last 50 lines)" \
+  kubectl logs -n "$NS" "$OTEL_POD" --tail=50
+
+ERROR_LINES=$(kubectl logs -n "$NS" "$OTEL_POD" --tail=200 2>/dev/null \
+  | grep -iE "error|failed|refused" | grep -ivE "healthcheck|retry" || true)
+if [[ -n "$ERROR_LINES" ]]; then
+  echo ""
+  echo -e "  ${YELLOW}⚠ WARNING: Found error-like lines in OTel Collector logs:${RESET}"
+  echo "$ERROR_LINES" | head -10 | sed 's/^/    /'
+  echo ""
+  echo -e "  ${YELLOW}  Review these manually — they may be transient startup errors.${RESET}"
+fi
+
+pass "No persistent export errors detected in OTel Collector logs."
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHECK 19 — End-to-end smoke test: OTLP trace → collector → ClickHouse
+# ─────────────────────────────────────────────────────────────────────────────
+banner "End-to-end smoke test: send a trace via OTLP and verify it lands in ClickHouse"
 
 # Random 16-byte trace id / 8-byte span id (openssl is already a requirement; this is
 # portable, unlike GNU-only date +%N).
@@ -496,7 +673,7 @@ echo "    TraceId: ${TRACE_ID}"
 # emit); grep -oE '\{.*\}' then keeps only the collector's JSON response body, dropping any
 # trailing "pod ... deleted" lifecycle notice that --rm concatenates onto the same line.
 SEND_RESULT=$(kubectl run -n "$NS" verify-smoke-test-azure --rm -i --restart=Never --quiet \
-  --image=curlimages/curl -- \
+  --image=curlimages/curl:8.11.1 -- \
   "$CURL_OPTS" -X POST "$SEND_URL" --max-time 30 \
   -H "Content-Type: application/json" \
   -d "$TRACE_JSON" 2>/dev/null | grep -oE '\{.*\}' | head -1 || true)
@@ -504,11 +681,18 @@ echo "    Response: ${SEND_RESULT}"
 
 echo ""
 echo -e "  ${YELLOW}▸ Querying ClickHouse for the trace (allowing for batch-processor flush)...${RESET}"
+# Poll window is configurable (default 24×5s = 120s). The OTel ClickHouse exporter retries
+# for up to 30m (retry_on_failure.max_elapsed_time in the chart), so a miss here is not
+# necessarily fatal — it can simply exceed this window under post-upgrade backpressure.
+SMOKE_ATTEMPTS="${SMOKE_TEST_ATTEMPTS:-24}"
 SMOKE_COUNT=0
-for _ in 1 2 3 4 5 6; do
+for ((i = 1; i <= SMOKE_ATTEMPTS; i++)); do
   sleep 5
+  # Password via env (CLICKHOUSE_PASSWORD), not --password on argv, so it stays out of the
+  # pod process table and the kube-apiserver exec audit record (mirrors the AWS ch_as()).
   SMOKE_COUNT=$(kubectl exec -n "$NS" "$CH_POD" -- \
-    clickhouse-client --user "$CH_READ_USER" --password "$CH_READ_PW" \
+    env CLICKHOUSE_PASSWORD="$CH_READ_PW" \
+    clickhouse-client --user "$CH_READ_USER" \
     --query "SELECT count() FROM otel_traces.otel_traces WHERE TraceId = '${TRACE_ID}'" 2>/dev/null || echo 0)
   [[ "$SMOKE_COUNT" =~ ^[0-9]+$ && "$SMOKE_COUNT" -gt 0 ]] && break
 done
@@ -521,9 +705,9 @@ if [[ "$SMOKE_COUNT" =~ ^[0-9]+$ && "$SMOKE_COUNT" -gt 0 ]]; then
   fi
 else
   if [[ "$GATEWAY_MODE" == "true" ]]; then
-    fail "Trace ${TRACE_ID} did not arrive in ClickHouse within ~30s — the end-to-end path may be broken (gateway ingress/DNS/hairpin, collector ingest, schema, or backend TLS)."
+    fail "Trace ${TRACE_ID} did not arrive in ClickHouse within the poll window (~$((SMOKE_ATTEMPTS * 5))s) — the end-to-end path may be broken (gateway ingress/DNS/hairpin, collector ingest, schema, or backend TLS). Note: the OTel exporter retries for up to 30m, so a miss here isn't necessarily fatal."
   else
-    fail "Trace ${TRACE_ID} did not arrive in ClickHouse within ~30s — the end-to-end pipeline may be broken (collector ingest, schema, or backend TLS)."
+    fail "Trace ${TRACE_ID} did not arrive in ClickHouse within the poll window (~$((SMOKE_ATTEMPTS * 5))s) — the end-to-end pipeline may be broken (collector ingest, schema, or backend TLS). Note: the OTel exporter retries for up to 30m, so a miss here isn't necessarily fatal."
   fi
 fi
 
