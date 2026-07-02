@@ -1,17 +1,18 @@
 {{- if .Values.gateway.enabled }}
 {{- if ne .Values.gateway.tls.source "letsencrypt" }}
-{{- fail "gateway.tls.source must be \"letsencrypt\" — the Key Vault (BYO-cert) source is reserved for a future release and not yet implemented." }}
+{{- fail "gateway.tls.source must be \"letsencrypt\" — a BYO-cert source is reserved for a future release and not yet implemented." }}
 {{- end }}
 {{- if not .Values.tls.enabled }}
 {{- fail "gateway.enabled requires tls.enabled=true — the Gateway always re-encrypts to the ClickHouse https/8443 listener, which only exists when internal TLS is on. Set tls.enabled=true, or gateway.enabled=false." }}
 {{- end }}
-# Managed AKS Gateway API (application routing add-on). One Gateway, two HTTPS
-# listeners terminating TLS per-hostname for the collector and ClickHouse.
-# Backends are ClusterIP; the internal self-signed path is untouched.
+# Kubernetes Gateway API. One Gateway, two HTTPS listeners terminating TLS
+# per-hostname for the collector and ClickHouse. Backends are ClusterIP; the
+# internal self-signed path is untouched.
 #
 # The Gateway's load balancer is forced internal (private IP only): the collector
 # and ClickHouse endpoints are never publicly reachable and are accessed over private
-# connectivity.
+# connectivity. The load-balancer annotations below are the cloud provider's
+# (Azure shown) — other providers substitute their own keys.
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:
@@ -22,7 +23,8 @@ metadata:
 spec:
   infrastructure:
     annotations:
-      # Provision the managed Gateway's Azure LB as internal (private IP only).
+      # Force the Gateway's load balancer internal (private IP only). Azure key;
+      # other clouds use their own internal-LB annotation.
       service.beta.kubernetes.io/azure-load-balancer-internal: "true"
       {{- with .Values.gateway.allowedSourceRanges }}
       # Restrict the (internal) LB to these source CIDRs (unioned across both listeners).

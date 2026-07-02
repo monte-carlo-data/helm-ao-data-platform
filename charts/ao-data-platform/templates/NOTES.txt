@@ -15,7 +15,7 @@ Verify the deployment:
   kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/name=opentelemetry-collector
 {{- if .Values.gateway.enabled }}
 
-The Azure Gateway path is enabled. It requires (the Terraform module installs these):
+The Gateway path is enabled. It requires (the Terraform module installs these):
   - cert-manager, plus the Workload Identity referenced by
     gateway.tls.letsencrypt.azureDNS.managedIdentityClientID (issues the listener certs)
   - trust-manager, with its trust namespace set to {{ .Release.Namespace }} (mirrors the
