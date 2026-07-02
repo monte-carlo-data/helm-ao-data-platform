@@ -471,17 +471,36 @@ EOJSON
 )
 
 echo ""
-echo -e "  ${YELLOW}▸ Sending a test trace to the OTel collector (in-cluster OTLP/HTTP)${RESET}"
+# Default (gateway mode): send through the gateway hostname, exercising the true agent
+# ingress path end-to-end — publicly-trusted TLS terminate → HTTPRoute → BackendTLSPolicy
+# re-encrypt → collector. The gateway's Let's Encrypt cert is trusted, so no -k. As a
+# bonus, the ephemeral pod's VNet source IP traverses the LB source-range restriction, so
+# a success also confirms the restriction admits in-VNet clients.
+#   Notes: relies on in-cluster DNS resolving the public hostname (CoreDNS → upstream) and
+#   on internal-LB hairpin; both hold on AKS. Falls back to the collector's in-cluster
+#   endpoint (self-signed, -k) in the internal-LB path, which has no gateway hostname.
+if [[ "$GATEWAY_MODE" == "true" ]]; then
+  OTEL_HOST=$(kubectl get httproute -n "$NS" "${GW_NAME}-otel" \
+    -o jsonpath='{.spec.hostnames[0]}' 2>/dev/null)
+  [[ -z "$OTEL_HOST" ]] && fail "Could not resolve the OTel gateway hostname from HTTPRoute ${GW_NAME}-otel."
+  SEND_URL="https://${OTEL_HOST}/v1/traces"
+  CURL_OPTS="-s"
+  echo -e "  ${YELLOW}▸ Sending a test trace via the gateway (${OTEL_HOST})${RESET}"
+else
+  SEND_URL="https://opentelemetry-collector:4318/v1/traces"
+  CURL_OPTS="-sk"
+  echo -e "  ${YELLOW}▸ Sending a test trace to the collector (in-cluster internal-LB path)${RESET}"
+fi
 echo "    TraceId: ${TRACE_ID}"
-# Ephemeral curl pod → the collector Service directly (this isolates the data path:
-# collector → ClickHouse; the gateway/LB edge is already covered by CHECK 13). -k because
-# the collector serves its in-cluster self-signed cert on 4318.
-SEND_RESULT=$(kubectl run -n "$NS" verify-smoke-test-azure --rm -i --restart=Never \
+# --quiet suppresses kubectl's attach/prompt chatter (and the duplicated stream it can
+# emit); grep -oE '\{.*\}' then keeps only the collector's JSON response body, dropping any
+# trailing "pod ... deleted" lifecycle notice that --rm concatenates onto the same line.
+SEND_RESULT=$(kubectl run -n "$NS" verify-smoke-test-azure --rm -i --restart=Never --quiet \
   --image=curlimages/curl -- \
-  -sk -X POST "https://opentelemetry-collector:4318/v1/traces" \
+  "$CURL_OPTS" -X POST "$SEND_URL" --max-time 30 \
   -H "Content-Type: application/json" \
-  -d "$TRACE_JSON" 2>/dev/null | grep -v '^pod "' || true)
-echo "    Collector response: ${SEND_RESULT}"
+  -d "$TRACE_JSON" 2>/dev/null | grep -oE '\{.*\}' | head -1 || true)
+echo "    Response: ${SEND_RESULT}"
 
 echo ""
 echo -e "  ${YELLOW}▸ Querying ClickHouse for the trace (allowing for batch-processor flush)...${RESET}"
@@ -495,9 +514,17 @@ for _ in 1 2 3 4 5 6; do
 done
 
 if [[ "$SMOKE_COUNT" =~ ^[0-9]+$ && "$SMOKE_COUNT" -gt 0 ]]; then
-  pass "Trace ${TRACE_ID} landed in ClickHouse (${SMOKE_COUNT} row(s)) — end-to-end OTLP → collector → ClickHouse works."
+  if [[ "$GATEWAY_MODE" == "true" ]]; then
+    pass "Trace ${TRACE_ID} landed in ClickHouse (${SMOKE_COUNT} row(s)) — end-to-end via gateway (TLS → HTTPRoute → re-encrypt → collector → ClickHouse) works."
+  else
+    pass "Trace ${TRACE_ID} landed in ClickHouse (${SMOKE_COUNT} row(s)) — end-to-end OTLP → collector → ClickHouse works."
+  fi
 else
-  fail "Trace ${TRACE_ID} did not arrive in ClickHouse within ~30s — the end-to-end pipeline may be broken (collector ingest, schema, or backend TLS)."
+  if [[ "$GATEWAY_MODE" == "true" ]]; then
+    fail "Trace ${TRACE_ID} did not arrive in ClickHouse within ~30s — the end-to-end path may be broken (gateway ingress/DNS/hairpin, collector ingest, schema, or backend TLS)."
+  else
+    fail "Trace ${TRACE_ID} did not arrive in ClickHouse within ~30s — the end-to-end pipeline may be broken (collector ingest, schema, or backend TLS)."
+  fi
 fi
 
 echo ""
