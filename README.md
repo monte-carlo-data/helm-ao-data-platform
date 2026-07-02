@@ -220,6 +220,12 @@ default**, so AWS and local installs are unaffected.
 
 The Gateway's load balancer is **always internal** (private IP only) — the collector and ClickHouse
 endpoints are never publicly reachable and are reached over private connectivity.
+
+Because the Gateway is L7 HTTP(S), clients reach the backends over their HTTP interfaces only: the
+collector takes **OTLP/HTTP on 4318** (no gRPC), and ClickHouse is reached over its **HTTPS interface
+on port 8443** (not 443, and not the native TCP protocol on 9440) — so clients and DSNs should target
+`https://<clickhouse-host>:8443`.
+
 ### Prerequisites
 
 - An AKS cluster with the **application-routing add-on** enabled, providing the Gateway API CRDs
