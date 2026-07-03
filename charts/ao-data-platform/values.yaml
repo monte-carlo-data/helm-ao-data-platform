@@ -7,6 +7,16 @@ clickhouse:
   # are reproducible. Note: `26.4` is a deliberate jump from the Altinity
   # 0.26.0 operator default of `23.8` — adopt with intent on first install.
   image: clickhouse/clickhouse-server:26.4.3
+  # Number of ClickHouse replicas in the (single-shard) cluster. Default 1 keeps
+  # the standard install a single instance — correct for this chart version, whose
+  # sql/*.sql tables are still plain MergeTree. High availability (2 replicas across
+  # AZs, backed by Keeper) is delivered by a later chart version that ships
+  # ReplicatedMergeTree engines + ON CLUSTER DDL; bumping this to 2 before that
+  # version, or against not-yet-converted tables, would start an independent,
+  # non-replicated second lineage. The consuming terraform owns this value during the
+  # in-place HA migration — it pins it at 1 until the conversion verifies, then moves
+  # it to 2. See README (Keeper / HA migration).
+  replicasCount: 1
   storageClass: ""
   storageSize: 100Gi
   # Data retention, in days, for the telemetry tables — the raw traces, the
@@ -176,6 +186,46 @@ clickhouse:
       memory: 2Gi
     limits:
       memory: 4Gi
+
+# ClickHouse Keeper — the coordination ensemble (Raft) that backs ReplicatedMergeTree
+# tables. Deployed as an Altinity ClickHouseKeeperInstallation (CHK); the ClickHouse
+# server (CHI) is wired to it via spec.configuration.zookeeper (see
+# templates/clickhouse-installation.yaml) and resolves replica paths through the
+# operator-injected macros (default_replica_path). Keeper is intrinsic to the clustered
+# design — there is no keeper-less mode; a dev/small install just sizes it down to
+# replicaCount: 1. See README for the two-apply HA migration ordering.
+keeper:
+  # Number of Keeper voters. Prod HA = 3 (a quorum of 2 tolerates losing one voter /
+  # one AZ); dev = 1. Should be odd (Raft quorum). The consuming terraform derives
+  # this from the length of its Keeper availability-zone list, so the voter count
+  # cannot drift from the number of per-AZ Keeper node groups.
+  replicaCount: 3
+  # Keeper image. Pinned to track the ClickHouse server release line (clickhouse.image
+  # is clickhouse-server:26.4.3); the AO team owns periodic bumps, same as the server
+  # image. NOTE: confirm this exact tag is published for clickhouse-keeper before the
+  # first deploy — the operator will otherwise fail to pull.
+  image: clickhouse/clickhouse-keeper:26.4.3
+  storageClass: ""
+  # Keeper persists only coordination metadata (Raft log + snapshots), not telemetry,
+  # so a small volume is ample. A replaced voter re-syncs its state from the quorum,
+  # so this does not need a Retain reclaim policy (plain gp3 / Delete is fine).
+  storageSize: 10Gi
+  # Resource requests/limits for the Keeper container. Sized to sit comfortably on a
+  # 2 vCPU / 8 GiB node (the terraform default is m6i.large) with OOM headroom — a
+  # throttled or OOM-killed voter risks spurious leader elections. CPU limit omitted
+  # deliberately (Keeper is bursty on failover). Tune per environment.
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      memory: 4Gi
+  # Pod scheduling for Keeper voters. The consuming terraform sets these to pin Keeper
+  # to its dedicated, tainted node groups (dedicated=keeper); defaults are no-ops. Hard
+  # AZ spread across topology.kubernetes.io/zone is applied in the CHK pod template
+  # itself (templates/clickhouse-keeper-installation.yaml), not here.
+  nodeSelector: {}
+  tolerations: []
 
 tls:
   enabled: true
