@@ -64,6 +64,27 @@ otel
 {{- end }}
 
 {{/*
+ClickHouseKeeperInstallation name.
+The Altinity operator stamps the label `clickhouse-keeper.altinity.com/chk: <name>`
+onto the Keeper pods and names the client Service `keeper-<name>`, so the Keeper PDB
+selector, the CHK pod topology-spread selector, and the CHI's zookeeper host must all
+derive from this same value. Centralized here so they can't drift apart.
+*/}}
+{{- define "ao-data-platform.chkName" -}}
+otel
+{{- end }}
+
+{{/*
+Keeper client Service DNS name (in-namespace).
+The operator creates a ClusterIP Service `keeper-<chkName>` on the Keeper client port
+(2181) — mirrors how the CHI's Service is `clickhouse-<chiName>`. This is the host the
+ClickHouse server points its `zookeeper.nodes` at.
+*/}}
+{{- define "ao-data-platform.keeperServiceName" -}}
+keeper-{{ include "ao-data-platform.chkName" . }}
+{{- end }}
+
+{{/*
 TLS certificate issuer reference.
 Returns the issuer ref block for Certificate resources.
 */}}
