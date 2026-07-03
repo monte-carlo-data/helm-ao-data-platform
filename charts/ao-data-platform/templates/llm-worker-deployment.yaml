@@ -6,7 +6,7 @@ metadata:
     {{- include "ao-data-platform.labels" . | nindent 4 }}
     app.kubernetes.io/component: llm-worker
 spec:
-  replicas: 1
+  replicas: {{ .Values.llmWorker.replicaCount }}
   selector:
     matchLabels:
       {{- include "ao-data-platform.selectorLabels" . | nindent 6 }}

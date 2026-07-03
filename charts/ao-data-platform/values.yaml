@@ -310,6 +310,11 @@ altinity-clickhouse-operator:
 
 # LLM Worker — polls ClickHouse for pending batches, calls AWS Bedrock, writes results back
 llmWorker:
+  # Number of llm-worker pods. Exposed so the consuming terraform can pin it (e.g. to 0)
+  # as config that survives a `helm upgrade` — used to pause/resume ingest-adjacent work
+  # during the HA migration window without a manual `kubectl scale` being reset by the
+  # next apply.
+  replicaCount: 1
   image:
     repository: ""
     tag: ""
