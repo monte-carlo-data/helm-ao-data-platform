@@ -8,7 +8,7 @@
 # schema job, ExternalSecret sync, cert-manager Issuers/Certificates, TLS secrets, the
 # ClickHouse database/schema + materialized views, and the least-privilege user model) and
 # adapts the cloud-coupled ones for Azure:
-#   - StorageClass: ebs.csi.aws.com/gp3 → disk.csi.azure.com/Premium SSD
+#   - StorageClass: ebs.csi.aws.com/gp3 → disk.csi.azure.com/Premium SSD v2
 #   - Ingress: AWS NLB Service annotations → the managed Gateway API
 #     (Gateway/HTTPRoute/BackendTLSPolicy) in gateway mode, or the internal-LB
 #     Service annotation otherwise — auto-detected.
@@ -319,9 +319,9 @@ done
 pass "All TLS certificates have valid SANs and are not expired."
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHECK 11 — StorageClass is Azure Disk Premium SSD
+# CHECK 11 — StorageClass is Azure Disk Premium SSD v2
 # ─────────────────────────────────────────────────────────────────────────────
-banner "StorageClass uses disk.csi.azure.com and Premium SSD"
+banner "StorageClass uses disk.csi.azure.com and Premium SSD v2"
 
 CH_SC=$(kubectl get pvc -n "$NS" --no-headers \
   -o custom-columns=":spec.storageClassName" | head -1 || true)
@@ -335,15 +335,22 @@ run_cmd "StorageClass '${CH_SC}' details" \
 
 SC_PROVISIONER=$(kubectl get storageclass "$CH_SC" -o jsonpath='{.provisioner}' || true)
 SC_SKU=$(kubectl get storageclass "$CH_SC" -o jsonpath='{.parameters.skuName}' || true)
+SC_IOPS=$(kubectl get storageclass "$CH_SC" -o jsonpath='{.parameters.DiskIOPSReadWrite}' || true)
+SC_MBPS=$(kubectl get storageclass "$CH_SC" -o jsonpath='{.parameters.DiskMBpsReadWrite}' || true)
 
 if [[ "$SC_PROVISIONER" != "disk.csi.azure.com" ]]; then
   fail "StorageClass provisioner is '${SC_PROVISIONER}', expected 'disk.csi.azure.com'."
 fi
-if [[ "$SC_SKU" != Premium_* ]]; then
-  fail "StorageClass skuName is '${SC_SKU}', expected a Premium SSD SKU (Premium_LRS / Premium_ZRS)."
+if [[ "$SC_SKU" != PremiumV2_* ]]; then
+  fail "StorageClass skuName is '${SC_SKU}', expected a Premium SSD v2 SKU (e.g. PremiumV2_LRS)."
+fi
+# PremiumV2 provisions IOPS/throughput explicitly (they don't scale with size), so the class
+# must set them.
+if [[ -z "$SC_IOPS" || -z "$SC_MBPS" ]]; then
+  fail "StorageClass '${CH_SC}' is PremiumV2 but missing DiskIOPSReadWrite/DiskMBpsReadWrite (got iops='${SC_IOPS}', throughput='${SC_MBPS}')."
 fi
 
-pass "StorageClass '${CH_SC}' uses disk.csi.azure.com with SKU '${SC_SKU}'."
+pass "StorageClass '${CH_SC}' uses disk.csi.azure.com with SKU '${SC_SKU}' (${SC_IOPS} IOPS / ${SC_MBPS} MB/s)."
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CHECK 12 — PVCs bound on Azure managed disks
