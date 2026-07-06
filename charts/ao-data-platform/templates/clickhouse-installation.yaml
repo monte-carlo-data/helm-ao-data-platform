@@ -153,6 +153,74 @@ spec:
             <default remove="1"/>
           </users>
         </clickhouse>
+      # probe — the identity the /ready readiness handler executes as (see
+      # config.d/readiness_handler.xml below). Defined as a raw users.d file rather
+      # than through the operator `users:` section so nothing can attach a password
+      # to it: the handler's <user> field authenticates with an empty password, so
+      # the user must genuinely be no_password. Networks stay open because kubelet
+      # probes arrive from node IPs; the exposure is bounded by the grants — config
+      # <grants> are exhaustive, so this user can read system.replicas plus table
+      # *metadata* (SHOW TABLES; no data access) and nothing else — plus a
+      # readonly=2 profile as defense-in-depth. Not listed in values.yaml/
+      # external-secret.yaml on purpose: it has no secret and is not a
+      # caller-facing user.
+      users.d/probe_user.xml: |
+        <clickhouse>
+          <profiles>
+            <!-- readonly=2, not 1: SELECT-only while per-session SET stays allowed;
+                 mode 1 rejects all setting changes, which can trip HTTP clients that
+                 pass settings with the request (same rationale as the gated
+                 readonly_settings profile above). Belt-and-braces on top of the
+                 exhaustive grant below. -->
+            <probe_profile>
+              <readonly>2</readonly>
+            </probe_profile>
+          </profiles>
+          <users>
+            <probe>
+              <no_password/>
+              <networks>
+                <ip>::/0</ip>
+              </networks>
+              <profile>probe_profile</profile>
+              <quota>default</quota>
+              <grants>
+                <query>GRANT SELECT ON system.replicas</query>
+                <!-- Load-bearing, not cosmetic: system.replicas filters its rows to
+                     tables the querying user can see, so without visibility of the
+                     otel_traces tables the probe reads an EMPTY system.replicas and
+                     can never fail — a readonly replica would stay "ready". SHOW
+                     TABLES grants that visibility without any data access. -->
+                <query>GRANT SHOW TABLES ON otel_traces.*</query>
+              </grants>
+            </probe>
+          </users>
+        </clickhouse>
+      # Writer-safe readiness endpoint, probed by the pod readinessProbe (see the
+      # podTemplate below). A replica that loses its Keeper session goes readonly
+      # but keeps answering /ping with 200 — and /replicas_status also stays 200 in
+      # CH 26.4 — so the default probes would keep the Service routing INSERTs to a
+      # replica that can't accept them (writers then hang ~120s in
+      # WaitForAsyncInsert rather than failing fast). This handler throws (HTTP 500)
+      # whenever any table on the replica is readonly, dropping the replica out of
+      # the Service until it rejoins Keeper. <defaults/> keeps the built-in
+      # handlers (/ping, dynamic queries, …) working — without it this rule would
+      # replace them all.
+      config.d/readiness_handler.xml: |
+        <clickhouse>
+          <http_handlers>
+            <rule>
+              <url>/ready</url>
+              <methods>GET</methods>
+              <handler>
+                <type>predefined_query_handler</type>
+                <query>SELECT throwIf(count() &gt; 0) FROM system.replicas WHERE is_readonly</query>
+                <user>probe</user>
+              </handler>
+            </rule>
+            <defaults/>
+          </http_handlers>
+        </clickhouse>
       {{- if .Values.tls.enabled }}
       server.crt:
         valueFrom:
@@ -207,14 +275,11 @@ spec:
     templates:
       dataVolumeClaimTemplate: data
       serviceTemplate: clickhouse-svc
-      # Stock installs always hit this branch (resources is defaulted in
-      # values.yaml); the conditional is an escape hatch for consumers who
-      # set all three to empty to fall back to operator defaults.
-      {{- if or .Values.clickhouse.nodeSelector .Values.clickhouse.tolerations .Values.clickhouse.resources }}
       podTemplate: clickhouse
-      {{- end }}
   templates:
-    {{- if or .Values.clickhouse.nodeSelector .Values.clickhouse.tolerations .Values.clickhouse.resources }}
+    # Always emitted (the pre-2.3.0 conditional escape hatch to operator defaults
+    # is gone): the writer-safe readinessProbe and the zone spread below are
+    # load-bearing chart behavior, not optional tuning.
     podTemplates:
       - name: clickhouse
         spec:
@@ -227,12 +292,9 @@ spec:
               resources:
                 {{- toYaml . | nindent 16 }}
               {{- end }}
-              # Only the startupProbe is set here. The Altinity operator
-              # injects its own liveness/readiness probes on the `clickhouse`
-              # container for steady-state health, so we rely on those and
-              # add only this startup gate. Generous startup window — large
-              # mark-cache warmups on restart can otherwise trip liveness and
-              # create restart loops.
+              # Startup gate only — steady-state liveness stays operator-injected
+              # (/ping). Generous window: large mark-cache warmups on restart can
+              # otherwise trip liveness and create restart loops.
               startupProbe:
                 httpGet:
                   path: /ping
@@ -244,6 +306,26 @@ spec:
                   {{- end }}
                 failureThreshold: 30
                 periodSeconds: 10
+              # Writer-safe readiness (replaces the operator-injected readiness
+              # probe, which the operator only adds when none is user-defined):
+              # /ready is the readonly-failing handler defined in
+              # config.d/readiness_handler.xml above. A replica partitioned from
+              # Keeper — or running its entire initial clone — reports not-Ready
+              # for the whole event, which is exactly the point: the Service must
+              # not route writes to it. Gate operational waits on system.replicas
+              # checks, not on pod Ready.
+              readinessProbe:
+                httpGet:
+                  path: /ready
+                  {{- if .Values.tls.enabled }}
+                  port: 8443
+                  scheme: HTTPS
+                  {{- else }}
+                  port: 8123
+                  {{- end }}
+                periodSeconds: 10
+                timeoutSeconds: 5
+                failureThreshold: 3
           {{- with .Values.clickhouse.nodeSelector }}
           nodeSelector:
             {{- toYaml . | nindent 12 }}
@@ -252,7 +334,20 @@ spec:
           tolerations:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-    {{- end }}
+          # Hard AZ spread — replicas land in distinct zones (mirrors the CHK
+          # spread in clickhouse-keeper-installation.yaml). No cluster autoscaler
+          # in the target environment, so the per-AZ ClickHouse node groups must
+          # pre-exist or the second replica stays Pending. DoNotSchedule is
+          # deliberate: two replicas in one AZ would silently forfeit the
+          # single-AZ-failure tolerance HA exists for. Trivially satisfied at
+          # replicasCount: 1 (dev).
+          topologySpreadConstraints:
+            - maxSkew: 1
+              topologyKey: topology.kubernetes.io/zone
+              whenUnsatisfiable: DoNotSchedule
+              labelSelector:
+                matchLabels:
+                  clickhouse.altinity.com/chi: {{ include "ao-data-platform.chiName" . }}
     serviceTemplates:
       - name: clickhouse-svc
         metadata:
