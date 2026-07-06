@@ -22,6 +22,38 @@ Fully qualified app name, truncated to 63 characters.
 {{- end }}
 
 {{/*
+Namespace-qualified name for CLUSTER-SCOPED resources (the ClusterIssuer and the
+trust-manager Bundle). fullname derives from the release + chart name only, so two
+same-named releases in different namespaces would collide on cluster-scoped objects
+(silently overwriting each other's config; an uninstall deleting the survivor's shared
+object). Appending the namespace keeps them distinct. Namespaced resources must NOT use
+this — they are already namespace-isolated and use stable literals.
+*/}}
+{{- define "ao-data-platform.clusterScopedName" -}}
+{{- printf "%s-%s" (include "ao-data-platform.fullname" .) .Release.Namespace -}}
+{{- end }}
+
+{{/*
+Gateway feature validation — the single source of truth for the gateway path's render-time
+guards. Included at the top of every gateway template so ANY gateway render (not just
+gateway.yaml) enforces the same invariants; when a new gateway.tls.source branch lands, add
+its guard here once instead of in each template. A no-op when gateway.enabled is false.
+*/}}
+{{- define "ao-data-platform.gatewayValidate" -}}
+{{- if .Values.gateway.enabled -}}
+{{- if ne .Values.gateway.tls.source "letsencrypt" -}}
+{{- fail "gateway.tls.source must be \"letsencrypt\" — a BYO-cert source is reserved for a future release and not yet implemented." -}}
+{{- end -}}
+{{- if not .Values.tls.enabled -}}
+{{- fail "gateway.enabled requires tls.enabled=true — the Gateway always re-encrypts to the ClickHouse https/8443 listener, which only exists when internal TLS is on. Set tls.enabled=true, or gateway.enabled=false." -}}
+{{- end -}}
+{{- if not .Values.tls.certManager.createCA -}}
+{{- fail "gateway.enabled currently requires tls.certManager.createCA=true — the Gateway backend-TLS Bundle sources the chart-managed ao-data-platform-ca secret and does not yet support tls.certManager.existingIssuerRef." -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 ClickHouseInstallation name.
 The Altinity operator stamps the label `clickhouse.altinity.com/chi: <name>`
 onto the ClickHouse pods, so anything selecting those pods must use this same

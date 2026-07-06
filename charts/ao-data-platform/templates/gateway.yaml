@@ -1,10 +1,5 @@
+{{- include "ao-data-platform.gatewayValidate" . }}
 {{- if .Values.gateway.enabled }}
-{{- if ne .Values.gateway.tls.source "letsencrypt" }}
-{{- fail "gateway.tls.source must be \"letsencrypt\" — a BYO-cert source is reserved for a future release and not yet implemented." }}
-{{- end }}
-{{- if not .Values.tls.enabled }}
-{{- fail "gateway.enabled requires tls.enabled=true — the Gateway always re-encrypts to the ClickHouse https/8443 listener, which only exists when internal TLS is on. Set tls.enabled=true, or gateway.enabled=false." }}
-{{- end }}
 # Kubernetes Gateway API. One Gateway, two HTTPS listeners terminating TLS
 # per-hostname for the collector and ClickHouse. Backends are ClusterIP; the
 # internal self-signed path is untouched.

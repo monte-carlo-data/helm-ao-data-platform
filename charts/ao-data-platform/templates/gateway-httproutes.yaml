@@ -1,3 +1,4 @@
+{{- include "ao-data-platform.gatewayValidate" . }}
 {{- if .Values.gateway.enabled }}
 # Routes each public listener to its ClusterIP backend. The collector serves OTLP/HTTP
 # on 4318; ClickHouse serves its HTTPS interface on 8443.

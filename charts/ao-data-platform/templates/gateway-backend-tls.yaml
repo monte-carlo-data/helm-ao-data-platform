@@ -1,3 +1,4 @@
+{{- include "ao-data-platform.gatewayValidate" . }}
 {{- if and .Values.gateway.enabled .Values.tls.enabled }}
 # Re-encrypt the Gateway→backend hop. The Gateway terminates the public cert, then
 # opens a fresh TLS connection to the (still self-signed) collector and ClickHouse,
@@ -11,7 +12,7 @@
 apiVersion: trust.cert-manager.io/v1alpha1
 kind: Bundle
 metadata:
-  name: {{ include "ao-data-platform.fullname" . }}-ca-bundle
+  name: {{ include "ao-data-platform.clusterScopedName" . }}-ca-bundle
   labels:
     {{- include "ao-data-platform.labels" . | nindent 4 }}
 spec:
@@ -44,7 +45,7 @@ spec:
     caCertificateRefs:
       - group: ""
         kind: ConfigMap
-        name: {{ include "ao-data-platform.fullname" . }}-ca-bundle
+        name: {{ include "ao-data-platform.clusterScopedName" . }}-ca-bundle
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: BackendTLSPolicy
@@ -64,5 +65,5 @@ spec:
     caCertificateRefs:
       - group: ""
         kind: ConfigMap
-        name: {{ include "ao-data-platform.fullname" . }}-ca-bundle
+        name: {{ include "ao-data-platform.clusterScopedName" . }}-ca-bundle
 {{- end }}
