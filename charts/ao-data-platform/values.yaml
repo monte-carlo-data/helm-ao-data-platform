@@ -7,16 +7,18 @@ clickhouse:
   # are reproducible. Note: `26.4` is a deliberate jump from the Altinity
   # 0.26.0 operator default of `23.8` — adopt with intent on first install.
   image: clickhouse/clickhouse-server:26.4.3
-  # Number of ClickHouse replicas in the (single-shard) cluster. Default 1 keeps
-  # the standard install a single instance — correct for this chart version, whose
-  # sql/*.sql tables are still plain MergeTree. High availability (2 replicas across
-  # AZs, backed by Keeper) is delivered by a later chart version that ships
-  # ReplicatedMergeTree engines + ON CLUSTER DDL; bumping this to 2 before that
-  # version, or against not-yet-converted tables, would start an independent,
-  # non-replicated second lineage. The consuming terraform owns this value during the
-  # in-place HA migration — it pins it at 1 until the conversion verifies, then moves
-  # it to 2. See the README's "ClickHouse replication and Keeper" section.
-  replicasCount: 1
+  # Number of ClickHouse replicas in the (single-shard) cluster. Default 2 is the
+  # HA shape this chart's SQL is built for: every table is a path-less Replicated*
+  # engine and all DDL runs ON CLUSTER, so a fresh install's replicas share one
+  # schema and clone data via Keeper. Dev/small installs override this to 1 (and
+  # keeper.replicasCount to 1) — same code path, sized down, matching the
+  # prod-shaped-defaults philosophy of the keeper block below. Installs upgrading
+  # with pre-existing plain-MergeTree data MUST hold this at 1 until the in-place
+  # convert_to_replicated conversion has verified — the consuming terraform owns
+  # the value during that migration and stages it 1 → 2; raising it against
+  # unconverted tables starts an independent, empty second lineage. See the
+  # README's "ClickHouse replication and Keeper" section.
+  replicasCount: 2
   storageClass: ""
   storageSize: 100Gi
   # Data retention, in days, for the telemetry tables — the raw traces, the
