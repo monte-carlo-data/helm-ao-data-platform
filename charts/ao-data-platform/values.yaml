@@ -37,9 +37,9 @@ clickhouse:
   # background merge, not immediately — see README for the manual-purge escape hatch.
   ttlDays: 30
   # Adding a ClickHouse user? Also update templates/clickhouse-installation.yaml and templates/external-secret.yaml.
-  # otel — the OTel collector ingest identity. Writes raw telemetry into otel_traces.otel_traces
-  # (and otel_metrics when the metrics exporter is active). The MV cascade runs as schema_owner
-  # (the MV DEFINER), so otel needs nothing on the normalized targets.
+  # otel — the OTel collector ingest identity. Writes raw telemetry into otel_traces.otel_traces.
+  # The MV cascade runs as schema_owner (the MV DEFINER), so otel needs nothing on the
+  # normalized targets.
   otel:
     # Name of the K8s Secret containing a "password" key for the otel user.
     # This secret is created by the ExternalSecret below.
@@ -512,7 +512,6 @@ opentelemetry-collector:
         create_schema: false
         compress: lz4
         traces_table_name: otel_traces
-        metrics_table_name: otel_metrics
         timeout: 30s
         async_insert: false
         sending_queue:

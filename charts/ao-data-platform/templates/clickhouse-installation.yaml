@@ -34,8 +34,6 @@ spec:
       # so it can stay broad until external readers have moved to monte_carlo, then be flipped on.
       otel/grants/query:
         - "GRANT INSERT ON otel_traces.otel_traces"
-        # otel_metrics is created at runtime by the collector's metrics exporter (not the schema Job), hence no SQL file.
-        - "GRANT INSERT ON otel_traces.otel_metrics"
       {{- end }}
       # schema_owner — DDL/owner identity for the schema Job and the persistent MV DEFINER.
       # Full DDL on otel_traces + ALTER on specific system-log tables (TTLs) + SYSTEM FLUSH LOGS;
