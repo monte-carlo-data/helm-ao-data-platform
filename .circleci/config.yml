@@ -77,12 +77,12 @@ jobs:
             helm template charts/ao-data-platform \
               -f charts/ao-data-platform/ci/lint-values.yaml \
               --set gateway.enabled=false > gw-off.yaml
-            if grep -Eq '^kind: (Gateway|HTTPRoute|BackendTLSPolicy|Bundle)$' gw-off.yaml; then
+            if grep -Eq '^kind: (Gateway|HTTPRoute|BackendTLSPolicy|Bundle|ClusterIssuer)$' gw-off.yaml; then
               echo "Gateway disabled but gateway resources rendered:"
-              grep -En '^kind: (Gateway|HTTPRoute|BackendTLSPolicy|Bundle)$' gw-off.yaml
+              grep -En '^kind: (Gateway|HTTPRoute|BackendTLSPolicy|Bundle|ClusterIssuer)$' gw-off.yaml
               exit 1
             fi
-            echo "Gateway disabled: no Gateway/HTTPRoute/BackendTLSPolicy/Bundle rendered."
+            echo "Gateway disabled: no Gateway/HTTPRoute/BackendTLSPolicy/Bundle/ClusterIssuer rendered."
       - run:
           name: Invalid gateway.tls.source fails render
           # Only letsencrypt is implemented; any other source must fail fast at render.
@@ -105,6 +105,91 @@ jobs:
               exit 1
             fi
             echo "Gateway with tls.enabled=false correctly failed the render."
+      - run:
+          name: Gateway with certManager.createCA=false fails render
+          # The backend-TLS Bundle sources the chart-managed ao-data-platform-ca secret, which
+          # only exists when tls.certManager.createCA=true. BYO-issuer is not yet supported, so
+          # the combination must fail fast rather than render clean and deploy broken.
+          command: |
+            if helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --set tls.certManager.createCA=false > /dev/null 2>&1; then
+              echo "Expected render to fail for gateway.enabled=true with tls.certManager.createCA=false, but it succeeded."
+              exit 1
+            fi
+            echo "Gateway with createCA=false correctly failed the render."
+      - run:
+          name: Missing required gateway field fails render
+          # Representative negative-path coverage for the `required` guards (hostnames, className,
+          # the four azureDNS fields): clearing one must fail the render.
+          command: |
+            if helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --set gateway.tls.letsencrypt.azureDNS.hostedZoneName= > /dev/null 2>&1; then
+              echo "Expected render to fail when gateway.tls.letsencrypt.azureDNS.hostedZoneName is empty, but it succeeded."
+              exit 1
+            fi
+            echo "Missing required gateway field correctly failed the render."
+      - run:
+          name: Gateway allowedSourceRanges renders the annotation
+          # allowedSourceRanges defaults to [] (a dark branch); lint-values sets two CIDRs, so
+          # assert the azure-allowed-ip-ranges annotation renders the joined, quoted list.
+          command: |
+            helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml > gw-on.yaml
+            if ! grep -Eq 'azure-allowed-ip-ranges: "10\.0\.0\.0/16,192\.168\.1\.0/24"' gw-on.yaml; then
+              echo "Expected azure-allowed-ip-ranges annotation with the joined CIDR list; got:"
+              grep -n 'azure-allowed-ip-ranges' gw-on.yaml || echo "(annotation not found)"
+              exit 1
+            fi
+            echo "allowedSourceRanges rendered the azure-allowed-ip-ranges annotation correctly."
+      - run:
+          name: Gateway cross-references are internally consistent
+          # The gateway templates cross-reference by string literal, so a rename in one file
+          # renders clean but breaks TLS at apply. Assert the in-render seams line up. (Service
+          # backends like clickhouse-otel are created by the Altinity operator at runtime, not by
+          # `helm template`, so they can't be checked statically here.)
+          command: |
+            helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml > gw-on.yaml
+            # Each Gateway certificateRefs name must be produced as a Certificate secretName.
+            for name in gateway-otel-tls gateway-clickhouse-tls; do
+              if ! grep -Eq "^  secretName: ${name}$" gw-on.yaml; then
+                echo "Gateway certificateRef '${name}' has no matching Certificate secretName."
+                exit 1
+              fi
+            done
+            # The trust-manager Bundle name must equal the ConfigMap both BackendTLSPolicies
+            # reference (Bundle metadata.name + 2 caCertificateRefs = 3 occurrences).
+            bundle=$(awk '/kind: Bundle/{f=1} f && /^  name: /{print $2; exit}' gw-on.yaml)
+            count=$(grep -Ec "name: ${bundle}$" gw-on.yaml)
+            if [ "$count" -ne 3 ]; then
+              echo "Bundle '${bundle}' must appear 3x (Bundle + 2 caCertificateRefs); found ${count}."
+              exit 1
+            fi
+            echo "certificateRefs<->secretName and Bundle<->caCertificateRefs are consistent."
+      - run:
+          name: llm-worker core labels win over colliding podLabels
+          # Guards the round-1 ordering fix (core labels emitted after podLabels, so YAML
+          # last-wins keeps the core value on collision). A future edit reversing the order
+          # would let a podLabel override the component label — this pins it.
+          command: |
+            helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --set 'llmWorker.podLabels.app\.kubernetes\.io/component=hijacked' \
+              --show-only templates/llm-worker-deployment.yaml > lw.yaml
+            if ! grep -q 'app.kubernetes.io/component: hijacked' lw.yaml; then
+              echo "Test setup broken: the colliding podLabel did not render."
+              exit 1
+            fi
+            # Pod-template labels are the last labels block; core is emitted last within it, so
+            # the final component line must be llm-worker (not the injected override).
+            last=$(grep 'app.kubernetes.io/component:' lw.yaml | tail -1 | awk '{print $2}')
+            if [ "$last" != "llm-worker" ]; then
+              echo "Core component label must win over the colliding podLabel; last-wins value was '${last}'."
+              exit 1
+            fi
+            echo "Core labels correctly win over colliding podLabels."
 
   publish-dev:
     docker:

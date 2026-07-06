@@ -41,6 +41,11 @@ gateway:
   enabled: true
   otelHostname: otel.ci-placeholder.internal
   clickhouseHostname: clickhouse.ci-placeholder.internal
+  # Exercise the source-range branch (defaults to [], otherwise never rendered in CI) so the
+  # azure-allowed-ip-ranges annotation + its join/quote are covered. Asserted in the lint job.
+  allowedSourceRanges:
+    - 10.0.0.0/16
+    - 192.168.1.0/24
   tls:
     letsencrypt:
       azureDNS:
