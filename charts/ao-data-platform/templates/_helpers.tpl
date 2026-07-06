@@ -66,9 +66,9 @@ otel
 {{/*
 ClickHouseKeeperInstallation name.
 The Altinity operator stamps the label `clickhouse-keeper.altinity.com/chk: <name>`
-onto the Keeper pods and names the client Service `keeper-<name>`, so the Keeper PDB
-selector, the CHK pod topology-spread selector, and the CHI's zookeeper host must all
-derive from this same value. Centralized here so they can't drift apart.
+onto the Keeper pods and names the client Service `keeper-<name>`, so the CHK pod
+topology-spread selector and the CHI's zookeeper host must both derive from this
+same value. Centralized here so they can't drift apart.
 */}}
 {{- define "ao-data-platform.chkName" -}}
 otel
