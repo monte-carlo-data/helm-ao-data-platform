@@ -24,9 +24,8 @@ Fully qualified app name, truncated to 63 characters.
 {{/*
 ClickHouseInstallation name.
 The Altinity operator stamps the label `clickhouse.altinity.com/chi: <name>`
-onto the ClickHouse pods, so anything selecting those pods (e.g. the PDB) must
-use this same value. Centralized here so the CHI name and its selectors can't
-drift apart.
+onto the ClickHouse pods, so anything selecting those pods must use this same
+value. Centralized here so the CHI name and its selectors can't drift apart.
 */}}
 {{- define "ao-data-platform.chiName" -}}
 otel
