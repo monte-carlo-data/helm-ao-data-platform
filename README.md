@@ -7,7 +7,8 @@ Helm chart for the Monte Carlo data plane for Agent Observability.
 ### ao-data-platform
 
 Deploys the observability data plane:
-- Altinity ClickHouse Operator + ClickHouse instance
+- Altinity ClickHouse Operator + ClickHouse installation (single shard, `clickhouse.replicasCount` replicas)
+- ClickHouse Keeper ensemble (Raft coordination for replicated tables — 3 voters by default, `keeper.replicaCount: 1` for dev; see [ClickHouse replication and Keeper](#clickhouse-replication-and-keeper))
 - OpenTelemetry Collector (traces pipeline)
 - Schema migration Job (a plain `Job`, recreated per release revision, that runs on every install and upgrade)
 
@@ -17,7 +18,66 @@ The ClickHouse instance ships with production hardening: a capped memory ceiling
 
 > **Chart-version bumps no longer recreate ClickHouse:** the ClickHouse operator propagates only a fixed allowlist of stable labels onto the resources it generates. A chart-version bump changes the volatile `helm.sh/chart` label, but that label is no longer stamped onto the StatefulSet's immutable `volumeClaimTemplates`, so the bump no longer forces a delete/recreate of the ClickHouse StatefulSet.
 
+> **Upgrading to 2.3.0:** every install now renders a `ClickHouseKeeperInstallation` alongside the ClickHouse server — 3 Keeper voters with a hard one-voter-per-AZ topology spread by default. On clusters that can't schedule across three zones (local dev, single-AZ), the extra voters stay `Pending`; set `keeper.replicaCount: 1` there. The ClickHouse server is wired to Keeper from this version, but the tables are still plain `MergeTree` and don't use it yet — runtime behavior is otherwise unchanged. See [ClickHouse replication and Keeper](#clickhouse-replication-and-keeper).
+
 > **Telemetry retention** is controlled by `clickhouse.ttlDays` (default 30 days), covering the raw traces, the trace-id timestamp index, the normalized spans, and their conversation-derived annotations (`conversation_eval_scores`, `conversation_cluster_assignments`). Unlike the system-log TTLs above, the schema migration Job re-applies this on every install and upgrade (`ALTER TABLE … MODIFY TTL`), so changing the value updates existing tables — no manual ALTER needed. The Job sets `materialize_ttl_after_modify = 0`, so the change is metadata-only: *raising* the TTL takes effect immediately, while *lowering* it purges newly-expired rows lazily on the next background merge rather than at once. To force an immediate purge after lowering, run `ALTER TABLE otel_traces.<table> MATERIALIZE TTL` per affected table. The `llm_*` worker queue tables (`llm_inputs`, `llm_results`, `llm_batches`) are LLM-pipeline state rather than telemetry and are **not** governed by this value — they keep a fixed 30-day TTL defined in their SQL.
+
+## ClickHouse replication and Keeper
+
+The chart deploys a single-shard ClickHouse cluster whose replica count is set by
+`clickhouse.replicasCount` (default `1`), coordinated by a ClickHouse Keeper ensemble
+(`keeper.replicaCount` voters, default `3`). Keeper is intrinsic to the clustered design —
+it renders on every install, there is no keeper-less mode; a dev or small deployment just
+sizes it down to one voter. The ClickHouse server is wired to Keeper via the CHI's
+`zookeeper` configuration, and replicated tables register under a macro-based ZooKeeper
+path (`default_replica_path: /clickhouse/tables/{cluster}/{shard}/{database}/{table}`)
+rather than ClickHouse's built-in `{uuid}` default.
+
+### Keeper sizing and scheduling
+
+- **Voter count should be odd** (Raft quorum). 3 voters tolerate losing one; use `1` for dev.
+- **Hard per-AZ spread:** the CHK pod template applies a `DoNotSchedule` topology spread on
+  `topology.kubernetes.io/zone`, so a 3-voter ensemble demands schedulable nodes in three
+  zones. A voter with no valid zone stays `Pending` — expected on single-AZ or local
+  clusters; set `keeper.replicaCount: 1` there. The spread is deliberately hard: packing two
+  voters into one AZ would silently forfeit the ensemble's single-AZ-failure tolerance.
+- Keeper persists only coordination metadata (Raft log + snapshots), so its PVCs are small
+  (`keeper.storageSize`, default `10Gi`) and a replaced voter re-syncs from the quorum.
+- Pin voters to dedicated nodes with `keeper.nodeSelector` / `keeper.tolerations`, same
+  pattern as ClickHouse (see [Node scheduling and workload isolation](#node-scheduling-and-workload-isolation)).
+
+### High availability and the migration ordering
+
+This chart version keeps the default install a **single ClickHouse replica**: the
+`sql/*.sql` table definitions are still plain `MergeTree`, which does not replicate. A later
+chart version ships `ReplicatedMergeTree` engines + `ON CLUSTER` DDL and completes the HA
+story. Until then — and, on installs with existing data, until those tables have actually
+been converted to `Replicated*` engines — **do not raise `clickhouse.replicasCount` above 1**.
+A second replica created against non-replicated tables does not clone the existing data; it
+starts an independent, empty table lineage.
+
+Moving an existing single-replica install to HA is a two-apply sequence with a manual
+conversion in between:
+
+1. **Apply #1** (this chart version): Keeper + the macro-based `default_replica_path`
+   ship while `replicasCount` stays `1`. Both are inert for plain `MergeTree` tables — this
+   apply only prepares the coordination layer the conversion assumes.
+2. **Convert the existing tables in place** using ClickHouse's
+   [`convert_to_replicated` flag-file mechanism](https://clickhouse.com/docs/engines/table-engines/mergetree-family/replication#converting-from-mergetree-to-replicatedmergetree)
+   (requires ClickHouse ≥ 23.11 and an Atomic database; take a volume snapshot first).
+   Verify every table reports `Replicated*` engines, `is_readonly = 0`, and the macro-based
+   `zookeeper_path` in `system.replicas` before proceeding.
+3. **Apply #2** (the later chart version): raise `clickhouse.replicasCount` to `2` and ship
+   the `Replicated*` SQL. Because the DDL is path-less and `default_replica_path` is
+   macro-based, the new replica's `CREATE` resolves to the same ZooKeeper path as the
+   converted tables — it registers as a second replica and clones the data.
+
+The macro-based replica path is what makes step 3 safe: a converted table keeps its old
+UUID while a freshly created replica gets a new one, so ClickHouse's default
+`{uuid}`-based path would register them as two unrelated replicas that never sync.
+
+Fresh installs with no data to preserve don't need the conversion — deploy the later chart
+version directly with the desired `replicasCount`.
 
 ## Prerequisites
 
@@ -106,10 +166,13 @@ helm dependency build charts/ao-data-platform/
 Wire an `ExternalSecret` for each always-provisioned user at the Fake store, and point the
 `llm-worker` at a worker image. (`readonly_user` and `admin` are off by default; enable and
 wire them the same way under `clickhouse.readonlyUser` / `clickhouse.admin` if you need
-them.)
+them.) `keeper.replicaCount=1` sizes the Keeper ensemble down to a single voter — the
+default 3 voters require nodes in three availability zones, which a local k3d cluster
+can't satisfy (the extra voters would sit `Pending`).
 
 ```bash
 helm upgrade --install ao-data-platform charts/ao-data-platform/ -n montecarlo --create-namespace \
+  --set keeper.replicaCount=1 \
   --set clickhouse.otel.externalSecret.secretStoreRef.name=fake-secret-store \
   --set clickhouse.otel.externalSecret.remoteRef.key=clickhouse-otel-password \
   --set clickhouse.otel.externalSecret.remoteRef.version=v1 \
@@ -134,6 +197,11 @@ kubectl get pods -n montecarlo -l app.kubernetes.io/name=altinity-clickhouse-ope
 
 # ClickHouse instance
 kubectl get chi -n montecarlo
+
+# ClickHouse Keeper ensemble (all voters should be Running; a Pending voter usually
+# means the per-AZ topology spread can't be satisfied — see the Keeper section above)
+kubectl get chk -n montecarlo
+kubectl get pods -n montecarlo -l clickhouse-keeper.altinity.com/chk
 
 # Schema migration job
 kubectl get jobs -n montecarlo
@@ -431,6 +499,7 @@ helm upgrade ao-data-platform oci://registry-1.docker.io/montecarlodata/ao-data-
 
 | Value | Default | Description |
 |-------|---------|-------------|
+| `clickhouse.replicasCount` | `1` | Number of ClickHouse replicas in the single-shard cluster. Leave at `1` until the tables are `Replicated*` engines — see [ClickHouse replication and Keeper](#clickhouse-replication-and-keeper) for the migration ordering. |
 | `clickhouse.storageSize` | `100Gi` | PVC size for ClickHouse data. |
 | `clickhouse.ttlDays` | `30` | Retention in days for the telemetry tables (raw traces, trace-id index, normalized spans) and their conversation-derived annotations (`conversation_eval_scores`, `conversation_cluster_assignments`). Re-applied on every install/upgrade via `ALTER TABLE … MODIFY TTL`. Does **not** govern the `llm_*` worker queue tables (they keep a fixed TTL). See the telemetry-retention note above. |
 | `clickhouse.nodeSelector` | `{}` | Node selector for the ClickHouse pod (wired into the CHI's `podTemplate`) |
@@ -469,6 +538,14 @@ helm upgrade ao-data-platform oci://registry-1.docker.io/montecarlodata/ao-data-
 | `clickhouse.hostname` | `""` | If set, adds `external-dns.alpha.kubernetes.io/hostname` annotation to the ClickHouse Service |
 | `clickhouse.service.type` | `ClusterIP` | ClickHouse Service type (`ClusterIP`, `LoadBalancer`) |
 | `clickhouse.service.annotations` | `{}` | Annotations on the ClickHouse Service (e.g. AWS NLB annotations) |
+| `keeper.replicaCount` | `3` | Number of Keeper voters. Should be odd (Raft quorum); 3 for production HA, `1` for dev/single-AZ clusters (the default 3 require nodes in three zones — see the Keeper section). |
+| `keeper.image` | `clickhouse/clickhouse-keeper:26.4.3` | Keeper image; pinned to track the ClickHouse server release line. |
+| `keeper.storageClass` | `""` | StorageClass for the Keeper PVCs (empty = cluster default). |
+| `keeper.storageSize` | `10Gi` | PVC size per Keeper voter. Keeper stores only Raft log + snapshots, so a small volume is ample. |
+| `keeper.resources` | `500m`/`1Gi` requests, `4Gi` memory limit | Resource requests/limits for the Keeper container. CPU limit deliberately omitted (Keeper is bursty on failover). |
+| `keeper.nodeSelector` | `{}` | Node selector for the Keeper voters (wired into the CHK's pod template). |
+| `keeper.tolerations` | `[]` | Tolerations for the Keeper voters (wired into the CHK's pod template). |
+| `llmWorker.replicaCount` | `1` | Number of `llm-worker` pods. Set to `0` to pause the worker declaratively (survives `helm upgrade`, unlike a manual `kubectl scale`). |
 | `llmWorker.image.repository` | `""` | Image repository for the `llm-worker` (required — e.g. `montecarlodata/ao-llm-worker`) |
 | `llmWorker.image.tag` | `""` | Image tag for the `llm-worker` |
 | `llmWorker.aws.region` | `us-east-1` | AWS region passed to the `llm-worker` |
@@ -527,6 +604,11 @@ clickhouse:
 With ClickHouse pinned (and tolerating) a dedicated node group and the collector
 scheduling only on the general pool, the two workloads physically cannot land on
 the same node, so no anti-affinity rule is needed.
+
+The Keeper voters follow the same pattern via `keeper.nodeSelector` /
+`keeper.tolerations` (e.g. a `dedicated: keeper` node group). Their one-voter-per-AZ
+topology spread is built into the CHK pod template and is not configurable through
+values — the node groups you pin them to must span the required zones.
 
 If you are not partitioning nodes, either set `clickhouse.nodeSelector` +
 `clickhouse.tolerations` to target your own dedicated node group, or restore

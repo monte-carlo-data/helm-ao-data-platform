@@ -8,6 +8,11 @@ Verify the deployment:
   # ClickHouse instance
   kubectl get chi -n {{ .Release.Namespace }}
 
+  # ClickHouse Keeper ensemble ({{ .Values.keeper.replicaCount }} voter(s); Pending usually
+  # means the per-AZ topology spread can't be satisfied — see the README's Keeper section)
+  kubectl get chk -n {{ .Release.Namespace }}
+  kubectl get pods -n {{ .Release.Namespace }} -l clickhouse-keeper.altinity.com/chk
+
   # Schema migration job
   kubectl get jobs -n {{ .Release.Namespace }}
 

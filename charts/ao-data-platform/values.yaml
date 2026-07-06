@@ -15,7 +15,7 @@ clickhouse:
   # version, or against not-yet-converted tables, would start an independent,
   # non-replicated second lineage. The consuming terraform owns this value during the
   # in-place HA migration — it pins it at 1 until the conversion verifies, then moves
-  # it to 2. See README (Keeper / HA migration).
+  # it to 2. See the README's "ClickHouse replication and Keeper" section.
   replicasCount: 1
   storageClass: ""
   storageSize: 100Gi
@@ -193,7 +193,8 @@ clickhouse:
 # templates/clickhouse-installation.yaml) and resolves replica paths through the
 # operator-injected macros (default_replica_path). Keeper is intrinsic to the clustered
 # design — there is no keeper-less mode; a dev/small install just sizes it down to
-# replicaCount: 1. See README for the two-apply HA migration ordering.
+# replicaCount: 1. See the README's "ClickHouse replication and Keeper" section for
+# the two-apply HA migration ordering.
 keeper:
   # Number of Keeper voters. Prod HA = 3 (a quorum of 2 tolerates losing one voter /
   # one AZ); dev = 1. Should be odd (Raft quorum). The consuming terraform derives
