@@ -8,6 +8,16 @@
 # here so the render reaches every template. These are CI placeholders only and
 # are never deployed.
 clickhouse:
+  # Exercise the ClickHouse nodeSelector/tolerations `with` branches in the CHI pod
+  # template (skipped at the empty defaults), mirroring the keeper block below and
+  # how the consuming terraform pins ClickHouse to its dedicated per-AZ node groups.
+  nodeSelector:
+    dedicated: clickhouse
+  tolerations:
+    - key: dedicated
+      operator: Equal
+      value: clickhouse
+      effect: NoSchedule
   otel:
     externalSecret:
       secretStoreRef:
