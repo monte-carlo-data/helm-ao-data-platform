@@ -1,4 +1,4 @@
-CREATE MATERIALIZED VIEW IF NOT EXISTS otel_traces.spans_normalized_mv
+CREATE MATERIALIZED VIEW IF NOT EXISTS otel_traces.spans_normalized_mv ON CLUSTER '{cluster}'
 TO otel_traces.spans_normalized
 AS WITH
     -- Stringified SpanAttributes for dynamic-path JSONExtractString calls.

@@ -1,4 +1,4 @@
-CREATE MATERIALIZED VIEW IF NOT EXISTS otel_traces.otel_traces_trace_id_ts_mv
+CREATE MATERIALIZED VIEW IF NOT EXISTS otel_traces.otel_traces_trace_id_ts_mv ON CLUSTER '{cluster}'
 TO otel_traces.otel_traces_trace_id_ts (
     TraceId String,
     Start DateTime64(9),

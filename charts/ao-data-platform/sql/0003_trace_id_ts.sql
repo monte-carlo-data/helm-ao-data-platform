@@ -1,10 +1,10 @@
-CREATE TABLE IF NOT EXISTS otel_traces.otel_traces_trace_id_ts (
+CREATE TABLE IF NOT EXISTS otel_traces.otel_traces_trace_id_ts ON CLUSTER '{cluster}' (
     TraceId String CODEC(ZSTD(1)),
     Start DateTime CODEC(Delta(4), ZSTD(1)),
     End DateTime CODEC(Delta(4), ZSTD(1)),
     INDEX idx_trace_id TraceId TYPE bloom_filter(0.01) GRANULARITY 1
 )
-ENGINE = MergeTree
+ENGINE = ReplicatedMergeTree
 PARTITION BY toDate(Start)
 ORDER BY (TraceId, Start)
 -- Create-time default; the live retention is set by clickhouse.ttlDays via the

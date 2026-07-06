@@ -64,6 +64,11 @@ spec:
         - "GRANT ALTER ON system.metric_log"
         - "GRANT ALTER ON system.text_log"
         - "GRANT SYSTEM FLUSH LOGS ON *.*"
+        # Every statement the schema Job runs is ON CLUSTER, and ClickHouse gates ON CLUSTER
+        # queries behind the CLUSTER privilege (on_cluster_queries_require_cluster_grant is on
+        # by default in this CH line) — without this the Job fails ACCESS_DENIED on its first
+        # statement. The privilege is irreducibly global; it cannot be scoped below *.*.
+        - "GRANT CLUSTER ON *.*"
       # llm_worker — the llm-worker Deployment. Reads the queue, appends results (no mutations).
       llm_worker/password:
         valueFrom:

@@ -1,4 +1,4 @@
-CREATE TABLE IF NOT EXISTS otel_traces.otel_traces (
+CREATE TABLE IF NOT EXISTS otel_traces.otel_traces ON CLUSTER '{cluster}' (
     Timestamp DateTime64(9) CODEC(Delta, ZSTD(1)),
     TraceId String CODEC(ZSTD(1)),
     SpanId String CODEC(ZSTD(1)),
@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS otel_traces.otel_traces (
     INDEX idx_span_attr_keys SpanAttributesKeys TYPE bloom_filter(0.01) GRANULARITY 1,
     INDEX idx_duration Duration TYPE minmax GRANULARITY 1
 )
-ENGINE = MergeTree
+ENGINE = ReplicatedMergeTree
 PARTITION BY toDate(Timestamp)
 ORDER BY (ServiceName, SpanName, toDateTime(Timestamp), Timestamp)
 -- Create-time default; the live retention is set by clickhouse.ttlDays via the

@@ -1,4 +1,4 @@
-CREATE TABLE IF NOT EXISTS otel_traces.spans_normalized
+CREATE TABLE IF NOT EXISTS otel_traces.spans_normalized ON CLUSTER '{cluster}'
 (
     `service_name` LowCardinality(String),
     `trace_id` String,
@@ -60,7 +60,7 @@ CREATE TABLE IF NOT EXISTS otel_traces.spans_normalized
     INDEX idx_res_attr_keys  resource_attributes_keys TYPE bloom_filter(0.01) GRANULARITY 1,
     INDEX idx_span_attr_keys span_attributes_keys     TYPE bloom_filter(0.01) GRANULARITY 1
 )
-ENGINE = ReplacingMergeTree
+ENGINE = ReplicatedReplacingMergeTree
 PARTITION BY toDate(start_time)
 PRIMARY KEY (service_name, toStartOfMinute(start_time), xxHash32(trace_id))
 ORDER BY (service_name, toStartOfMinute(start_time), xxHash32(trace_id), span_id)

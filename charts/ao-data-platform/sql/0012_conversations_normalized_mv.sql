@@ -19,7 +19,7 @@
 --
 -- SELECT column order matches conversations_normalized (0008) — MV-to-table
 -- inserts position-wise, not by name.
-CREATE MATERIALIZED VIEW IF NOT EXISTS otel_traces.conversations_normalized_mv
+CREATE MATERIALIZED VIEW IF NOT EXISTS otel_traces.conversations_normalized_mv ON CLUSTER '{cluster}'
 TO otel_traces.conversations_normalized
 AS WITH
     CAST(span_attributes.traceloop.entity.input  AS String) AS _in_j,
