@@ -194,7 +194,7 @@ tls:
 # it needs the internal-TLS listeners (enforced at render time). Disabled by default.
 #
 # The load-balancer annotations (gateway.yaml) and the cert-manager DNS-01 solver
-# (tls.letsencrypt below) are the cloud-specific layer — shipped for Azure; other clouds
+# (gateway.tls.letsencrypt below) are the cloud-specific layer — shipped for Azure; other clouds
 # substitute their own annotation keys and cert-manager solver. The Terraform module
 # supplies the GatewayClass, the internal-LB add-on, and the cert-manager identity.
 gateway:

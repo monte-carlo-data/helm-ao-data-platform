@@ -477,7 +477,7 @@ helm upgrade ao-data-platform oci://registry-1.docker.io/montecarlodata/ao-data-
 | `gateway.allowedSourceRanges` | `[]` | CIDRs allowed to reach the Gateway's internal load balancer (renders the `azure-allowed-ip-ranges` annotation). Empty = no source-range restriction. Unioned across both listeners (shared LB). |
 | `gateway.tls.source` | `letsencrypt` | Listener cert source. Only `letsencrypt` is supported; Key Vault (BYO certs) is reserved for a future release. |
 | `gateway.tls.letsencrypt.email` | `""` | ACME contact email (optional; omitted registers a contactless account). |
-| `gateway.tls.letsencrypt.server` | Let's Encrypt production | ACME server URL. |
+| `gateway.tls.letsencrypt.server` | `https://acme-v02.api.letsencrypt.org/directory` | ACME server URL (Let's Encrypt production). |
 | `gateway.tls.letsencrypt.azureDNS.hostedZoneName` | `""` | DNS zone for the DNS-01 solver (required when `gateway.enabled`). |
 | `gateway.tls.letsencrypt.azureDNS.resourceGroupName` | `""` | Resource group of the DNS zone (required when `gateway.enabled`). |
 | `gateway.tls.letsencrypt.azureDNS.subscriptionID` | `""` | Subscription ID of the DNS zone (required when `gateway.enabled`). |
