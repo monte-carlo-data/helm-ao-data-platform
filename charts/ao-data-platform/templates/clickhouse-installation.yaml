@@ -8,6 +8,16 @@ spec:
   configuration:
     clusters:
       - name: "otel"
+        # Auto-generated cluster secret for intra-cluster (replica→replica) query hops.
+        # Without it, distributed queries such as clusterAllReplicas() authenticate the
+        # remote hop as the `default` user — which this chart removes — and fail
+        # AUTHENTICATION_FAILED. With a shared secret, the hop is authenticated by the
+        # secret and executes as the *initiating* user. Nothing in the product path uses
+        # distributed queries (single shard, clients hit one replica), but cluster-wide
+        # operability checks (part-count parity across replicas, replication health) need
+        # this to work.
+        secret:
+          auto: "true"
         layout:
           shardsCount: 1
           replicasCount: {{ .Values.clickhouse.replicasCount }}
