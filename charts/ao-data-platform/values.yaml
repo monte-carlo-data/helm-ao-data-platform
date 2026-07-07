@@ -193,14 +193,16 @@ clickhouse:
 # templates/clickhouse-installation.yaml) and resolves replica paths through the
 # operator-injected macros (default_replica_path). Keeper is intrinsic to the clustered
 # design — there is no keeper-less mode; a dev/small install just sizes it down to
-# replicaCount: 1. See the README's "ClickHouse replication and Keeper" section for
+# replicasCount: 1. See the README's "ClickHouse replication and Keeper" section for
 # the two-apply HA migration ordering.
 keeper:
   # Number of Keeper voters. Prod HA = 3 (a quorum of 2 tolerates losing one voter /
   # one AZ); dev = 1. Should be odd (Raft quorum). The consuming terraform derives
   # this from the length of its Keeper availability-zone list, so the voter count
-  # cannot drift from the number of per-AZ Keeper node groups.
-  replicaCount: 3
+  # cannot drift from the number of per-AZ Keeper node groups. Named `replicasCount`
+  # (not the Helm-conventional `replicaCount`) to match both the CRD field it feeds
+  # (the CHK's layout.replicasCount) and its sibling clickhouse.replicasCount.
+  replicasCount: 3
   # Keeper image. Pinned to track the ClickHouse server release line (clickhouse.image
   # is clickhouse-server:26.4.3); the AO team owns periodic bumps, same as the server
   # image. NOTE: confirm this exact tag is published for clickhouse-keeper before the
@@ -227,6 +229,25 @@ keeper:
   # itself (templates/clickhouse-keeper-installation.yaml), not here.
   nodeSelector: {}
   tolerations: []
+  # Network isolation for Keeper. Keeper speaks the unauthenticated ZooKeeper protocol —
+  # any pod that can reach the client port (2181) gets read/write on the entire
+  # coordination tree — and network isolation (not protocol auth) is the standard
+  # production posture for Keeper/ZooKeeper ensembles. This ships a NetworkPolicy
+  # restricting Keeper ingress to the ClickHouse server pods, the operator, and the
+  # Keeper Raft peers (see templates/keeper-networkpolicy.yaml). Enabled by default:
+  # on clusters without a NetworkPolicy engine the policy object is inert, so there is
+  # no keeper-less-secure mode to opt into by accident. Disable only if the policy
+  # conflicts with the cluster's CNI.
+  networkPolicy:
+    enabled: true
+  # Keeper four-letter-word admin commands, exposed unauthenticated on the client port.
+  # Trimmed from Keeper's built-in default — which includes cluster-affecting commands
+  # like rcvr (force recovery mode) and rqld (request leadership) — down to the liveness
+  # probe (ruok; the operator's injected probe sends it over loopback) plus read-only
+  # introspection (mntr, srvr, stat, conf; hack/verify-deployment.sh uses mntr). Extend
+  # per environment if an operational runbook needs more; set to "" to fall back to
+  # Keeper's built-in default list. Keep ruok in any custom list or liveness fails.
+  fourLetterWordAllowList: "ruok,mntr,srvr,stat,conf"
 
 tls:
   enabled: true
@@ -311,10 +332,12 @@ altinity-clickhouse-operator:
 
 # LLM Worker — polls ClickHouse for pending batches, calls AWS Bedrock, writes results back
 llmWorker:
-  # Number of llm-worker pods. Exposed so the consuming terraform can pin it (e.g. to 0)
-  # as config that survives a `helm upgrade` — used to pause/resume ingest-adjacent work
-  # during the HA migration window without a manual `kubectl scale` being reset by the
-  # next apply.
+  # Number of llm-worker pods — 0 or 1 ONLY (the template rejects >1). The worker is
+  # not designed to run as multiple copies: it has no job-claim/locking semantics, so
+  # concurrent workers would double-process batches. Exposed so the consuming terraform
+  # can pin it (e.g. to 0) as config that survives a `helm upgrade` — used to
+  # pause/resume ingest-adjacent work during the HA migration window without a manual
+  # `kubectl scale` being reset by the next apply.
   replicaCount: 1
   image:
     repository: ""

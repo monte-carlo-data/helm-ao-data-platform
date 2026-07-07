@@ -152,7 +152,82 @@ fi
 pass "ClickHouse pod ${CH_POD} is Ready."
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHECK 4 — OTel collector pod
+# CHECK 4 — ClickHouse Keeper ensemble
+#
+# CHECK 1 already fails on any Pending/crashed pod namespace-wide; this check adds
+# the Keeper-specific diagnostics: the CHK resource, per-voter readiness against the
+# declared voter count (with the topology-spread hint), and Raft quorum health.
+# ─────────────────────────────────────────────────────────────────────────────
+banner "ClickHouse Keeper ensemble is healthy"
+
+# Probe before displaying — under set -e/pipefail, run_cmd would kill the script if
+# the CHK (or its CRD) is missing, skipping the diagnostic fail message below.
+KEEPER_EXPECTED=$(kubectl get chk -n "$NS" otel \
+  -o jsonpath='{.spec.configuration.clusters[0].layout.replicasCount}' 2>/dev/null || true)
+
+if [[ -z "$KEEPER_EXPECTED" ]]; then
+  fail "No ClickHouseKeeperInstallation 'otel' found (or it declares no voter count)."
+fi
+
+run_cmd "ClickHouseKeeperInstallation resource" \
+  kubectl get chk -n "$NS" otel
+
+run_cmd "Keeper voter pods" \
+  kubectl get pods -n "$NS" -l clickhouse-keeper.altinity.com/chk=otel -o wide
+
+KEEPER_PODS=$(kubectl get pods -n "$NS" -l clickhouse-keeper.altinity.com/chk=otel \
+  --no-headers -o custom-columns=":metadata.name" 2>/dev/null || true)
+
+KEEPER_READY=0
+for POD in $KEEPER_PODS; do
+  READY=$(kubectl get pod -n "$NS" "$POD" \
+    -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+  [[ "$READY" == "True" ]] && KEEPER_READY=$((KEEPER_READY + 1))
+done
+
+if [[ "$KEEPER_READY" -ne "$KEEPER_EXPECTED" ]]; then
+  fail "Only ${KEEPER_READY}/${KEEPER_EXPECTED} Keeper voters are Ready. A Pending voter usually means the per-AZ topology spread cannot be satisfied — see the README's Keeper section."
+fi
+
+# Quorum health via the mntr four-letter word, over the same pod-local /dev/tcp
+# channel the operator's liveness probe uses — so this works with the chart's Keeper
+# NetworkPolicy in place, and mntr must stay in keeper.fourLetterWordAllowList.
+echo ""
+echo -e "  ${YELLOW}▸ Raft state per voter (mntr)${RESET}"
+LEADERS=0
+for POD in $KEEPER_PODS; do
+  STATE=$(kubectl exec -n "$NS" "$POD" -- bash -c \
+    'exec 3<>/dev/tcp/127.0.0.1/2181; printf mntr >&3; IFS=; tee <&3; exec 3<&-' 2>/dev/null \
+    | awk '$1 == "zk_server_state" {print $2}' || true)
+  echo "    ${POD}: ${STATE:-no answer}"
+  if [[ -z "$STATE" ]]; then
+    fail "Keeper voter ${POD} did not answer the mntr probe on its client port."
+  fi
+  [[ "$STATE" == "leader" ]] && LEADERS=$((LEADERS + 1))
+done
+
+if [[ "$LEADERS" -ne 1 ]]; then
+  fail "Keeper quorum reports ${LEADERS} Raft leader(s), expected exactly 1."
+fi
+
+# One PVC per voter must exist; CHECK 13 asserts Bound status for every PVC.
+KEEPER_PVCS=$(kubectl get pvc -n "$NS" --no-headers -o custom-columns=":metadata.name" \
+  | grep -c "keeper" || true)
+if [[ "$KEEPER_PVCS" -lt "$KEEPER_EXPECTED" ]]; then
+  fail "Expected ${KEEPER_EXPECTED} Keeper PVC(s), found ${KEEPER_PVCS}."
+fi
+
+# The Keeper NetworkPolicy ships enabled by default; warn (don't fail) if absent,
+# since keeper.networkPolicy.enabled=false is a legitimate per-environment choice.
+if ! kubectl get networkpolicy -n "$NS" keeper-otel >/dev/null 2>&1; then
+  echo ""
+  echo -e "  ${YELLOW}⚠ WARNING: NetworkPolicy 'keeper-otel' not found — Keeper's client port is unrestricted (keeper.networkPolicy.enabled may be off).${RESET}"
+fi
+
+pass "Keeper ensemble healthy: ${KEEPER_READY}/${KEEPER_EXPECTED} voters Ready, exactly one Raft leader, ${KEEPER_PVCS} PVC(s)."
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHECK 5 — OTel collector pod
 # ─────────────────────────────────────────────────────────────────────────────
 banner "OpenTelemetry Collector pod is running"
 
@@ -176,7 +251,7 @@ fi
 pass "OTel collector pod ${OTEL_POD} is Ready."
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHECK 5 — Schema migration job
+# CHECK 6 — Schema migration job
 # ─────────────────────────────────────────────────────────────────────────────
 banner "Schema migration job completed successfully"
 
@@ -199,7 +274,7 @@ fi
 pass "Schema migration job(s) completed successfully."
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHECK 6 — ExternalSecret synced
+# CHECK 7 — ExternalSecret synced
 # ─────────────────────────────────────────────────────────────────────────────
 banner "ExternalSecret synced and Secret created"
 
@@ -226,7 +301,7 @@ fi
 pass "ExternalSecret is synced and Secret contains the 'password' key."
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHECK 7 — TLS: Issuers ready
+# CHECK 8 — TLS: Issuers ready
 # ─────────────────────────────────────────────────────────────────────────────
 banner "cert-manager Issuers are ready"
 
@@ -244,7 +319,7 @@ done
 pass "All Issuers are Ready."
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHECK 8 — TLS: Certificates issued
+# CHECK 9 — TLS: Certificates issued
 # ─────────────────────────────────────────────────────────────────────────────
 banner "TLS Certificates are issued and valid"
 
@@ -264,7 +339,7 @@ done
 pass "All Certificates (CA, ClickHouse, OTel) are Ready."
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHECK 9 — TLS: Certificate secrets contain expected keys
+# CHECK 10 — TLS: Certificate secrets contain expected keys
 # ─────────────────────────────────────────────────────────────────────────────
 banner "TLS Secrets contain tls.crt, tls.key, and ca.crt"
 
@@ -280,7 +355,7 @@ done
 pass "Both TLS secrets contain tls.crt, tls.key, and ca.crt."
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHECK 10 — TLS: Certificate SANs and expiry
+# CHECK 11 — TLS: Certificate SANs and expiry
 # ─────────────────────────────────────────────────────────────────────────────
 banner "TLS certificate SANs and expiry are correct"
 
@@ -301,7 +376,7 @@ done
 pass "All TLS certificates have valid SANs and are not expired."
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHECK 11 — StorageClass
+# CHECK 12 — StorageClass
 # ─────────────────────────────────────────────────────────────────────────────
 banner "StorageClass is gp3, encrypted, and uses ebs.csi.aws.com"
 
@@ -333,7 +408,7 @@ fi
 pass "StorageClass '${CH_SC}' is gp3, encrypted, provisioned by ebs.csi.aws.com."
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHECK 12 — PVCs bound
+# CHECK 13 — PVCs bound
 # ─────────────────────────────────────────────────────────────────────────────
 banner "PersistentVolumeClaims are Bound"
 
@@ -351,7 +426,7 @@ fi
 pass "All PVCs are Bound."
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHECK 13 — EBS volumes are encrypted
+# CHECK 14 — EBS volumes are encrypted
 # ─────────────────────────────────────────────────────────────────────────────
 banner "Underlying EBS volumes are encrypted"
 
@@ -378,7 +453,7 @@ done
 pass "All EBS volumes backing PVCs are encrypted."
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHECK 14 — ClickHouse NLB: Service annotations
+# CHECK 15 — ClickHouse NLB: Service annotations
 # ─────────────────────────────────────────────────────────────────────────────
 banner "ClickHouse Service has correct NLB annotations"
 
@@ -413,7 +488,7 @@ fi
 pass "ClickHouse Service NLB annotations are correct (ACM cert: ${CH_ACM})."
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHECK 15 — ClickHouse NLB: Provisioned
+# CHECK 16 — ClickHouse NLB: Provisioned
 # ─────────────────────────────────────────────────────────────────────────────
 banner "ClickHouse NLB is provisioned"
 
@@ -437,7 +512,7 @@ fi
 pass "ClickHouse NLB is provisioned (ARN: ${CH_NLB_ARN})."
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHECK 16 — ClickHouse NLB: Scheme is internal
+# CHECK 17 — ClickHouse NLB: Scheme is internal
 # ─────────────────────────────────────────────────────────────────────────────
 banner "ClickHouse NLB scheme is internal"
 
@@ -454,7 +529,7 @@ fi
 pass "ClickHouse NLB is internal."
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHECK 17 — ClickHouse NLB: Listener TLS config
+# CHECK 18 — ClickHouse NLB: Listener TLS config
 # ─────────────────────────────────────────────────────────────────────────────
 banner "ClickHouse NLB listeners have TLS configured"
 
@@ -474,7 +549,7 @@ done
 pass "ClickHouse NLB listeners on ports 9440 and 8443 use TLS with ACM certificate."
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHECK 18 — ClickHouse NLB: Target group health
+# CHECK 19 — ClickHouse NLB: Target group health
 # ─────────────────────────────────────────────────────────────────────────────
 banner "ClickHouse NLB target group targets are healthy"
 
@@ -510,7 +585,7 @@ done
 pass "All ClickHouse NLB targets are healthy (or completing initial health check)."
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHECK 19 — OTel Collector NLB: Service annotations
+# CHECK 20 — OTel Collector NLB: Service annotations
 # ─────────────────────────────────────────────────────────────────────────────
 banner "OTel Collector Service has correct NLB annotations"
 
@@ -544,7 +619,7 @@ fi
 pass "OTel Collector Service NLB annotations are correct (ACM cert: ${OTEL_ACM})."
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHECK 20 — OTel Collector NLB: Provisioned
+# CHECK 21 — OTel Collector NLB: Provisioned
 # ─────────────────────────────────────────────────────────────────────────────
 banner "OTel Collector NLB is provisioned"
 
@@ -568,7 +643,7 @@ fi
 pass "OTel Collector NLB is provisioned (ARN: ${OTEL_NLB_ARN})."
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHECK 21 — OTel Collector NLB: Scheme is internal
+# CHECK 22 — OTel Collector NLB: Scheme is internal
 # ─────────────────────────────────────────────────────────────────────────────
 banner "OTel Collector NLB scheme is internal"
 
@@ -585,7 +660,7 @@ fi
 pass "OTel Collector NLB is internal."
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHECK 22 — OTel Collector NLB: Listener TLS config
+# CHECK 23 — OTel Collector NLB: Listener TLS config
 # ─────────────────────────────────────────────────────────────────────────────
 banner "OTel Collector NLB listeners have TLS configured"
 
@@ -605,7 +680,7 @@ done
 pass "OTel Collector NLB listeners on ports 4317 and 4318 use TLS with ACM certificate."
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHECK 23 — OTel Collector NLB: Target group health
+# CHECK 24 — OTel Collector NLB: Target group health
 # ─────────────────────────────────────────────────────────────────────────────
 banner "OTel Collector NLB target group targets are healthy"
 
@@ -641,7 +716,7 @@ done
 pass "All OTel Collector NLB targets are healthy."
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHECK 24 — DNS: ClickHouse hostname resolves
+# CHECK 25 — DNS: ClickHouse hostname resolves
 # ─────────────────────────────────────────────────────────────────────────────
 banner "ClickHouse DNS hostname resolves to its NLB"
 
@@ -679,7 +754,7 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHECK 25 — DNS: OTel Collector hostname resolves
+# CHECK 26 — DNS: OTel Collector hostname resolves
 # ─────────────────────────────────────────────────────────────────────────────
 banner "OTel Collector DNS hostname resolves to its NLB"
 
@@ -715,7 +790,7 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHECK 26 — In-cluster TLS: ClickHouse serving TLS on ports 9440 and 8443
+# CHECK 27 — In-cluster TLS: ClickHouse serving TLS on ports 9440 and 8443
 # ─────────────────────────────────────────────────────────────────────────────
 banner "ClickHouse is serving TLS on ports 9440 and 8443 (in-cluster)"
 
@@ -741,7 +816,7 @@ done
 pass "ClickHouse TLS certificates on ports 9440 and 8443 are valid and verified against the CA."
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHECK 27 — In-cluster TLS: OTel Collector serving TLS on ports 4317 and 4318
+# CHECK 28 — In-cluster TLS: OTel Collector serving TLS on ports 4317 and 4318
 # ─────────────────────────────────────────────────────────────────────────────
 banner "OTel Collector is serving TLS on ports 4317 and 4318 (in-cluster)"
 
@@ -765,7 +840,7 @@ done
 pass "OTel Collector TLS certificates on ports 4317 and 4318 are valid and verified against the CA."
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Read-only credential for the schema/data checks below (CHECK 28+). These run as readonly_user,
+# Read-only credential for the schema/data checks below (CHECK 29+). These run as readonly_user,
 # so enable it (readonlyUser.enabled=true) to run this verification. Avoids the removed `default`
 # user and the write-scoped otel / schema_owner identities.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -778,7 +853,7 @@ fi
 echo -e "  ${YELLOW}▸ Using ClickHouse reader 'readonly_user' for schema/data checks${RESET}"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHECK 28 — ClickHouse database and schema
+# CHECK 29 — ClickHouse database and schema
 # ─────────────────────────────────────────────────────────────────────────────
 banner "ClickHouse database 'otel_traces' and tables exist"
 
@@ -815,7 +890,7 @@ fi
 pass "Database 'otel_traces' exists with all tables and materialized view."
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHECK 29 — ClickHouse otel user authentication
+# CHECK 30 — ClickHouse otel user authentication
 # ─────────────────────────────────────────────────────────────────────────────
 banner "ClickHouse 'otel' user can authenticate"
 
@@ -836,7 +911,7 @@ fi
 pass "ClickHouse 'otel' user authenticated successfully."
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ClickHouse least-privilege user model
+# CHECK 31 — ClickHouse least-privilege user model
 #
 # Each user authenticates and holds the expected grants, and the security-critical
 # denials are enforced. Queries run as each user over the pod's local port via
@@ -940,7 +1015,7 @@ done
 pass "ClickHouse least-privilege user model verified."
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHECK 30 — OTel Collector health check
+# CHECK 32 — OTel Collector health check
 # ─────────────────────────────────────────────────────────────────────────────
 banner "OTel Collector health check endpoint responds"
 
@@ -957,7 +1032,7 @@ fi
 pass "OTel Collector pod is Ready (health check on :13133 is passing)."
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHECK 31 — OTel Collector logs (no export errors)
+# CHECK 33 — OTel Collector logs (no export errors)
 # ─────────────────────────────────────────────────────────────────────────────
 banner "OTel Collector has no export errors in recent logs"
 
@@ -978,7 +1053,7 @@ fi
 pass "No persistent export errors detected in OTel Collector logs."
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHECK 32 — End-to-end smoke test
+# CHECK 34 — End-to-end smoke test
 # ─────────────────────────────────────────────────────────────────────────────
 banner "End-to-end smoke test: send trace via OTLP → verify in ClickHouse"
 
@@ -1038,7 +1113,7 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHECK 33 — NLB smoke test: send trace via OTel NLB endpoint
+# CHECK 35 — NLB smoke test: send trace via OTel NLB endpoint
 # ─────────────────────────────────────────────────────────────────────────────
 banner "NLB smoke test: send trace via OTel Collector NLB endpoint"
 
@@ -1101,7 +1176,7 @@ EOJSON2
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHECK 34 — NLB smoke test: query ClickHouse via its NLB endpoint
+# CHECK 36 — NLB smoke test: query ClickHouse via its NLB endpoint
 # ─────────────────────────────────────────────────────────────────────────────
 banner "NLB smoke test: query ClickHouse via its NLB endpoint (port 8443, HTTPS)"
 

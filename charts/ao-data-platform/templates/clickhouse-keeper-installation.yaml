@@ -7,7 +7,7 @@
 # Service, port 2181).
 #
 # Keeper is intrinsic to the clustered design — this renders on every install; a
-# dev/small deployment just sets keeper.replicaCount: 1. Prod runs 3 voters, one per
+# dev/small deployment just sets keeper.replicasCount: 1. Prod runs 3 voters, one per
 # AZ (hard topology spread below), so a quorum of 2 survives losing one AZ.
 apiVersion: "clickhouse-keeper.altinity.com/v1"
 kind: "ClickHouseKeeperInstallation"
@@ -17,10 +17,18 @@ metadata:
     {{- include "ao-data-platform.labels" . | nindent 4 }}
 spec:
   configuration:
+    {{- with .Values.keeper.fourLetterWordAllowList }}
+    settings:
+      # Trim the four-letter-word commands served unauthenticated on the client port
+      # (Keeper's built-in default includes cluster-affecting ones like rcvr/rqld).
+      # Must keep ruok — the operator's injected liveness probe sends it. Omitted
+      # entirely (falling back to Keeper's built-in default) when the value is "".
+      keeper_server/four_letter_word_allow_list: {{ . | quote }}
+    {{- end }}
     clusters:
       - name: "keeper"
         layout:
-          replicasCount: {{ .Values.keeper.replicaCount }}
+          replicasCount: {{ .Values.keeper.replicasCount }}
   defaults:
     templates:
       dataVolumeClaimTemplate: keeper-data

@@ -59,6 +59,10 @@ gateway:
 # actually covers them, matching how the consuming terraform pins Keeper to its
 # dedicated node groups. CI placeholders only; never deployed.
 keeper:
+  # Non-default voter count so the CI render proves keeper.replicasCount actually
+  # reaches the CHK's layout.replicasCount — a misnamed key would silently render
+  # the default and Helm would never complain (no values.schema.json).
+  replicasCount: 5
   nodeSelector:
     dedicated: keeper
   tolerations:

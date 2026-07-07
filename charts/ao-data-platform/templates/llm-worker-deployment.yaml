@@ -1,3 +1,6 @@
+{{- if gt (int .Values.llmWorker.replicaCount) 1 }}
+{{- fail "llmWorker.replicaCount must be 0 or 1. The llm-worker is not designed to run as multiple copies: it has no job-claim/locking semantics (its ClickHouse grants are SELECT/INSERT only), so concurrent workers would double-process batches. Use 0 to pause, 1 to run." }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
