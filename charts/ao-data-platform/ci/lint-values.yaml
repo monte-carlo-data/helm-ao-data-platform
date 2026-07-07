@@ -53,3 +53,16 @@ gateway:
         resourceGroupName: ci-placeholder
         subscriptionID: ci-placeholder
         managedIdentityClientID: ci-placeholder
+
+# Exercise the Keeper nodeSelector/tolerations `with` branches in the CHK pod template
+# (skipped at the empty defaults) so the render — CI's template-correctness guard —
+# actually covers them, matching how the consuming terraform pins Keeper to its
+# dedicated node groups. CI placeholders only; never deployed.
+keeper:
+  nodeSelector:
+    dedicated: keeper
+  tolerations:
+    - key: dedicated
+      operator: Equal
+      value: keeper
+      effect: NoSchedule
