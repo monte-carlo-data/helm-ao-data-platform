@@ -186,6 +186,45 @@ tls:
     #   name: my-issuer
     #   kind: Issuer  # or ClusterIssuer
 
+# Internal TLS termination via the Kubernetes Gateway API. Opt-in: when enabled, a single
+# Gateway terminates TLS for the collector + ClickHouse (ClusterIP backends) at per-hostname
+# HTTPS listeners. The Gateway's load balancer is always internal (private IP) — these
+# endpoints are never publicly reachable. The internal self-signed path (tls.* above) is
+# untouched. Requires tls.enabled=true: the Gateway always re-encrypts to the backends, so
+# it needs the internal-TLS listeners (enforced at render time). Disabled by default.
+#
+# The load-balancer annotations (gateway.yaml) and the cert-manager DNS-01 solver
+# (gateway.tls.letsencrypt below) are the cloud-specific layer — shipped for Azure; other clouds
+# substitute their own annotation keys and cert-manager solver. The Terraform module
+# supplies the GatewayClass, the internal-LB add-on, and the cert-manager identity.
+gateway:
+  enabled: false
+  # GatewayClass. Cloud-specific — this default is Azure's managed application-routing add-on.
+  className: approuting-istio
+  # Hostnames for the two listeners. Must resolve to the Gateway's private LB IP (e.g.
+  # via a private DNS zone). Let's Encrypt DNS-01 still issues publicly-trusted certs for
+  # these names — validation is via DNS records, not endpoint reachability.
+  otelHostname: ""
+  clickhouseHostname: ""
+  # Restrict the Gateway's (internal) load balancer to these source CIDRs. Empty = no
+  # restriction (any client with network reach to the private LB). Unioned across both
+  # listeners (shared LB). Rendered as the cloud provider's source-range LB annotation.
+  allowedSourceRanges: []
+  tls:
+    # letsencrypt is the only supported source. A BYO-cert source is reserved for a
+    # future release; any other value fails at render time.
+    source: letsencrypt
+    letsencrypt:
+      email: ""
+      server: https://acme-v02.api.letsencrypt.org/directory
+      # Cloud-specific cert-manager DNS-01 solver config (Azure DNS). Other clouds
+      # supply their own solver block (e.g. cloudDNS, route53).
+      azureDNS:
+        hostedZoneName: ""
+        resourceGroupName: ""
+        subscriptionID: ""
+        managedIdentityClientID: "" # cert-manager Workload Identity (from the TF module)
+
 # Altinity ClickHouse Operator
 altinity-clickhouse-operator:
   fullnameOverride: clickhouse-operator
@@ -228,6 +267,9 @@ llmWorker:
     region: us-east-1
   serviceAccount:
     annotations: {}
+  # Additional labels for the worker pod template — set per-environment as needed
+  # (e.g. to opt into an identity/admission webhook).
+  podLabels: {}
   # Extra env vars (e.g., MAX_WORKERS, POLL_INTERVAL)
   env: []
   # Resource requests/limits for the llm-worker container. Modest dev

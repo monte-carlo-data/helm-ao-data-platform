@@ -1,0 +1,54 @@
+{{- include "ao-data-platform.gatewayValidate" . }}
+{{- if .Values.gateway.enabled }}
+# Kubernetes Gateway API. One Gateway, two HTTPS listeners terminating TLS
+# per-hostname for the collector and ClickHouse. Backends are ClusterIP; the
+# internal self-signed path is untouched.
+#
+# The Gateway's load balancer is forced internal (private IP only): the collector
+# and ClickHouse endpoints are never publicly reachable and are accessed over private
+# connectivity. The load-balancer annotations below are the cloud provider's
+# (Azure shown) — other providers substitute their own keys.
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: {{ include "ao-data-platform.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ao-data-platform.labels" . | nindent 4 }}
+spec:
+  infrastructure:
+    annotations:
+      # Force the Gateway's load balancer internal (private IP only). Azure key;
+      # other clouds use their own internal-LB annotation.
+      service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+      {{- with .Values.gateway.allowedSourceRanges }}
+      # Restrict the (internal) LB to these source CIDRs (unioned across both listeners).
+      service.beta.kubernetes.io/azure-allowed-ip-ranges: {{ join "," . | quote }}
+      {{- end }}
+  gatewayClassName: {{ required "gateway.className is required when gateway.enabled" .Values.gateway.className }}
+  listeners:
+    - name: otel
+      hostname: {{ required "gateway.otelHostname is required when gateway.enabled" .Values.gateway.otelHostname | quote }}
+      port: 443
+      protocol: HTTPS
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: gateway-otel-tls
+      allowedRoutes:
+        namespaces:
+          from: Same
+    - name: clickhouse
+      hostname: {{ required "gateway.clickhouseHostname is required when gateway.enabled" .Values.gateway.clickhouseHostname | quote }}
+      port: 8443
+      protocol: HTTPS
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: gateway-clickhouse-tls
+      allowedRoutes:
+        namespaces:
+          from: Same
+{{- end }}

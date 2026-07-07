@@ -32,3 +32,24 @@ clickhouse:
         name: ci-placeholder
       remoteRef:
         key: ci-placeholder
+
+# Exercise the (default-off) Gateway path so its four templates — gateway,
+# gateway-httproutes, gateway-certificates, gateway-backend-tls — render in CI.
+# tls.enabled defaults true, so the Gateway→backend re-encrypt path renders against a
+# valid config. CI placeholders only; never deployed.
+gateway:
+  enabled: true
+  otelHostname: otel.ci-placeholder.internal
+  clickhouseHostname: clickhouse.ci-placeholder.internal
+  # Exercise the source-range branch (defaults to [], otherwise never rendered in CI) so the
+  # azure-allowed-ip-ranges annotation + its join/quote are covered. Asserted in the lint job.
+  allowedSourceRanges:
+    - 10.0.0.0/16
+    - 192.168.1.0/24
+  tls:
+    letsencrypt:
+      azureDNS:
+        hostedZoneName: ci-placeholder.internal
+        resourceGroupName: ci-placeholder
+        subscriptionID: ci-placeholder
+        managedIdentityClientID: ci-placeholder
