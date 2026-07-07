@@ -219,9 +219,29 @@ fi
 
 # The Keeper NetworkPolicy ships enabled by default; warn (don't fail) if absent,
 # since keeper.networkPolicy.enabled=false is a legitimate per-environment choice.
+# When present, prove the deny actually works: a NetworkPolicy object is inert on a
+# cluster without a policy engine (on EKS, the VPC CNI network policy agent), and
+# nothing in the API surfaces that — only a blocked connection does. The probe pod
+# (label run=verify-keeper-deny) matches none of the policy's allowed selectors, so
+# its TCP connect to the client port must time out. An enforced deny drops packets
+# (timeout); "Connected to" or a refusal means packets reached Keeper's netns.
 if ! kubectl get networkpolicy -n "$NS" keeper-otel >/dev/null 2>&1; then
   echo ""
-  echo -e "  ${YELLOW}⚠ WARNING: NetworkPolicy 'keeper-otel' not found — Keeper's client port is unrestricted (keeper.networkPolicy.enabled may be off).${RESET}"
+  echo -e "  ${YELLOW}⚠ WARNING: NetworkPolicy 'keeper-otel' not found — Keeper's client port is unrestricted (keeper.networkPolicy.enabled may be off); skipping the isolation probe.${RESET}"
+else
+  echo ""
+  echo -e "  ${YELLOW}▸ Negative probe: connect to keeper-otel:2181 from an unauthorized pod (expect a connect timeout)${RESET}"
+  PROBE_OUT=$(kubectl run -n "$NS" verify-keeper-deny --rm -i --restart=Never \
+    --image=curlimages/curl -- \
+    -vs -o /dev/null --connect-timeout 4 "http://keeper-otel:2181/" 2>&1 \
+    | grep -v '^pod "' || true)
+  if echo "$PROBE_OUT" | grep -q "Connected to"; then
+    fail "An unauthorized pod CAN reach keeper-otel:2181 — the NetworkPolicy exists but is not enforced. Either the cluster has no NetworkPolicy engine (on EKS, enable the VPC CNI network policy agent) or the policy is misconfigured."
+  elif echo "$PROBE_OUT" | grep -qi "timed out"; then
+    echo "    Connect timed out — the Keeper NetworkPolicy deny is enforced."
+  else
+    fail "Keeper isolation probe returned an unexpected result (expected a connect timeout):\n${PROBE_OUT}"
+  fi
 fi
 
 pass "Keeper ensemble healthy: ${KEEPER_READY}/${KEEPER_EXPECTED} voters Ready, exactly one Raft leader, ${KEEPER_PVCS} PVC(s)."

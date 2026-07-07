@@ -61,6 +61,9 @@ layer:
   `NetworkPolicy` object — note that policies only take effect on clusters with a
   NetworkPolicy-capable CNI (on EKS, the VPC CNI's network policy agent must be enabled);
   without one the object is inert, which is also why it's safe to ship enabled by default.
+  Because an inert policy looks healthy in the API, `hack/verify-deployment-aws.sh` proves the
+  deny with a negative probe: it connects to the Keeper client port from an unauthorized
+  pod and requires the connection to time out.
 - **Four-letter-word allowlist** (`keeper.fourLetterWordAllowList`, default
   `ruok,mntr,srvr,stat,conf`): Keeper's built-in default additionally serves
   cluster-affecting commands (e.g. `rcvr` force-recovery, `rqld` request-leadership) on
