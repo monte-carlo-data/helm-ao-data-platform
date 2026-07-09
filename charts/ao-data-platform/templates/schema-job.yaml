@@ -74,8 +74,16 @@ spec:
                   echo "  skipping $1 — table absent (log disabled or not yet created)"
                 fi
               }
+              # The wait can legitimately run long (the Job races the operator's
+              # config reconcile), so log progress periodically — a silent loop is
+              # indistinguishable from a hang in kubectl logs.
               echo "Waiting for ClickHouse to accept queries..."
+              attempt=0
               until ch --query "SELECT 1" 2>/dev/null; do
+                attempt=$((attempt + 1))
+                if [ $((attempt % 15)) -eq 0 ]; then
+                  echo "  still waiting after $((attempt * 2))s..."
+                fi
                 sleep 2
               done
               echo "Running schema migrations..."
