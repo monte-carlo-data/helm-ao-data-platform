@@ -39,7 +39,7 @@ spec:
       otel/networks/ip:
         {{- toYaml .Values.clickhouse.otel.networksIp | nindent 8 }}
       {{- if .Values.clickhouse.otel.restrictGrants }}
-      # otel (ingest) — restricted to INSERT on the telemetry source tables. The MV cascade runs
+      # otel (ingest) — restricted to INSERT on otel_traces.otel_traces. The MV cascade runs
       # as schema_owner (the MV DEFINER), so otel needs nothing on the normalized targets. Gated
       # so it can stay broad until external readers have moved to monte_carlo, then be flipped on.
       otel/grants/query:
@@ -165,13 +165,15 @@ spec:
       # config.d/readiness_handler.xml below). Defined as a raw users.d file rather
       # than through the operator `users:` section so nothing can attach a password
       # to it: the handler's <user> field authenticates with an empty password, so
-      # the user must genuinely be no_password. Networks stay open because kubelet
-      # probes arrive from node IPs; the exposure is bounded by the grants — config
-      # <grants> are exhaustive, so this user can read system.replicas plus table
-      # *metadata* (SHOW TABLES; no data access) and nothing else — plus a
-      # readonly=2 profile as defense-in-depth. Not listed in values.yaml/
-      # external-secret.yaml on purpose: it has no secret and is not a
-      # caller-facing user.
+      # the user must genuinely be no_password. Networks are ::/0 — kubelet probes
+      # arrive from node IPs, which the chart cannot enumerate portably — which
+      # means anyone who can reach any ClickHouse listener can authenticate as
+      # `probe` directly, not just through /ready. That exposure is bounded by the
+      # grants: config <grants> are exhaustive, so this user can read replication
+      # metadata (system.replicas) plus otel_traces table *names* (SHOW TABLES; no
+      # data access) and nothing else — plus a readonly=2 profile as
+      # defense-in-depth. Not listed in values.yaml/external-secret.yaml on
+      # purpose: it has no secret and is not a caller-facing user.
       users.d/probe_user.xml: |
         <clickhouse>
           <profiles>
@@ -318,10 +320,13 @@ spec:
               # probe, which the operator only adds when none is user-defined):
               # /ready is the readonly-failing handler defined in
               # config.d/readiness_handler.xml above. A replica partitioned from
-              # Keeper — or running its entire initial clone — reports not-Ready
-              # for the whole event, which is exactly the point: the Service must
-              # not route writes to it. Gate operational waits on system.replicas
-              # checks, not on pod Ready.
+              # Keeper reports not-Ready until it rejoins — the point: the
+              # Service must not route writes to it. A joining replica is
+              # not-Ready only through its registration/metadata phase;
+              # is_readonly clears once the fetch queue is populated, before the
+              # part fetches finish, so it can turn Ready while its historical
+              # backfill is still in flight. Writer-safe, not read-complete —
+              # gate operational waits on system.replicas checks, not pod Ready.
               readinessProbe:
                 httpGet:
                   path: /ready

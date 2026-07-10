@@ -50,7 +50,7 @@ clickhouse:
     # scoping (otel → pod CIDR, etc.) is handled separately.
     networksIp:
       - "0.0.0.0/0"
-    # When true, otel is restricted (via config grants) to INSERT on the telemetry source tables
+    # When true, otel is restricted (via config grants) to INSERT on otel_traces.otel_traces
     # only — the least-privilege ingest role for the OTel collector. The MV cascade runs as
     # schema_owner (the MV DEFINER), so otel needs nothing on the normalized targets. Default
     # false keeps otel broad (implicit full access) so it can be enabled in a later step, once any

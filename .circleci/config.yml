@@ -233,6 +233,109 @@ jobs:
             assert_fact 'voters=5'
             assert_fact 'fourlw="ruok,mntr,srvr,stat,conf"'
             echo "ClickHouse replication wiring rendered correctly."
+      - run:
+          name: Verify rendered readiness probe and probe-user wiring
+          # The /ready chain has several links that drop out silently: the handler
+          # XML, the probe user file, and its two config grants. Losing the SHOW
+          # TABLES grant is the worst class — system.replicas filters rows to
+          # tables the querying user can see, so the probe would read an empty
+          # table and never fail (a readonly replica stays "ready"). Assert each
+          # link in the TLS-on render, plus the cluster secret, the schema_owner
+          # CLUSTER grant (ON CLUSTER DDL fails ACCESS_DENIED without it), and
+          # the hard zone spread on both the CHI and CHK pod templates.
+          command: |
+            assert_rendered() {
+              # `--` so patterns beginning with `-` (the YAML list items) are not
+              # parsed as grep options.
+              if ! grep -qF -- "$1" rendered.yaml; then
+                echo "Missing from render: $1"
+                exit 1
+              fi
+            }
+            assert_rendered 'users.d/probe_user.xml: |'
+            assert_rendered 'config.d/readiness_handler.xml: |'
+            assert_rendered '<query>GRANT SELECT ON system.replicas</query>'
+            assert_rendered '<query>GRANT SHOW TABLES ON otel_traces.*</query>'
+            assert_rendered '- "GRANT CLUSTER ON *.*"'
+            assert_rendered 'clickhouse.altinity.com/chi: otel'
+            assert_rendered 'clickhouse-keeper.altinity.com/chk: otel'
+            # The auto cluster secret must sit under the cluster's `secret:` key —
+            # `auto:` alone also appears in the operator CRD schema.
+            if ! grep -B1 'auto: "true"' rendered.yaml | grep -q 'secret:'; then
+              echo 'Cluster `secret: {auto: "true"}` did not render.'
+              exit 1
+            fi
+            # lint-values render TLS-on: /ready must probe the HTTPS port.
+            probe=$(grep -A3 'path: /ready' rendered.yaml)
+            for want in 'port: 8443' 'scheme: HTTPS'; do
+              if ! echo "$probe" | grep -q "$want"; then
+                echo "TLS-on /ready readinessProbe missing '$want'; block was:"
+                echo "$probe"
+                exit 1
+              fi
+            done
+            echo "Readiness probe and probe-user wiring rendered correctly."
+      - run:
+          name: Dev shape (1 replica / 1 voter, TLS off) renders
+          # The documented dev/single-AZ shape appears nowhere in the default
+          # render: 1 ClickHouse replica, 1 Keeper voter, TLS off. Render it and
+          # assert both counts reach their layouts and the /ready probe flips to
+          # plain HTTP 8123 — the TLS-off branch of the probe wiring is otherwise
+          # never exercised in CI.
+          command: |
+            helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --set gateway.enabled=false \
+              --set tls.enabled=false \
+              --set clickhouse.replicasCount=1 \
+              --set keeper.replicasCount=1 > dev-shape.yaml
+            count=$(grep -Ec '^          replicasCount: 1$' dev-shape.yaml)
+            if [ "$count" -ne 2 ]; then
+              echo "Expected replicasCount: 1 in both the CHI and CHK layouts; found ${count} occurrence(s)."
+              exit 1
+            fi
+            probe=$(grep -A3 'path: /ready' dev-shape.yaml)
+            if ! echo "$probe" | grep -q 'port: 8123'; then
+              echo "TLS-off /ready readinessProbe must target port 8123; block was:"
+              echo "$probe"
+              exit 1
+            fi
+            if echo "$probe" | grep -q 'scheme: HTTPS'; then
+              echo "TLS-off /ready readinessProbe must not set scheme: HTTPS; block was:"
+              echo "$probe"
+              exit 1
+            fi
+            echo "Dev shape rendered correctly with plain-HTTP readiness."
+      - run:
+          name: Schema SQL is clustered-only
+          # Every table the chart creates must be a path-less Replicated* engine
+          # and every DDL statement must run ON CLUSTER — a plain-MergeTree or
+          # non-cluster statement installs fine on one replica, then surfaces as
+          # a missing table or an independent empty lineage on the other. Pure
+          # source greps; no render needed.
+          command: |
+            fail=0
+            ddl=$(grep -En '^(CREATE|ALTER|DROP|RENAME|ATTACH|DETACH|TRUNCATE) ' charts/ao-data-platform/sql/*.sql || true)
+            if [ -z "$ddl" ]; then
+              echo "Sanity check failed: no DDL statements matched in charts/ao-data-platform/sql/ — the grep pattern has drifted."
+              exit 1
+            fi
+            missing=$(echo "$ddl" | grep -v "ON CLUSTER '{cluster}'" || true)
+            if [ -n "$missing" ]; then
+              echo "DDL without ON CLUSTER '{cluster}':"
+              echo "$missing"
+              fail=1
+            fi
+            if grep -En 'ENGINE = ' charts/ao-data-platform/sql/*.sql | grep -v 'ENGINE = Replicated'; then
+              echo "Non-Replicated engine in schema SQL (lines above)."
+              fail=1
+            fi
+            if grep -n '/clickhouse/' charts/ao-data-platform/sql/*.sql; then
+              echo "Explicit replication path in schema SQL (lines above) — engines must stay path-less (default_replica_path owns the layout)."
+              fail=1
+            fi
+            [ "$fail" -eq 0 ] && echo "Schema SQL is clustered-only: ON CLUSTER DDL, path-less Replicated engines."
+            exit $fail
 
   publish-dev:
     docker:

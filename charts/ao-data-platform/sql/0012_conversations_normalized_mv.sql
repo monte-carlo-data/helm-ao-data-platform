@@ -17,7 +17,7 @@
 -- LangChain constructor-wrapped (kwargs.*). Agent content may be a plain string
 -- or a block array ([{type:text, text:...}]).
 --
--- SELECT column order matches conversations_normalized (0008) — MV-to-table
+-- SELECT column order matches conversations_normalized (0011) — MV-to-table
 -- inserts position-wise, not by name.
 CREATE MATERIALIZED VIEW IF NOT EXISTS otel_traces.conversations_normalized_mv ON CLUSTER '{cluster}'
 TO otel_traces.conversations_normalized
