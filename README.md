@@ -18,7 +18,7 @@ The ClickHouse instance ships with production hardening: a capped memory ceiling
 
 > **Chart-version bumps no longer recreate ClickHouse:** the ClickHouse operator propagates only a fixed allowlist of stable labels onto the resources it generates. A chart-version bump changes the volatile `helm.sh/chart` label, but that label is no longer stamped onto the StatefulSet's immutable `volumeClaimTemplates`, so the bump no longer forces a delete/recreate of the ClickHouse StatefulSet.
 
-> **Upgrading to 2.4.0:** the schema SQL is now clustered-only — every table is a path-less `Replicated*` engine, all DDL (including the schema-Job TTL `ALTER`s) runs `ON CLUSTER '{cluster}'`, and `clickhouse.replicasCount` defaults to **2**. A bare install now deploys the prod HA shape (2 ClickHouse replicas + 3 Keeper voters, both hard-spread across zones); dev/single-AZ installs set both counts to `1`. **Installs upgrading with existing pre-2.4.0 (plain `MergeTree`) data must pin `clickhouse.replicasCount: 1` until the tables have been converted in place** — see [the migration ordering](#high-availability-and-the-migration-ordering). Readiness also switches from the operator-injected `/ping` to the writer-safe `/ready` handler: a replica partitioned from Keeper drops out of the Service until it rejoins, and a joining replica stays not-Ready through its registration/metadata phase — though it can turn Ready before its historical part fetches finish, so gate operational waits on `system.replicas`, not pod Ready (see [Writer-safe readiness](#writer-safe-readiness-ready)).
+> **Upgrading to 3.0.0:** a breaking major release — the default install shape changes. The schema SQL is now clustered-only — every table is a path-less `Replicated*` engine, all DDL (including the schema-Job TTL `ALTER`s) runs `ON CLUSTER '{cluster}'`, and `clickhouse.replicasCount` defaults to **2**. A bare install now deploys the prod HA shape (2 ClickHouse replicas + 3 Keeper voters, both hard-spread across zones); dev/single-AZ installs set both counts to `1`. **Installs upgrading with existing pre-3.0.0 (plain `MergeTree`) data must pin `clickhouse.replicasCount: 1` until the tables have been converted in place** — see [the migration ordering](#high-availability-and-the-migration-ordering). Readiness also switches from the operator-injected `/ping` to the writer-safe `/ready` handler: a replica partitioned from Keeper drops out of the Service until it rejoins, and a joining replica stays not-Ready through its registration/metadata phase — though it can turn Ready before its historical part fetches finish, so gate operational waits on `system.replicas`, not pod Ready (see [Writer-safe readiness](#writer-safe-readiness-ready)).
 >
 > **Upgrading to 2.3.0:** every install now renders a `ClickHouseKeeperInstallation` alongside the ClickHouse server — 3 Keeper voters with a hard one-voter-per-AZ topology spread by default. On clusters that can't schedule across three zones (local dev, single-AZ), the extra voters stay `Pending`; set `keeper.replicasCount: 1` there. The ClickHouse server is wired to Keeper from this version, but the tables are still plain `MergeTree` and don't use it yet — runtime behavior is otherwise unchanged. The Keeper client port ships network-isolated by a `NetworkPolicy` (inert on clusters without a NetworkPolicy engine) with a trimmed four-letter-word allowlist — see [Keeper network exposure and hardening](#keeper-network-exposure-and-hardening).
 
@@ -81,7 +81,7 @@ which unlike digest ACLs has no retrofit penalty on existing znodes.
 
 ### High availability and the migration ordering
 
-From chart `2.4.0` the default install is HA: the `sql/*.sql` table definitions are
+From chart `3.0.0` the default install is HA: the `sql/*.sql` table definitions are
 path-less `Replicated*` engines, every DDL statement runs `ON CLUSTER '{cluster}'` (so the
 single schema Job propagates schema to every replica via Keeper's distributed DDL queue),
 and the ClickHouse pods carry the same hard per-zone topology spread as the Keeper voters —
@@ -93,9 +93,9 @@ ZooKeeper path and replicate from the first insert. Dev/small installs set
 `clickhouse.replicasCount: 1` + `keeper.replicasCount: 1` — same engines, same DDL, sized
 down; there is no single-instance engine mode.
 
-Moving an existing single-replica install with pre-`2.4.0` (plain `MergeTree`) data to HA
+Moving an existing single-replica install with pre-`3.0.0` (plain `MergeTree`) data to HA
 is a two-apply sequence with a manual conversion in between. **Do not raise
-`clickhouse.replicasCount` above 1 — and do not take the `2.4.0` upgrade without pinning it
+`clickhouse.replicasCount` above 1 — and do not take the `3.0.0` upgrade without pinning it
 at 1 — until the conversion has verified.** A second replica created against non-replicated
 tables does not clone the existing data; it starts an independent, empty table lineage.
 
@@ -107,7 +107,7 @@ tables does not clone the existing data; it starts an independent, empty table l
    (requires ClickHouse ≥ 23.11 and an Atomic database; take a volume snapshot first).
    Verify every table reports `Replicated*` engines, `is_readonly = 0`, and the macro-based
    `zookeeper_path` in `system.replicas` before proceeding.
-3. **Apply #2** (chart ≥ `2.4.0`, `replicasCount: 2`): the operator adds the second
+3. **Apply #2** (chart ≥ `3.0.0`, `replicasCount: 2`): the operator adds the second
    replica. Because the DDL is path-less and `default_replica_path` is macro-based, its
    `ON CLUSTER` `CREATE … IF NOT EXISTS` statements no-op on the converted replica and
    resolve to the same ZooKeeper path on the new one — it registers as a second replica
@@ -152,7 +152,7 @@ refused while the other is readonly (correct, but it changes node-roll behavior)
 readonly; and if *every* replica is readonly at once — Keeper quorum loss, or in the
 single-voter dev shape a Keeper outage outlasting the probe window (~30 s:
 `failureThreshold: 3` × `periodSeconds: 10`) — the Service empties and *reads* are
-blocked too, even though each replica's data is still locally SELECT-able. Pre-2.4.0
+blocked too, even though each replica's data is still locally SELECT-able. Pre-3.0.0
 `/ping` readiness kept reads flowing in that state; trading read availability for
 writer safety here is deliberate.
 
