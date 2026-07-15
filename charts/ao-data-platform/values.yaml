@@ -344,8 +344,20 @@ llmWorker:
   image:
     repository: ""
     tag: ""
+  # LLM backend: "bedrock" (Claude on AWS Bedrock) or "foundry" (Claude on
+  # Microsoft Foundry / Azure). Selects LLM_PROVIDER + which provider-specific
+  # env the deployment renders. (vertex/GCP is added when that cloud ships.)
+  provider: bedrock
   aws:
     region: us-east-1
+  # Foundry (Azure) settings — required (and only used) when provider is "foundry".
+  # resource = the Foundry resource name; the AnthropicFoundry SDK builds
+  # https://<resource>.services.ai.azure.com/anthropic/ from it. Auth is Entra ID
+  # via AKS Workload Identity (no key) — set the managed-identity client-id on
+  # serviceAccount.annotations ("azure.workload.identity/client-id") and the
+  # "azure.workload.identity/use": "true" label on podLabels (Terraform wires both).
+  foundry:
+    resource: ""
   serviceAccount:
     annotations: {}
   # Additional labels for the worker pod template — set per-environment as needed

@@ -54,6 +54,25 @@ its guard here once instead of in each template. A no-op when gateway.enabled is
 {{- end }}
 
 {{/*
+LLM-worker provider validation — the single source of truth for the worker path's render-time
+guards. Included at the top of the llm-worker templates so any render enforces the same
+invariants: the provider must be a known enum, and foundry requires its resource (auth is
+Entra ID via AKS Workload Identity, wired separately via serviceAccount.annotations + podLabels).
+When a new provider lands (e.g. vertex), add its guard here once.
+*/}}
+{{- define "ao-data-platform.llmWorkerValidate" -}}
+{{- $p := .Values.llmWorker.provider -}}
+{{- if not (or (eq $p "bedrock") (eq $p "foundry")) -}}
+{{- fail (printf "llmWorker.provider must be \"bedrock\" or \"foundry\", got %q." $p) -}}
+{{- end -}}
+{{- if eq $p "foundry" -}}
+{{- if not .Values.llmWorker.foundry.resource -}}
+{{- fail "llmWorker.provider=foundry requires llmWorker.foundry.resource." -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 ClickHouseInstallation name.
 The Altinity operator stamps the label `clickhouse.altinity.com/chi: <name>`
 onto the ClickHouse pods, so anything selecting those pods must use this same

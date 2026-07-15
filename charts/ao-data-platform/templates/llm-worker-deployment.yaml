@@ -1,6 +1,7 @@
 {{- if gt (int .Values.llmWorker.replicaCount) 1 }}
 {{- fail "llmWorker.replicaCount must be 0 or 1. The llm-worker is not designed to run as multiple copies: it has no job-claim/locking semantics (its ClickHouse grants are SELECT/INSERT only), so concurrent workers would double-process batches. Use 0 to pause, 1 to run." }}
 {{- end }}
+{{- include "ao-data-platform.llmWorkerValidate" . -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -69,8 +70,19 @@ spec:
               value: "2"
             - name: MAX_WORKERS
               value: "80"
+            - name: LLM_PROVIDER
+              value: {{ .Values.llmWorker.provider | quote }}
+            {{- if eq .Values.llmWorker.provider "bedrock" }}
             - name: AWS_REGION
               value: {{ .Values.llmWorker.aws.region | quote }}
+            {{- else if eq .Values.llmWorker.provider "foundry" }}
+            # Claude on Microsoft Foundry. Auth is Entra ID via AKS Workload
+            # Identity (no key) — the SA client-id annotation + the
+            # azure.workload.identity/use pod label are set by Terraform. The
+            # AnthropicFoundry SDK builds https://<resource>.services.ai.azure.com/anthropic/.
+            - name: ANTHROPIC_FOUNDRY_RESOURCE
+              value: {{ .Values.llmWorker.foundry.resource | quote }}
+            {{- end }}
             - name: CH_CA_CERT
               value: /tls/clickhouse-ca/ca.crt
             {{- with .Values.llmWorker.env }}
