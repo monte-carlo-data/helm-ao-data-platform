@@ -82,6 +82,17 @@ spec:
             # AnthropicFoundry SDK builds https://<resource>.services.ai.azure.com/anthropic/.
             - name: ANTHROPIC_FOUNDRY_RESOURCE
               value: {{ .Values.llmWorker.foundry.resource | quote }}
+            {{- else if eq .Values.llmWorker.provider "vertex" }}
+            # Claude on GCP Vertex AI. Auth is ADC via GKE Workload Identity
+            # Federation — the GCP module grants the worker KSA's WIF principal
+            # roles/aiplatform.user directly (no GCP SA / annotation). The env vars
+            # ANTHROPIC_VERTEX_PROJECT_ID + CLOUD_ML_REGION are the AnthropicVertex
+            # SDK's native ones (region "global" = the global endpoint). The worker
+            # honors the row's model_id (no configured model).
+            - name: ANTHROPIC_VERTEX_PROJECT_ID
+              value: {{ .Values.llmWorker.vertex.project | quote }}
+            - name: CLOUD_ML_REGION
+              value: {{ .Values.llmWorker.vertex.region | quote }}
             {{- end }}
             - name: CH_CA_CERT
               value: /tls/clickhouse-ca/ca.crt

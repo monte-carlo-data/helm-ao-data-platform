@@ -62,12 +62,17 @@ When a new provider lands (e.g. vertex), add its guard here once.
 */}}
 {{- define "ao-data-platform.llmWorkerValidate" -}}
 {{- $p := .Values.llmWorker.provider -}}
-{{- if not (or (eq $p "bedrock") (eq $p "foundry")) -}}
-{{- fail (printf "llmWorker.provider must be \"bedrock\" or \"foundry\", got %q." $p) -}}
+{{- if not (or (eq $p "bedrock") (eq $p "foundry") (eq $p "vertex")) -}}
+{{- fail (printf "llmWorker.provider must be \"bedrock\", \"foundry\", or \"vertex\", got %q." $p) -}}
 {{- end -}}
 {{- if eq $p "foundry" -}}
 {{- if not .Values.llmWorker.foundry.resource -}}
 {{- fail "llmWorker.provider=foundry requires llmWorker.foundry.resource." -}}
+{{- end -}}
+{{- end -}}
+{{- if eq $p "vertex" -}}
+{{- if not .Values.llmWorker.vertex.project -}}
+{{- fail "llmWorker.provider=vertex requires llmWorker.vertex.project." -}}
 {{- end -}}
 {{- end -}}
 {{- end }}

@@ -375,6 +375,26 @@ jobs:
             fi
             echo "bedrock provider renders AWS env, no Foundry env."
       - run:
+          name: llm-worker vertex provider renders Vertex env, no AWS/Foundry env
+          # provider=vertex emits LLM_PROVIDER=vertex + ANTHROPIC_VERTEX_PROJECT_ID
+          # + CLOUD_ML_REGION, and no AWS_REGION / ANTHROPIC_FOUNDRY_RESOURCE.
+          command: |
+            helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --set llmWorker.provider=vertex \
+              --set llmWorker.vertex.project=mc-ao-gcp \
+              --show-only templates/llm-worker-deployment.yaml > lw-vertex.yaml
+            if ! grep -q 'value: "vertex"' lw-vertex.yaml; then
+              echo "LLM_PROVIDER=vertex not rendered."; exit 1
+            fi
+            if ! grep -q 'name: ANTHROPIC_VERTEX_PROJECT_ID' lw-vertex.yaml; then
+              echo "ANTHROPIC_VERTEX_PROJECT_ID not rendered for vertex."; exit 1
+            fi
+            if grep -qE 'name: (AWS_REGION|ANTHROPIC_FOUNDRY_RESOURCE)' lw-vertex.yaml; then
+              echo "AWS/Foundry env must not render for vertex."; exit 1
+            fi
+            echo "vertex provider renders Vertex env, no AWS/Foundry env."
+      - run:
           name: Invalid llmWorker.provider config fails render
           # The llmWorkerValidate guard must fail fast for an unknown provider and
           # for foundry missing its required resource.
@@ -388,6 +408,11 @@ jobs:
               -f charts/ao-data-platform/ci/lint-values.yaml \
               --set llmWorker.provider=foundry > /dev/null 2>&1; then
               echo "Expected render to fail for foundry with no resource, but it succeeded."; exit 1
+            fi
+            if helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --set llmWorker.provider=vertex > /dev/null 2>&1; then
+              echo "Expected render to fail for vertex with no project, but it succeeded."; exit 1
             fi
             echo "Invalid llmWorker.provider config correctly failed the render."
 

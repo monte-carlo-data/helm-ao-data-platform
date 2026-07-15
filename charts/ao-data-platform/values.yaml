@@ -344,9 +344,9 @@ llmWorker:
   image:
     repository: ""
     tag: ""
-  # LLM backend: "bedrock" (Claude on AWS Bedrock) or "foundry" (Claude on
-  # Microsoft Foundry / Azure). Selects LLM_PROVIDER + which provider-specific
-  # env the deployment renders. (vertex/GCP is added when that cloud ships.)
+  # LLM backend: "bedrock" (Claude on AWS Bedrock), "foundry" (Claude on
+  # Microsoft Foundry / Azure), or "vertex" (Claude on GCP Vertex AI). Selects
+  # LLM_PROVIDER + which provider-specific env the deployment renders.
   provider: bedrock
   aws:
     region: us-east-1
@@ -358,6 +358,14 @@ llmWorker:
   # "azure.workload.identity/use": "true" label on podLabels (Terraform wires both).
   foundry:
     resource: ""
+  # Vertex (GCP) settings — required (and only used) when provider is "vertex".
+  # project = the GCP project id; region = the Vertex location ("global" = the
+  # global endpoint). Auth is ADC via GKE Workload Identity Federation — the GCP
+  # module grants the worker KSA's WIF principal roles/aiplatform.user directly
+  # (no GCP service account, no annotation needed). Worker honors the row's model_id.
+  vertex:
+    project: ""
+    region: global
   serviceAccount:
     annotations: {}
   # Additional labels for the worker pod template — set per-environment as needed
