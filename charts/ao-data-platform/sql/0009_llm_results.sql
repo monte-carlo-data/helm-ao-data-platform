@@ -1,4 +1,4 @@
-CREATE TABLE IF NOT EXISTS otel_traces.llm_results
+CREATE TABLE IF NOT EXISTS otel_traces.llm_results ON CLUSTER '{cluster}'
 (
     batch_id        UUID,
     row_id          UUID,
@@ -7,7 +7,7 @@ CREATE TABLE IF NOT EXISTS otel_traces.llm_results
     error           String DEFAULT '',
     created_at      DateTime DEFAULT now()
 )
-ENGINE = MergeTree()
+ENGINE = ReplicatedMergeTree
 PARTITION BY toYYYYMM(created_at)
 ORDER BY (batch_id, row_id)
 TTL created_at + INTERVAL 30 DAY DELETE

@@ -13,13 +13,13 @@
 -- never deleted before its conversation. "Uncategorized" is a reserved
 -- cluster_key, not a Postgres row.
 --
--- Latest-wins is NOT enforced by the engine: this is a plain MergeTree, not a
--- ReplacingMergeTree, and classified_at is not in the ORDER BY. Every read MUST
+-- Latest-wins is NOT enforced by the engine: this is a plain ReplicatedMergeTree,
+-- not a Replacing variant, and classified_at is not in the ORDER BY. Every read MUST
 -- `ORDER BY classified_at DESC` before `LIMIT 1 BY (service_name, conversation_id,
 -- space_uuid)` to collapse re-classifies to the newest row; a read that omits the
 -- sort returns an arbitrary row per grain. (Mirrors the 0013 conversation_eval_scores
 -- convention.)
-CREATE TABLE IF NOT EXISTS otel_traces.conversation_cluster_assignments
+CREATE TABLE IF NOT EXISTS otel_traces.conversation_cluster_assignments ON CLUSTER '{cluster}'
 (
     `space_uuid` UUID,
     `service_name` LowCardinality(String),
@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS otel_traces.conversation_cluster_assignments
     `batch_id` UUID,
     `classified_at` DateTime64(9)
 )
-ENGINE = MergeTree()
+ENGINE = ReplicatedMergeTree
 PARTITION BY toYYYYMM(classified_at)
 ORDER BY (service_name, conversation_id, space_uuid)
 TTL classified_at + INTERVAL 30 DAY DELETE;

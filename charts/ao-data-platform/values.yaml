@@ -7,16 +7,18 @@ clickhouse:
   # are reproducible. Note: `26.4` is a deliberate jump from the Altinity
   # 0.26.0 operator default of `23.8` — adopt with intent on first install.
   image: clickhouse/clickhouse-server:26.4.3
-  # Number of ClickHouse replicas in the (single-shard) cluster. Default 1 keeps
-  # the standard install a single instance — correct for this chart version, whose
-  # sql/*.sql tables are still plain MergeTree. High availability (2 replicas across
-  # AZs, backed by Keeper) is delivered by a later chart version that ships
-  # ReplicatedMergeTree engines + ON CLUSTER DDL; bumping this to 2 before that
-  # version, or against not-yet-converted tables, would start an independent,
-  # non-replicated second lineage. The consuming terraform owns this value during the
-  # in-place HA migration — it pins it at 1 until the conversion verifies, then moves
-  # it to 2. See the README's "ClickHouse replication and Keeper" section.
-  replicasCount: 1
+  # Number of ClickHouse replicas in the (single-shard) cluster. Default 2 is the
+  # HA shape this chart's SQL is built for: every table is a path-less Replicated*
+  # engine and all DDL runs ON CLUSTER, so a fresh install's replicas share one
+  # schema and clone data via Keeper. Dev/small installs override this to 1 (and
+  # keeper.replicasCount to 1) — same code path, sized down, matching the
+  # prod-shaped-defaults philosophy of the keeper block below. Installs upgrading
+  # with pre-existing plain-MergeTree data MUST hold this at 1 until the in-place
+  # convert_to_replicated conversion has verified — the consuming terraform owns
+  # the value during that migration and stages it 1 → 2; raising it against
+  # unconverted tables starts an independent, empty second lineage. See the
+  # README's "ClickHouse replication and Keeper" section.
+  replicasCount: 2
   storageClass: ""
   storageSize: 100Gi
   # Data retention, in days, for the telemetry tables — the raw traces, the
@@ -35,9 +37,9 @@ clickhouse:
   # background merge, not immediately — see README for the manual-purge escape hatch.
   ttlDays: 30
   # Adding a ClickHouse user? Also update templates/clickhouse-installation.yaml and templates/external-secret.yaml.
-  # otel — the OTel collector ingest identity. Writes raw telemetry into otel_traces.otel_traces
-  # (and otel_metrics when the metrics exporter is active). The MV cascade runs as schema_owner
-  # (the MV DEFINER), so otel needs nothing on the normalized targets.
+  # otel — the OTel collector ingest identity. Writes raw telemetry into otel_traces.otel_traces.
+  # The MV cascade runs as schema_owner (the MV DEFINER), so otel needs nothing on the
+  # normalized targets.
   otel:
     # Name of the K8s Secret containing a "password" key for the otel user.
     # This secret is created by the ExternalSecret below.
@@ -48,7 +50,7 @@ clickhouse:
     # scoping (otel → pod CIDR, etc.) is handled separately.
     networksIp:
       - "0.0.0.0/0"
-    # When true, otel is restricted (via config grants) to INSERT on the telemetry source tables
+    # When true, otel is restricted (via config grants) to INSERT on otel_traces.otel_traces
     # only — the least-privilege ingest role for the OTel collector. The MV cascade runs as
     # schema_owner (the MV DEFINER), so otel needs nothing on the normalized targets. Default
     # false keeps otel broad (implicit full access) so it can be enabled in a later step, once any
@@ -510,7 +512,6 @@ opentelemetry-collector:
         create_schema: false
         compress: lz4
         traces_table_name: otel_traces
-        metrics_table_name: otel_metrics
         timeout: 30s
         async_insert: false
         sending_queue:

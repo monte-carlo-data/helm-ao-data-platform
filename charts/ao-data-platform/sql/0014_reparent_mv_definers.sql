@@ -13,6 +13,6 @@
 -- these statements are a harmless reassertion. This is a migration file (not an edit to 0004/0006/
 -- 0012) because the schema Job re-runs every *.sql on each upgrade and the create files are
 -- CREATE ... IF NOT EXISTS (no-ops on existing installs).
-ALTER TABLE otel_traces.otel_traces_trace_id_ts_mv MODIFY SQL SECURITY DEFINER DEFINER = schema_owner;
-ALTER TABLE otel_traces.spans_normalized_mv        MODIFY SQL SECURITY DEFINER DEFINER = schema_owner;
-ALTER TABLE otel_traces.conversations_normalized_mv MODIFY SQL SECURITY DEFINER DEFINER = schema_owner;
+ALTER TABLE otel_traces.otel_traces_trace_id_ts_mv  ON CLUSTER '{cluster}' MODIFY SQL SECURITY DEFINER DEFINER = schema_owner;
+ALTER TABLE otel_traces.spans_normalized_mv         ON CLUSTER '{cluster}' MODIFY SQL SECURITY DEFINER DEFINER = schema_owner;
+ALTER TABLE otel_traces.conversations_normalized_mv ON CLUSTER '{cluster}' MODIFY SQL SECURITY DEFINER DEFINER = schema_owner;

@@ -9,7 +9,7 @@
 -- annotate (the only read path joins by (service_name, conversation_id) — an
 -- orphaned score whose conversation has been dropped is unreadable). scored_at >=
 -- turn_start, so a score is never deleted before its conversation.
-CREATE TABLE IF NOT EXISTS otel_traces.conversation_eval_scores
+CREATE TABLE IF NOT EXISTS otel_traces.conversation_eval_scores ON CLUSTER '{cluster}'
 (
     `monitor_uuid` UUID,
     `service_name` LowCardinality(String),
@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS otel_traces.conversation_eval_scores
     `batch_id` UUID,
     `scored_at` DateTime64(9)
 )
-ENGINE = MergeTree()
+ENGINE = ReplicatedMergeTree
 PARTITION BY toYYYYMM(scored_at)
 ORDER BY (service_name, conversation_id, monitor_uuid, eval_type)
 TTL scored_at + INTERVAL 30 DAY DELETE;

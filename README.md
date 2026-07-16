@@ -12,12 +12,14 @@ Deploys the observability data plane:
 - OpenTelemetry Collector (traces pipeline)
 - Schema migration Job (a plain `Job`, recreated per release revision, that runs on every install and upgrade)
 
-The ClickHouse instance ships with production hardening: a capped memory ceiling (80% of the cgroup limit), `notice`-level logging, 7-day TTLs on system log tables, and a startup probe with a 5-minute warmup window. Disruption protection comes from the ClickHouse operator, which creates a `PodDisruptionBudget` (`maxUnavailable: 1`) for the pods it manages — a circuit breaker for cluster automation (node drains, Kubernetes upgrades, node AMI rolls), not an HA mechanism. Do **not** add your own PDB selecting these pods: a pod matched by more than one PDB cannot be evicted at all (the Kubernetes eviction API rejects multi-PDB pods), which blocks node drains outright instead of rate-limiting them.
+The ClickHouse instance ships with production hardening: a capped memory ceiling (80% of the cgroup limit), `notice`-level logging, 7-day TTLs on system log tables, a startup probe with a 5-minute warmup window, and a writer-safe readiness probe (see [Writer-safe readiness](#writer-safe-readiness-ready)). Disruption protection comes from the ClickHouse operator, which creates a `PodDisruptionBudget` (`maxUnavailable: 1`) for the pods it manages — a circuit breaker for cluster automation (node drains, Kubernetes upgrades, node AMI rolls), not an HA mechanism. Do **not** add your own PDB selecting these pods: a pod matched by more than one PDB cannot be evicted at all (the Kubernetes eviction API rejects multi-PDB pods), which blocks node drains outright instead of rate-limiting them.
 
 > **Upgrading an existing cluster:** the system-log TTLs only take effect when ClickHouse first *creates* each `system.*_log` table. If those tables already exist (any cluster that was running before this chart version), a restart will not apply the TTLs retroactively — `SHOW CREATE TABLE system.query_log` will show no TTL, which is expected, not a failure. To apply them on an existing cluster, run a one-time `ALTER TABLE system.<log> MODIFY TTL event_date + INTERVAL 7 DAY` per log table (or drop the tables and let ClickHouse recreate them on next flush).
 
 > **Chart-version bumps no longer recreate ClickHouse:** the ClickHouse operator propagates only a fixed allowlist of stable labels onto the resources it generates. A chart-version bump changes the volatile `helm.sh/chart` label, but that label is no longer stamped onto the StatefulSet's immutable `volumeClaimTemplates`, so the bump no longer forces a delete/recreate of the ClickHouse StatefulSet.
 
+> **Upgrading to 3.0.0:** a breaking major release — the default install shape changes. The schema SQL is now clustered-only — every table is a path-less `Replicated*` engine, all DDL (including the schema-Job TTL `ALTER`s) runs `ON CLUSTER '{cluster}'`, and `clickhouse.replicasCount` defaults to **2**. A bare install now deploys the prod HA shape (2 ClickHouse replicas + 3 Keeper voters, both hard-spread across zones); dev/single-AZ installs set both counts to `1`. **Installs upgrading with existing pre-3.0.0 (plain `MergeTree`) data must pin `clickhouse.replicasCount: 1` until the tables have been converted in place** — see [the migration ordering](#high-availability-and-the-migration-ordering). Readiness also switches from the operator-injected `/ping` to the writer-safe `/ready` handler: a replica partitioned from Keeper drops out of the Service until it rejoins, and a joining replica stays not-Ready through its registration/metadata phase — though it can turn Ready before its historical part fetches finish, so gate operational waits on `system.replicas`, not pod Ready (see [Writer-safe readiness](#writer-safe-readiness-ready)).
+>
 > **Upgrading to 2.3.0:** every install now renders a `ClickHouseKeeperInstallation` alongside the ClickHouse server — 3 Keeper voters with a hard one-voter-per-AZ topology spread by default. On clusters that can't schedule across three zones (local dev, single-AZ), the extra voters stay `Pending`; set `keeper.replicasCount: 1` there. The ClickHouse server is wired to Keeper from this version, but the tables are still plain `MergeTree` and don't use it yet — runtime behavior is otherwise unchanged. The Keeper client port ships network-isolated by a `NetworkPolicy` (inert on clusters without a NetworkPolicy engine) with a trimmed four-letter-word allowlist — see [Keeper network exposure and hardening](#keeper-network-exposure-and-hardening).
 
 > **Telemetry retention** is controlled by `clickhouse.ttlDays` (default 30 days), covering the raw traces, the trace-id timestamp index, the normalized spans, and their conversation-derived annotations (`conversation_eval_scores`, `conversation_cluster_assignments`). Unlike the system-log TTLs above, the schema migration Job re-applies this on every install and upgrade (`ALTER TABLE … MODIFY TTL`), so changing the value updates existing tables — no manual ALTER needed. The Job sets `materialize_ttl_after_modify = 0`, so the change is metadata-only: *raising* the TTL takes effect immediately, while *lowering* it purges newly-expired rows lazily on the next background merge rather than at once. To force an immediate purge after lowering, run `ALTER TABLE otel_traces.<table> MATERIALIZE TTL` per affected table. The `llm_*` worker queue tables (`llm_inputs`, `llm_results`, `llm_batches`) are LLM-pipeline state rather than telemetry and are **not** governed by this value — they keep a fixed 30-day TTL defined in their SQL.
@@ -25,7 +27,7 @@ The ClickHouse instance ships with production hardening: a capped memory ceiling
 ## ClickHouse replication and Keeper
 
 The chart deploys a single-shard ClickHouse cluster whose replica count is set by
-`clickhouse.replicasCount` (default `1`), coordinated by a ClickHouse Keeper ensemble
+`clickhouse.replicasCount` (default `2`), coordinated by a ClickHouse Keeper ensemble
 (`keeper.replicasCount` voters, default `3`). Keeper is intrinsic to the clustered design —
 it renders on every install, there is no keeper-less mode; a dev or small deployment just
 sizes it down to one voter. The ClickHouse server is wired to Keeper via the CHI's
@@ -79,36 +81,80 @@ which unlike digest ACLs has no retrofit penalty on existing znodes.
 
 ### High availability and the migration ordering
 
-This chart version keeps the default install a **single ClickHouse replica**: the
-`sql/*.sql` table definitions are still plain `MergeTree`, which does not replicate. A later
-chart version ships `ReplicatedMergeTree` engines + `ON CLUSTER` DDL and completes the HA
-story. Until then — and, on installs with existing data, until those tables have actually
-been converted to `Replicated*` engines — **do not raise `clickhouse.replicasCount` above 1**.
-A second replica created against non-replicated tables does not clone the existing data; it
-starts an independent, empty table lineage.
+From chart `3.0.0` the default install is HA: the `sql/*.sql` table definitions are
+path-less `Replicated*` engines, every DDL statement runs `ON CLUSTER '{cluster}'` (so the
+single schema Job propagates schema to every replica via Keeper's distributed DDL queue),
+and the ClickHouse pods carry the same hard per-zone topology spread as the Keeper voters —
+`DoNotSchedule`, so the second replica needs a schedulable node in a second zone or it
+stays `Pending`.
 
-Moving an existing single-replica install to HA is a two-apply sequence with a manual
-conversion in between:
+Fresh installs need no ceremony: both replicas create their tables at the same macro-based
+ZooKeeper path and replicate from the first insert. Dev/small installs set
+`clickhouse.replicasCount: 1` + `keeper.replicasCount: 1` — same engines, same DDL, sized
+down; there is no single-instance engine mode.
 
-1. **Apply #1** (this chart version): Keeper + the macro-based `default_replica_path`
-   ship while `replicasCount` stays `1`. Both are inert for plain `MergeTree` tables — this
+Moving an existing single-replica install with pre-`3.0.0` (plain `MergeTree`) data to HA
+is a two-apply sequence with a manual conversion in between. **Do not raise
+`clickhouse.replicasCount` above 1 — and do not take the `3.0.0` upgrade without pinning it
+at 1 — until the conversion has verified.** A second replica created against non-replicated
+tables does not clone the existing data; it starts an independent, empty table lineage.
+
+1. **Apply #1** (chart `2.3.x`): Keeper + the macro-based `default_replica_path` ship
+   while `replicasCount` stays `1`. Both are inert for plain `MergeTree` tables — this
    apply only prepares the coordination layer the conversion assumes.
 2. **Convert the existing tables in place** using ClickHouse's
    [`convert_to_replicated` flag-file mechanism](https://clickhouse.com/docs/engines/table-engines/mergetree-family/replication#converting-from-mergetree-to-replicatedmergetree)
    (requires ClickHouse ≥ 23.11 and an Atomic database; take a volume snapshot first).
    Verify every table reports `Replicated*` engines, `is_readonly = 0`, and the macro-based
    `zookeeper_path` in `system.replicas` before proceeding.
-3. **Apply #2** (the later chart version): raise `clickhouse.replicasCount` to `2` and ship
-   the `Replicated*` SQL. Because the DDL is path-less and `default_replica_path` is
-   macro-based, the new replica's `CREATE` resolves to the same ZooKeeper path as the
-   converted tables — it registers as a second replica and clones the data.
+3. **Apply #2** (chart ≥ `3.0.0`, `replicasCount: 2`): the operator adds the second
+   replica. Because the DDL is path-less and `default_replica_path` is macro-based, its
+   `ON CLUSTER` `CREATE … IF NOT EXISTS` statements no-op on the converted replica and
+   resolve to the same ZooKeeper path on the new one — it registers as a second replica
+   and clones every part over the interserver port. The new pod reports not-Ready (the
+   `/ready` probe below) only while its tables are readonly — the registration and
+   metadata-attach phase of the clone. `is_readonly` clears once the fetch queue is
+   populated, *before* the queued part fetches complete, so the pod can turn Ready while
+   the historical backfill is still in flight; gate operational waits on
+   `system.replicas` (`active_replicas = 2`, `queue_size` draining to 0), not on pod
+   Ready.
 
 The macro-based replica path is what makes step 3 safe: a converted table keeps its old
 UUID while a freshly created replica gets a new one, so ClickHouse's default
 `{uuid}`-based path would register them as two unrelated replicas that never sync.
 
-Fresh installs with no data to preserve don't need the conversion — deploy the later chart
-version directly with the desired `replicasCount`.
+### Writer-safe readiness (`/ready`)
+
+A replica that loses its Keeper session keeps answering `/ping` with 200 while its
+`Replicated*` tables are readonly (`/replicas_status` also stays 200 in ClickHouse 26.4) —
+and INSERTs routed to it don't fail fast, they hang in `WaitForAsyncInsert` until timeout.
+The chart therefore replaces the pod readiness probe with a custom `http_handlers`
+endpoint, `/ready`, running `SELECT throwIf(count() > 0) FROM system.replicas WHERE
+is_readonly`. It executes as a dedicated passwordless `probe` user — readonly profile,
+config grants allowing `SELECT` on `system.replicas` plus `SHOW TABLES` on `otel_traces.*`
+(row *visibility*: `system.replicas` only shows tables the querying user can see, so
+without it the probe reads an empty table and can never fail) and nothing else —
+unauthenticated to callers, like `/ping`. A readonly replica drops out of the Service
+until it rejoins Keeper.
+
+The probe is writer-safe, not read-complete. A replica joining the cluster is readonly —
+and therefore not-Ready — only through its registration/metadata phase: `is_readonly`
+clears once the replication queue is populated, *before* the queued part fetches run, so
+a new replica can turn Ready (and serve reads) while its historical backfill is still in
+flight. That is correct for writers — a queue-populated replica accepts INSERTs and
+replicates them — but reads can hit a still-backfilling replica, so gate operational
+waits on `system.replicas` (`queue_size` draining to 0), never on pod Ready.
+
+Three consequences to be aware of: a not-Ready replica already counts as disrupted for
+the operator's `maxUnavailable: 1` PDB, so a drain of the *healthy* replica's node is
+refused while the other is readonly (correct, but it changes node-roll behavior);
+`helm --wait` / `kubectl wait --for=condition=Ready` won't return while a pod is still
+readonly; and if *every* replica is readonly at once — Keeper quorum loss, or in the
+single-voter dev shape a Keeper outage outlasting the probe window (~30 s:
+`failureThreshold: 3` × `periodSeconds: 10`) — the Service empties and *reads* are
+blocked too, even though each replica's data is still locally SELECT-able. Pre-3.0.0
+`/ping` readiness kept reads flowing in that state; trading read availability for
+writer safety here is deliberate.
 
 ## Prerequisites
 
@@ -197,12 +243,17 @@ helm dependency build charts/ao-data-platform/
 Wire an `ExternalSecret` for each always-provisioned user at the Fake store, and point the
 `llm-worker` at a worker image. (`readonly_user` and `admin` are off by default; enable and
 wire them the same way under `clickhouse.readonlyUser` / `clickhouse.admin` if you need
-them.) `keeper.replicasCount=1` sizes the Keeper ensemble down to a single voter — the
-default 3 voters require nodes in three availability zones, which a local k3d cluster
-can't satisfy (the extra voters would sit `Pending`).
+them.) `clickhouse.replicasCount=1` + `keeper.replicasCount=1` size the cluster down to a
+single replica and a single voter — the default 2 replicas + 3 voters carry hard per-zone
+spreads that a local k3d cluster can't satisfy (the extra pods would sit `Pending`). Note
+that with a single voter there is no Keeper quorum to fail over to: a Keeper pod outage
+outlasting the readiness window (~30 s) turns the ClickHouse replica readonly and empties
+the ClickHouse Service — reads included — until Keeper returns (see
+[Writer-safe readiness](#writer-safe-readiness-ready)).
 
 ```bash
 helm upgrade --install ao-data-platform charts/ao-data-platform/ -n montecarlo --create-namespace \
+  --set clickhouse.replicasCount=1 \
   --set keeper.replicasCount=1 \
   --set clickhouse.otel.externalSecret.secretStoreRef.name=fake-secret-store \
   --set clickhouse.otel.externalSecret.remoteRef.key=clickhouse-otel-password \
@@ -423,10 +474,11 @@ to the normalized target tables. The stock `default` superuser is removed.
 
 | User | Reads | Writes | Used by | Provisioned |
 |------|-------|--------|---------|-------------|
-| `schema_owner` | `otel_traces.*` | full DDL on `otel_traces.*`, `ALTER` on 7 system-log tables³, `SYSTEM FLUSH LOGS` | schema-migration Job; the MV `DEFINER` | always |
-| `otel` | full read (`restrictGrants=false`, default); `—` when `restrictGrants=true` | `INSERT` on the telemetry source tables when `clickhouse.otel.restrictGrants=true` (otherwise unrestricted) | OTel collector | always |
+| `schema_owner` | `otel_traces.*` | full DDL on `otel_traces.*`, `ALTER` on 7 system-log tables², `SYSTEM FLUSH LOGS`, `CLUSTER` on `*.*`³ | schema-migration Job; the MV `DEFINER` | always |
+| `otel` | full read (`restrictGrants=false`, default); `—` when `restrictGrants=true` | `INSERT` on `otel_traces.otel_traces` when `clickhouse.otel.restrictGrants=true` (otherwise unrestricted) | OTel collector | always |
 | `llm_worker` | `llm_batches`/`llm_inputs`/`llm_results` | `INSERT` on `llm_batches`/`llm_results` | llm-worker Deployment | always |
 | `monte_carlo` | reader bundle¹ | `INSERT` on `llm_inputs`/`llm_batches`/`conversation_eval_scores`/`conversation_cluster_assignments` | Monte Carlo (data-source monitoring + agent observability) | always |
+| `probe` | `system.replicas` + table visibility (`SHOW TABLES` on `otel_traces.*`; no data reads) | — (`readonly=2` profile) | the `/ready` readiness handler (see [Writer-safe readiness](#writer-safe-readiness-ready)) | always (passwordless; no ExternalSecret) |
 | `readonly_user` | reader bundle¹ | — (`readonly=2`, so JDBC `SET` works) | humans / MCP / JDBC clients | `clickhouse.readonlyUser.enabled=true` |
 | `admin` | all | all + user management + `SYSTEM` | break-glass DBA (not service-to-service; loopback-only by default) | `clickhouse.admin.enabled=true` |
 
@@ -435,15 +487,15 @@ to the normalized target tables. The stock `default` superuser is removed.
 monitoring need, plus `system.numbers` for time-bucket / gap-fill queries (e.g. the trace
 time-series). Shared by `monte_carlo` and `readonly_user`.
 
-² **`otel_metrics`** (`otel_traces.otel_metrics`) is created at runtime by the OTel collector's
-metrics exporter, not by the schema migration Job. It has no SQL file under `charts/.../sql/`; the
-`INSERT` grant on it is provisioned unconditionally, and the table appears once the collector has
-written its first metrics payload.
-
-³ **7 system-log tables** = `ALTER` on exactly `system.query_log`, `system.query_thread_log`,
+² **7 system-log tables** = `ALTER` on exactly `system.query_log`, `system.query_thread_log`,
 `system.query_views_log`, `system.part_log`, `system.trace_log`, `system.metric_log`, and
 `system.text_log` — the log tables whose TTLs the schema Job manages. The grant is *not* `system.*`;
 it is scoped to these seven so it cannot touch system tables the Job never modifies.
+
+³ **`CLUSTER`** — every statement the schema Job runs is `ON CLUSTER '{cluster}'`, and ClickHouse
+gates ON CLUSTER queries behind the `CLUSTER` privilege
+(`on_cluster_queries_require_cluster_grant` is on by default in this ClickHouse line). The
+privilege is irreducibly global; it cannot be scoped below `*.*`.
 
 Each password-backed user has an ExternalSecret sourcing its password from your secret store (see the
 per-user `*.externalSecret` values below). Network *reachability* is typically restricted one layer
@@ -530,14 +582,14 @@ helm upgrade ao-data-platform oci://registry-1.docker.io/montecarlodata/ao-data-
 
 | Value | Default | Description |
 |-------|---------|-------------|
-| `clickhouse.replicasCount` | `1` | Number of ClickHouse replicas in the single-shard cluster. Leave at `1` until the tables are `Replicated*` engines — see [ClickHouse replication and Keeper](#clickhouse-replication-and-keeper) for the migration ordering. |
+| `clickhouse.replicasCount` | `2` | Number of ClickHouse replicas in the single-shard cluster. Default is the HA shape (hard per-zone spread); set `1` for dev/single-AZ installs. On installs with pre-existing plain-`MergeTree` data, hold at `1` until the in-place conversion has verified — see [ClickHouse replication and Keeper](#clickhouse-replication-and-keeper). |
 | `clickhouse.storageSize` | `100Gi` | PVC size for ClickHouse data. |
 | `clickhouse.ttlDays` | `30` | Retention in days for the telemetry tables (raw traces, trace-id index, normalized spans) and their conversation-derived annotations (`conversation_eval_scores`, `conversation_cluster_assignments`). Re-applied on every install/upgrade via `ALTER TABLE … MODIFY TTL`. Does **not** govern the `llm_*` worker queue tables (they keep a fixed TTL). See the telemetry-retention note above. |
 | `clickhouse.nodeSelector` | `{}` | Node selector for the ClickHouse pod (wired into the CHI's `podTemplate`) |
 | `clickhouse.tolerations` | `[]` | Tolerations for the ClickHouse pod (wired into the CHI's `podTemplate`) |
 | `clickhouse.otel.secret` | `ao-clickhouse-otel-credentials` | Name of the K8s Secret (created by ESO) with a `password` key |
 | `clickhouse.otel.networksIp` | `["0.0.0.0/0"]` | CIDR list allowed to authenticate as the `otel` user (default open). Reachability is typically restricted at the load balancer; per-caller CH-level scoping is handled separately. |
-| `clickhouse.otel.restrictGrants` | `false` | When `true`, restrict `otel` to `INSERT` on the telemetry source tables (least-privilege ingest). Leave `false` until external readers have been switched to `monte_carlo`. |
+| `clickhouse.otel.restrictGrants` | `false` | When `true`, restrict `otel` to `INSERT` on `otel_traces.otel_traces` (least-privilege ingest). Leave `false` until external readers have been switched to `monte_carlo`. |
 | `clickhouse.otel.externalSecret.secretStoreRef.name` | `""` | Name of the `SecretStore` or `ClusterSecretStore` to use (for the `otel` password) |
 | `clickhouse.otel.externalSecret.secretStoreRef.kind` | `ClusterSecretStore` | Kind of the secret store reference |
 | `clickhouse.otel.externalSecret.remoteRef.key` | `""` | Key in the external secrets backend |

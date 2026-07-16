@@ -5,7 +5,7 @@
 -- target. span_attributes / span_attributes_keys are carried from the root span
 -- to power turn-level attribute filtering downstream — minus the two heaviest
 -- content paths (see the span_attributes column below).
-CREATE TABLE IF NOT EXISTS otel_traces.conversations_normalized
+CREATE TABLE IF NOT EXISTS otel_traces.conversations_normalized ON CLUSTER '{cluster}'
 (
     `service_name` LowCardinality(String),
     `conversation_id` String,
@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS otel_traces.conversations_normalized
     INDEX idx_conversation_id conversation_id TYPE bloom_filter(0.01) GRANULARITY 1,
     INDEX idx_span_attr_keys span_attributes_keys TYPE bloom_filter(0.01) GRANULARITY 1
 )
-ENGINE = ReplacingMergeTree
+ENGINE = ReplicatedReplacingMergeTree
 PARTITION BY toDate(turn_start)
 PRIMARY KEY (service_name, toStartOfMinute(turn_start), conversation_id)
 ORDER BY (service_name, toStartOfMinute(turn_start), conversation_id, trace_id)

@@ -39,19 +39,34 @@ spec:
               set -e
               # Single point of truth for the client invocation (host/auth/TLS),
               # used by the readiness probe, the migration loop, and the TTL step.
+              #
+              # distributed_ddl_task_timeout: every statement in sql/*.sql (and the TTL
+              # ALTERs below) is ON CLUSTER, so the client waits for every replica in the
+              # cluster to execute it. A replica that is still provisioning or running its
+              # initial clone (e.g. pod-1 during the scale-to-2 apply) can legitimately take
+              # longer than the 180s default; the DDL queue executes the entry on it
+              # eventually regardless. 600s + the Job's backoffLimit retries (all DDL here
+              # is idempotent) make the Job robust to that window while still surfacing a
+              # replica that never comes up.
               ch() {
-                clickhouse-client --host clickhouse-otel --user schema_owner --password "${CLICKHOUSE_PASSWORD}"{{ if .Values.tls.enabled }} --secure --port 9440{{ end }} "$@"
+                clickhouse-client --host clickhouse-otel --user schema_owner --password "${CLICKHOUSE_PASSWORD}"{{ if .Values.tls.enabled }} --secure --port 9440{{ end }} --distributed_ddl_task_timeout 600 "$@"
               }
               # MODIFY TTL with materialize_ttl_after_modify=0: update table metadata
               # only — TTL is enforced by normal background merges, avoiding a heavy
-              # full-table mutation on every install/upgrade.
+              # full-table mutation on every install/upgrade. ON CLUSTER so the change
+              # reaches every replica — a replica-local ALTER would let retention drift
+              # between replicas (and, for the host-local system.* log tables below,
+              # never reach the other replica's copy at all).
               modify_ttl() {
-                ch --query "ALTER TABLE $1 MODIFY TTL $2 SETTINGS materialize_ttl_after_modify = 0"
+                ch --query "ALTER TABLE $1 ON CLUSTER '{cluster}' MODIFY TTL $2 SETTINGS materialize_ttl_after_modify = 0"
               }
               # As modify_ttl, but skips tables that don't exist. Used for the
               # system log tables: which ones the operator enables varies (e.g.
               # query_thread_log ships disabled), and a disabled log's table is
               # never created — so an unconditional ALTER would fail UNKNOWN_TABLE.
+              # EXISTS probes only the connected replica, which suffices: the log
+              # config is identical CHI-wide and FLUSH LOGS below runs ON CLUSTER,
+              # so a log table exists either on every replica or on none.
               modify_ttl_if_exists() {
                 if [ "$(ch --query "EXISTS TABLE $1")" = "1" ]; then
                   modify_ttl "$1" "$2"
@@ -59,8 +74,16 @@ spec:
                   echo "  skipping $1 — table absent (log disabled or not yet created)"
                 fi
               }
+              # The wait can legitimately run long (the Job races the operator's
+              # config reconcile), so log progress periodically — a silent loop is
+              # indistinguishable from a hang in kubectl logs.
               echo "Waiting for ClickHouse to accept queries..."
+              attempt=0
               until ch --query "SELECT 1" 2>/dev/null; do
+                attempt=$((attempt + 1))
+                if [ $((attempt % 15)) -eq 0 ]; then
+                  echo "  still waiting after $((attempt * 2))s..."
+                fi
                 sleep 2
               done
               echo "Running schema migrations..."
@@ -92,12 +115,14 @@ spec:
               # system-log table with an inline engine that already carries a
               # TTL, and rejects a separate `<ttl>` setting on top (Code: 36) —
               # see templates/clickhouse-installation.yaml. SYSTEM FLUSH LOGS
-              # first materializes every *enabled* system-log table so we don't
-              # race their lazy creation; modify_ttl_if_exists then skips any
-              # that are disabled (the operator ships some, e.g.
-              # query_thread_log, with remove="1").
+              # first materializes every *enabled* system-log table — ON CLUSTER,
+              # because the log tables are host-local and the ON CLUSTER ALTERs
+              # below execute on every replica — so we don't race their lazy
+              # creation anywhere; modify_ttl_if_exists then skips any that are
+              # disabled (the operator ships some, e.g. query_thread_log, with
+              # remove="1").
               echo "Applying 7-day TTL to system log tables..."
-              ch --query "SYSTEM FLUSH LOGS"
+              ch --query "SYSTEM FLUSH LOGS ON CLUSTER '{cluster}'"
               modify_ttl_if_exists system.query_log "event_date + INTERVAL 7 DAY"
               modify_ttl_if_exists system.query_thread_log "event_date + INTERVAL 7 DAY"
               modify_ttl_if_exists system.query_views_log "event_date + INTERVAL 7 DAY"
