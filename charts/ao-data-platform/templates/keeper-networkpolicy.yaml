@@ -1,0 +1,53 @@
+{{- if .Values.keeper.networkPolicy.enabled }}
+# Network isolation for the Keeper ensemble. Keeper speaks the unauthenticated
+# ZooKeeper protocol: any pod that can reach the client port can read and write the
+# entire coordination tree (and issue the whitelisted four-letter-word commands), so
+# ingress is restricted to the pods that legitimately talk to Keeper. Inert on
+# clusters without a NetworkPolicy engine (e.g. EKS needs the VPC CNI network policy
+# agent enabled).
+#
+# Not listed, deliberately:
+#   - port 9182 (http_control readiness): probed by the kubelet from the node, which
+#     NetworkPolicy engines allow outside of policy; the liveness probe is a pod-local
+#     exec (ruok over loopback) and never crosses the network.
+#   - metrics: the operator configures no Keeper prometheus endpoint and its
+#     metrics-exporter monitors ClickHouse pods only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: keeper-{{ include "ao-data-platform.chkName" . }}
+  labels:
+    {{- include "ao-data-platform.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      clickhouse-keeper.altinity.com/chk: {{ include "ao-data-platform.chkName" . }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # Client port — the ClickHouse server pods are the only Keeper client in this
+    # design. The operator is also allowed: it only dials Keeper directly when a CHI
+    # sets a non-empty zookeeper.root (to pre-create the root znode). This chart's CHI
+    # doesn't, but allowing it is cheap insurance against a hard-to-debug reconcile
+    # hang if that ever changes.
+    - from:
+        - podSelector:
+            matchLabels:
+              clickhouse.altinity.com/chi: {{ include "ao-data-platform.chiName" . }}
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: altinity-clickhouse-operator
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - protocol: TCP
+          port: 2181
+    # Raft — Keeper voters replicating to each other. The operator's generated raft
+    # config uses port 9444 (it overrides the stock image's 9234).
+    - from:
+        - podSelector:
+            matchLabels:
+              clickhouse-keeper.altinity.com/chk: {{ include "ao-data-platform.chkName" . }}
+      ports:
+        - protocol: TCP
+          port: 9444
+{{- end }}

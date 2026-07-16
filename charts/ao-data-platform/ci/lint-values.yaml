@@ -53,3 +53,20 @@ gateway:
         resourceGroupName: ci-placeholder
         subscriptionID: ci-placeholder
         managedIdentityClientID: ci-placeholder
+
+# Exercise the Keeper nodeSelector/tolerations `with` branches in the CHK pod template
+# (skipped at the empty defaults) so the render — CI's template-correctness guard —
+# actually covers them, matching how the consuming terraform pins Keeper to its
+# dedicated node groups. CI placeholders only; never deployed.
+keeper:
+  # Non-default voter count so the CI render proves keeper.replicasCount actually
+  # reaches the CHK's layout.replicasCount — a misnamed key would silently render
+  # the default and Helm would never complain (no values.schema.json).
+  replicasCount: 5
+  nodeSelector:
+    dedicated: keeper
+  tolerations:
+    - key: dedicated
+      operator: Equal
+      value: keeper
+      effect: NoSchedule

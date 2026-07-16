@@ -10,7 +10,15 @@ spec:
       - name: "otel"
         layout:
           shardsCount: 1
-          replicasCount: 1
+          replicasCount: {{ .Values.clickhouse.replicasCount }}
+    # ClickHouse Keeper ensemble backing ReplicatedMergeTree. Points at the operator-
+    # created Keeper client Service (keeper-<chk>, port 2181). Present from this chart
+    # version so the coordination layer is live before any table becomes Replicated;
+    # plain MergeTree tables simply don't use it. See clickhouse-keeper-installation.yaml.
+    zookeeper:
+      nodes:
+        - host: {{ include "ao-data-platform.keeperServiceName" . }}
+          port: 2181
     # Adding a ClickHouse user? Also update values.yaml and templates/external-secret.yaml.
     users:
       otel/password:
@@ -158,6 +166,15 @@ spec:
             key: ca.crt
       {{- end }}
     settings:
+      # Replicated tables register under a macro-based ZooKeeper path (NOT the built-in
+      # {uuid} default). Load-bearing for the in-place MergeTree->Replicated conversion:
+      # a converted table keeps its old UUID while a freshly-created replica gets a new
+      # one, so a {uuid} path would make them two unrelated replicas that never sync.
+      # {cluster}/{shard}/{replica} are operator-injected macros; {database}/{table} are
+      # ClickHouse built-ins — both replicas resolve to the same path and clone. Set now
+      # (harmless while tables are MergeTree) so it's already in place at conversion time.
+      default_replica_path: "/clickhouse/tables/{cluster}/{shard}/{database}/{table}"
+      default_replica_name: "{replica}"
       # Cap CH memory at 80% of the cgroup limit. Requires
       # clickhouse.resources.limits.memory to be set so the ratio resolves
       # to the pod's cgroup limit rather than host RAM.
