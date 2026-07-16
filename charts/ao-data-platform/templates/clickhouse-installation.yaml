@@ -77,7 +77,8 @@ spec:
         # by default in this CH line) — without this the Job fails ACCESS_DENIED on its first
         # statement. The privilege is irreducibly global; it cannot be scoped below *.*.
         - "GRANT CLUSTER ON *.*"
-      # llm_worker — the llm-worker Deployment. Reads the queue, appends results (no mutations).
+      # llm_worker — the llm-worker Deployment. Reads the queue, appends results, and writes its
+      # (cloud, provider) marker to llm_worker_info on startup (for monolith cloud identification).
       llm_worker/password:
         valueFrom:
           secretKeyRef:
@@ -89,8 +90,10 @@ spec:
         - "GRANT SELECT ON otel_traces.llm_batches"
         - "GRANT SELECT ON otel_traces.llm_inputs"
         - "GRANT SELECT ON otel_traces.llm_results"
+        - "GRANT SELECT ON otel_traces.llm_worker_info"
         - "GRANT INSERT ON otel_traces.llm_batches"
         - "GRANT INSERT ON otel_traces.llm_results"
+        - "GRANT INSERT ON otel_traces.llm_worker_info"
       # monte_carlo — Monte Carlo read-only service account + agent queue producer. Shared reader
       # bundle plus the queue/eval-score INSERTs. NO readonly profile: readonly=2 would block these
       # INSERTs, so the read-mostly shape is enforced by grants alone.
