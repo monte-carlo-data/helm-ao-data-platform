@@ -1,0 +1,27 @@
+{{- include "ao-data-platform.gatewayValidate" . }}
+{{- if and .Values.gateway.enabled (eq .Values.gateway.provider "gke") .Values.gateway.gcpBackendSecurityPolicy }}
+# Source-range restriction for the GKE internal L7 Gateway (gke provider only).
+#
+# GKE's Gateway has no source-range annotation (that is the Azure path); instead a
+# regional Cloud Armor security policy is attached to each backend Service via a
+# GCPBackendPolicy. The Terraform module builds the policy from the allowed source
+# CIDRs and passes its name as gateway.gcpBackendSecurityPolicy — empty renders nothing
+# (unrestricted). One policy per Gateway backend (the collector and ClickHouse Services).
+{{- range $b := list (dict "name" "otel-sources" "service" "opentelemetry-collector") (dict "name" "clickhouse-sources" "service" "clickhouse-otel") }}
+---
+apiVersion: networking.gke.io/v1
+kind: GCPBackendPolicy
+metadata:
+  name: {{ include "ao-data-platform.fullname" $ }}-{{ $b.name }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "ao-data-platform.labels" $ | nindent 4 }}
+spec:
+  default:
+    securityPolicy: {{ $.Values.gateway.gcpBackendSecurityPolicy | quote }}
+  targetRef:
+    group: ""
+    kind: Service
+    name: {{ $b.service }}
+{{- end }}
+{{- end }}

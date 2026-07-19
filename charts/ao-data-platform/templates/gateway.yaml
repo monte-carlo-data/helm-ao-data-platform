@@ -6,8 +6,9 @@
 #
 # The Gateway's load balancer is forced internal (private IP only): the collector
 # and ClickHouse endpoints are never publicly reachable and are accessed over private
-# connectivity. The load-balancer annotations below are the cloud provider's
-# (Azure shown) — other providers substitute their own keys.
+# connectivity. How internal-ness + source restriction are expressed is cloud-specific
+# (see gateway.provider) — azure uses LB annotations; gke uses the internal GatewayClass
+# (gke-l7-rilb) plus a GCPBackendPolicy (gateway-gcp-security-policy.yaml).
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:
@@ -16,15 +17,16 @@ metadata:
   labels:
     {{- include "ao-data-platform.labels" . | nindent 4 }}
 spec:
+  {{- if eq .Values.gateway.provider "azure" }}
   infrastructure:
     annotations:
-      # Force the Gateway's load balancer internal (private IP only). Azure key;
-      # other clouds use their own internal-LB annotation.
+      # Force the Gateway's load balancer internal (private IP only).
       service.beta.kubernetes.io/azure-load-balancer-internal: "true"
       {{- with .Values.gateway.allowedSourceRanges }}
       # Restrict the (internal) LB to these source CIDRs (unioned across both listeners).
       service.beta.kubernetes.io/azure-allowed-ip-ranges: {{ join "," . | quote }}
       {{- end }}
+  {{- end }}
   gatewayClassName: {{ required "gateway.className is required when gateway.enabled" .Values.gateway.className }}
   listeners:
     - name: otel

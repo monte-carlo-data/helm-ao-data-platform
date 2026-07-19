@@ -49,6 +49,7 @@ clickhouse:
 # valid config. CI placeholders only; never deployed.
 gateway:
   enabled: true
+  provider: azure
   otelHostname: otel.ci-placeholder.internal
   clickhouseHostname: clickhouse.ci-placeholder.internal
   # Exercise the source-range branch (defaults to [], otherwise never rendered in CI) so the

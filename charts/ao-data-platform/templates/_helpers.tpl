@@ -50,6 +50,15 @@ its guard here once instead of in each template. A no-op when gateway.enabled is
 {{- if not .Values.tls.certManager.createCA -}}
 {{- fail "gateway.enabled currently requires tls.certManager.createCA=true — the Gateway backend-TLS Bundle sources the chart-managed ao-data-platform-ca secret and does not yet support tls.certManager.existingIssuerRef." -}}
 {{- end -}}
+{{- if not (or (eq .Values.gateway.provider "azure") (eq .Values.gateway.provider "gke")) -}}
+{{- fail (printf "gateway.provider must be \"azure\" or \"gke\", got %q." .Values.gateway.provider) -}}
+{{- end -}}
+{{- if and .Values.gateway.allowedSourceRanges (ne .Values.gateway.provider "azure") -}}
+{{- fail "gateway.allowedSourceRanges is the Azure source-range path — set it only when gateway.provider=\"azure\". On gke, use gateway.gcpBackendSecurityPolicy." -}}
+{{- end -}}
+{{- if and .Values.gateway.gcpBackendSecurityPolicy (ne .Values.gateway.provider "gke") -}}
+{{- fail "gateway.gcpBackendSecurityPolicy is the GKE source-range path — set it only when gateway.provider=\"gke\". On azure, use gateway.allowedSourceRanges." -}}
+{{- end -}}
 {{- end -}}
 {{- end }}
 
