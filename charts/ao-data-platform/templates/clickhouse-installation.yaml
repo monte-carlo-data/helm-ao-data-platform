@@ -384,6 +384,12 @@ spec:
             {{- if .Values.tls.enabled }}
             - name: https
               port: 8443
+              {{- if eq .Values.gateway.provider "gke" }}
+              # GKE keys backend re-encryption + the LB health-check scheme off appProtocol,
+              # so mark the ClickHouse HTTPS port: the Gateway's BackendTLSPolicy re-encrypts
+              # to it (the collector's otlp-http port is marked equivalently by the TF module).
+              appProtocol: HTTPS
+              {{- end }}
             - name: tcp-secure
               port: 9440
             {{- else }}

@@ -164,7 +164,14 @@ jobs:
               echo "GCPBackendPolicy did not reference the expected securityPolicy 'ci-armor'."
               exit 1
             fi
-            echo "gcpBackendSecurityPolicy rendered a GCPBackendPolicy per backend correctly."
+            # GKE re-encrypts to a backend only if the Service port is marked appProtocol:
+            # HTTPS. The collector port is marked by the TF module; the ClickHouse https port
+            # is marked by the CHI serviceTemplate here (gke only). Assert it renders.
+            if ! grep -Eq '^              appProtocol: HTTPS$' gw-gke.yaml; then
+              echo "Expected the gke ClickHouse https port to be marked appProtocol: HTTPS."
+              exit 1
+            fi
+            echo "gke source-range + ClickHouse backend appProtocol rendered correctly."
       - run:
           name: Gateway source-range path is provider-exclusive
           # allowedSourceRanges (azure) and gcpBackendSecurityPolicy (gke) must never cross:
