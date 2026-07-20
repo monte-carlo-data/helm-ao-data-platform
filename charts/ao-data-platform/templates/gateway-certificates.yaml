@@ -21,7 +21,10 @@ spec:
       # too so same-named releases in different namespaces don't share one ACME account.
       name: {{ include "ao-data-platform.clusterScopedName" . }}-letsencrypt-account-key
     solvers:
-      # DNS-01 solver is cloud-specific (cert-manager schema); Azure DNS shown.
+      # DNS-01 solver is cloud-specific (cert-manager schema), selected by gateway.provider
+      # (validated azure|gke by gatewayValidate above). Each cloud's Terraform module fills in
+      # its own solver block.
+      {{- if eq .Values.gateway.provider "azure" }}
       - dns01:
           azureDNS:
             hostedZoneName: {{ required "gateway.tls.letsencrypt.azureDNS.hostedZoneName is required" .Values.gateway.tls.letsencrypt.azureDNS.hostedZoneName | quote }}
@@ -30,6 +33,14 @@ spec:
             environment: AzurePublicCloud
             managedIdentity:
               clientID: {{ required "gateway.tls.letsencrypt.azureDNS.managedIdentityClientID is required" .Values.gateway.tls.letsencrypt.azureDNS.managedIdentityClientID | quote }}
+      {{- else if eq .Values.gateway.provider "gke" }}
+      # Google Cloud DNS. cert-manager authenticates with ambient GKE Workload Identity — the
+      # cert-manager KSA is bound to a GCP service account with Cloud DNS write access by the
+      # Terraform module — so only the project (hosting the DNS zone) is needed, no SA key.
+      - dns01:
+          cloudDNS:
+            project: {{ required "gateway.tls.letsencrypt.cloudDNS.project is required" .Values.gateway.tls.letsencrypt.cloudDNS.project | quote }}
+      {{- end }}
 ---
 # The listener Certificate / secretName values are deliberately stable literals: they must
 # match the certificateRefs in gateway.yaml and follow the chart's existing internal-TLS

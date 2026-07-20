@@ -59,11 +59,16 @@ gateway:
     - 192.168.1.0/24
   tls:
     letsencrypt:
+      # Both solver blocks are populated so either provider render (azure by default here,
+      # gke via --set in the gke render step) has its required DNS-01 fields. The chart emits
+      # only the one matching gateway.provider.
       azureDNS:
         hostedZoneName: ci-placeholder.internal
         resourceGroupName: ci-placeholder
         subscriptionID: ci-placeholder
         managedIdentityClientID: ci-placeholder
+      cloudDNS:
+        project: ci-placeholder-project
 
 # Exercise the Keeper nodeSelector/tolerations `with` branches in the CHK pod template
 # (skipped at the empty defaults) so the render — CI's template-correctness guard —

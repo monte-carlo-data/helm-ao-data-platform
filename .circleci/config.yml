@@ -171,7 +171,14 @@ jobs:
               echo "Expected the gke ClickHouse https port to be marked appProtocol: HTTPS."
               exit 1
             fi
-            echo "gke source-range + ClickHouse backend appProtocol rendered correctly."
+            # gke selects the cert-manager DNS-01 solver by provider: assert the ClusterIssuer
+            # emits the cloudDNS solver (not azureDNS) with the passed project.
+            if ! grep -q 'cloudDNS:' gw-gke.yaml || grep -q 'azureDNS:' gw-gke.yaml; then
+              echo "Expected the gke ClusterIssuer to use the cloudDNS DNS-01 solver, not azureDNS."
+              grep -nE 'cloudDNS|azureDNS|dns01' gw-gke.yaml || true
+              exit 1
+            fi
+            echo "gke source-range + ClickHouse appProtocol + cloudDNS solver rendered correctly."
       - run:
           name: Gateway source-range path is provider-exclusive
           # allowedSourceRanges (azure) and gcpBackendSecurityPolicy (gke) must never cross:

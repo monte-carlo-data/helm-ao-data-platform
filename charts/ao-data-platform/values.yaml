@@ -300,13 +300,19 @@ gateway:
     letsencrypt:
       email: ""
       server: https://acme-v02.api.letsencrypt.org/directory
-      # Cloud-specific cert-manager DNS-01 solver config (Azure DNS). Other clouds
-      # supply their own solver block (e.g. cloudDNS, route53).
+      # Cloud-specific cert-manager DNS-01 solver config, selected by gateway.provider. Each
+      # cloud's Terraform module fills in the block for its provider; the other stays empty.
+      # (route53 etc. reserved for future clouds.)
+      # azure:
       azureDNS:
         hostedZoneName: ""
         resourceGroupName: ""
         subscriptionID: ""
         managedIdentityClientID: "" # cert-manager Workload Identity (from the TF module)
+      # gke: cert-manager uses ambient GKE Workload Identity (no SA key); only the project
+      # hosting the Cloud DNS zone is needed.
+      cloudDNS:
+        project: ""
 
 # Altinity ClickHouse Operator
 altinity-clickhouse-operator:
