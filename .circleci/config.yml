@@ -212,6 +212,22 @@ jobs:
             fi
             echo "Provider-exclusive source-range validation correctly rejected both crossovers."
       - run:
+          name: Invalid or missing gateway.provider fails render
+          # gateway.provider is a required, validated field (no default). A logic error in the
+          # gatewayValidate enum guard would render clean for the azure/gke values CI already
+          # exercises; assert an unknown value and the empty default both fail the render.
+          command: |
+            for bad in bogus ""; do
+              if helm template charts/ao-data-platform \
+                -f charts/ao-data-platform/ci/lint-values.yaml \
+                --set-json 'gateway.allowedSourceRanges=[]' \
+                --set gateway.provider="$bad" > /dev/null 2>&1; then
+                echo "Expected render to fail for gateway.provider='${bad}', but it succeeded."
+                exit 1
+              fi
+            done
+            echo "Invalid and empty gateway.provider both correctly failed the render."
+      - run:
           name: Gateway cross-references are internally consistent
           # The gateway templates cross-reference by string literal, so a rename in one file
           # renders clean but breaks TLS at apply. Assert the in-render seams line up. (Service
