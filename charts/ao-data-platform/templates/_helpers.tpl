@@ -67,7 +67,7 @@ LLM-worker provider validation — the single source of truth for the worker pat
 guards. Included at the top of the llm-worker templates so any render enforces the same
 invariants: the provider must be a known enum, and foundry requires its resource (auth is
 Entra ID via AKS Workload Identity, wired separately via serviceAccount.annotations + podLabels).
-When a new provider lands (e.g. vertex), add its guard here once.
+Each provider (bedrock, foundry, vertex) is guarded below; when a new one lands, add its guard here once.
 */}}
 {{- define "ao-data-platform.llmWorkerValidate" -}}
 {{- $p := .Values.llmWorker.provider -}}
