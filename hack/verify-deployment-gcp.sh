@@ -27,6 +27,12 @@
 # Requirements: kubectl (authenticated to the cluster), jq, openssl, base64. The
 # end-to-end check queries ClickHouse as readonly_user, so it requires
 # clickhouse.readonlyUser.enabled=true (same as verify-deployment-aws.sh).
+#
+# Environment variables (optional):
+#   VERIFY_OTEL_RESTRICTED=true  assert the otel user is INSERT-only (post-cutover posture);
+#                                default warns-and-passes for pre-cutover clusters (CHECK 16).
+#   SMOKE_TEST_ATTEMPTS=<n>      poll iterations (x5s) for the end-to-end trace check
+#                                (default 24 = ~120s) (CHECK 19).
 
 set -euo pipefail
 
