@@ -404,6 +404,7 @@ Supply environment-specific configuration in your own values file and pass it wi
 ```yaml
 gateway:
   enabled: true
+  provider: azure                         # required when gateway.enabled — "azure" or "gke"
   otelHostname: otel.<your-zone>          # resolves to the Gateway's private LB IP
   clickhouseHostname: clickhouse.<your-zone>
   tls:
