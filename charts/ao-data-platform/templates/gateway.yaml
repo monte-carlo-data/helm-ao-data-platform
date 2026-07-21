@@ -8,7 +8,7 @@
 # and ClickHouse endpoints are never publicly reachable and are accessed over private
 # connectivity. How internal-ness + source restriction are expressed is cloud-specific
 # (see gateway.provider) — azure uses LB annotations; gke uses the internal GatewayClass
-# (gke-l7-rilb) plus a GCPBackendPolicy (gateway-gcp-security-policy.yaml).
+# (gke-l7-rilb) plus a GCPBackendPolicy (gateway-gke-security-policy.yaml).
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:
