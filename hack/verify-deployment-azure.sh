@@ -448,9 +448,16 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 banner "ClickHouse database 'otel_traces' and tables exist"
 
-# Passwords go via env (CLICKHOUSE_PASSWORD), never --password on argv or through run_cmd's
-# command echo, so they stay out of the process table, apiserver audit, and this output.
-ch_query() { kubectl exec -n "$NS" "$CH_POD" -- env CLICKHOUSE_PASSWORD="$2" clickhouse-client --user "$1" --query "$3" 2>/dev/null || true; }
+# Password ($2) is fed over the exec *stdin* stream, never on the exec command array — so it
+# stays out of clickhouse-client's argv, the ClickHouse query_log, this script's output, AND
+# the kube-apiserver exec audit requestURI (which records the command array, not stdin). The
+# user ($1) and SQL ($3) still travel on argv, but neither is sensitive.
+ch_exec() {  # user pw sql
+  # shellcheck disable=SC2016  # $1/$2/$p are expanded by the inner `sh -c`, not the outer shell — intentional.
+  printf '%s\n' "$2" | kubectl exec -i -n "$NS" "$CH_POD" -- \
+    sh -c 'IFS= read -r p; CLICKHOUSE_PASSWORD="$p" clickhouse-client --user "$1" --query "$2"' _ "$1" "$3"
+}
+ch_query() { ch_exec "$1" "$2" "$3" 2>/dev/null || true; }
 
 DB_EXISTS=$(ch_query "$CH_READ_USER" "$CH_READ_PW" "SELECT name FROM system.databases WHERE name='otel_traces'")
 if [[ "$DB_EXISTS" != "otel_traces" ]]; then
@@ -502,7 +509,7 @@ banner "ClickHouse least-privilege user model"
 # status — a missing secret yields "" and a denied query yields the error text, so the explicit
 # guards/assertions below fire and print instead of the script dying silently mid-check.
 ch_pw() { kubectl get secret -n "$NS" "$1" -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || true; }
-ch_as() { kubectl exec -n "$NS" "$CH_POD" -- env CLICKHOUSE_PASSWORD="$2" clickhouse-client --user "$1" --query "$3" </dev/null 2>&1 || true; }
+ch_as() { ch_exec "$1" "$2" "$3" 2>&1 || true; }
 
 expect_grant() {  # label user pw needle
   if ch_as "$2" "$3" "SHOW GRANTS" | grep -qiF "$4"; then pass "$1"; else fail "$1 — expected grant missing: $4"; fi
@@ -695,12 +702,10 @@ SMOKE_ATTEMPTS="${SMOKE_TEST_ATTEMPTS:-24}"
 SMOKE_COUNT=0
 for ((i = 1; i <= SMOKE_ATTEMPTS; i++)); do
   sleep 5
-  # Password via env (CLICKHOUSE_PASSWORD), not --password on argv, so it stays out of the
-  # pod process table and the kube-apiserver exec audit record (mirrors the AWS ch_as()).
-  SMOKE_COUNT=$(kubectl exec -n "$NS" "$CH_POD" -- \
-    env CLICKHOUSE_PASSWORD="$CH_READ_PW" \
-    clickhouse-client --user "$CH_READ_USER" \
-    --query "SELECT count() FROM otel_traces.otel_traces WHERE TraceId = '${TRACE_ID}'" 2>/dev/null || echo 0)
+  # Password fed over the exec stdin stream via ch_exec (see CHECK 14) — stays out of the pod
+  # process table and the kube-apiserver exec audit requestURI.
+  SMOKE_COUNT=$(ch_exec "$CH_READ_USER" "$CH_READ_PW" \
+    "SELECT count() FROM otel_traces.otel_traces WHERE TraceId = '${TRACE_ID}'" 2>/dev/null || echo 0)
   [[ "$SMOKE_COUNT" =~ ^[0-9]+$ && "$SMOKE_COUNT" -gt 0 ]] && break
 done
 
