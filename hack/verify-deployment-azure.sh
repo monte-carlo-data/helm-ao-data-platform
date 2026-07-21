@@ -323,7 +323,10 @@ pass "All TLS certificates have valid SANs and are not expired."
 # ─────────────────────────────────────────────────────────────────────────────
 banner "StorageClass uses disk.csi.azure.com and Premium SSD v2"
 
-CH_SC=$(kubectl get pvc -n "$NS" --no-headers \
+# Filter to the ClickHouse CHI's own PVCs (label mirrors the CH_POD lookup), so a Keeper or
+# other-component PVC sorting first can't stand in for the ClickHouse data volume this check
+# claims to validate.
+CH_SC=$(kubectl get pvc -n "$NS" -l clickhouse.altinity.com/chi=otel --no-headers \
   -o custom-columns=":spec.storageClassName" | head -1 || true)
 
 if [[ -z "$CH_SC" || "$CH_SC" == "<none>" ]]; then
