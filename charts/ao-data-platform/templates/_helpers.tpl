@@ -38,6 +38,14 @@ Gateway feature validation — the single source of truth for the gateway path's
 guards. Included at the top of every gateway template so ANY gateway render (not just
 gateway.yaml) enforces the same invariants; when a new gateway.tls.source branch lands, add
 its guard here once instead of in each template. A no-op when gateway.enabled is false.
+
+Adding a new gateway.provider is NOT confined to this helper — the provider axis fans out
+across templates. Files to touch when adding one: (1) the provider enum guard below;
+(2) gateway.yaml (provider-specific LB annotations); (3) gateway-certificates.yaml (the
+cert-manager DNS-01 solver); (4) clickhouse-installation.yaml (the backend appProtocol
+marker); (5) new gateway-<provider>-*.yaml files for provider-only resources (cf.
+gateway-gke-security-policy.yaml / gateway-gke-health-check.yaml); (6) the provider's block
+in values.yaml.
 */}}
 {{- define "ao-data-platform.gatewayValidate" -}}
 {{- if .Values.gateway.enabled -}}
