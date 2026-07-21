@@ -365,6 +365,9 @@ llmWorker:
   # Microsoft Foundry / Azure), or "vertex" (Claude on GCP Vertex AI). Selects
   # LLM_PROVIDER + which provider-specific env the deployment renders.
   provider: bedrock
+  # Bedrock (AWS) settings — used when provider is "bedrock". This block is named "aws" (not
+  # "bedrock", unlike the foundry/vertex blocks below) for backward compatibility with existing
+  # Terraform callers that set llmWorker.aws.region.
   aws:
     region: us-east-1
   # Foundry (Azure) settings — required (and only used) when provider is "foundry".
