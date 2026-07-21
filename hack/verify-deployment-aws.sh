@@ -401,7 +401,10 @@ pass "All TLS certificates have valid SANs and are not expired."
 banner "StorageClass is gp3, encrypted, and uses ebs.csi.aws.com"
 
 # Find the StorageClass used by ClickHouse PVCs
-CH_SC=$(kubectl get pvc -n "$NS" --no-headers \
+# Filter to the ClickHouse CHI's own PVCs (label mirrors the CH_POD lookup), so a Keeper or
+# other-component PVC sorting first can't stand in for the ClickHouse data volume this check
+# claims to validate.
+CH_SC=$(kubectl get pvc -n "$NS" -l clickhouse.altinity.com/chi=otel --no-headers \
   -o custom-columns=":spec.storageClassName" | head -1)
 
 if [[ -z "$CH_SC" || "$CH_SC" == "<none>" ]]; then
@@ -877,32 +880,32 @@ echo -e "  ${YELLOW}▸ Using ClickHouse reader 'readonly_user' for schema/data 
 # ─────────────────────────────────────────────────────────────────────────────
 banner "ClickHouse database 'otel_traces' and tables exist"
 
-run_cmd "Databases" \
-  kubectl exec -n "$NS" "$CH_POD" -- \
-    clickhouse-client --user "$CH_READ_USER" --password "$CH_READ_PW" --query "SHOW DATABASES"
+# Password ($2) is fed over the exec *stdin* stream, never on the exec command array — so it
+# stays out of clickhouse-client's argv, the ClickHouse query_log, this script's output (incl.
+# run_cmd's command echo), AND the kube-apiserver exec audit requestURI (which records the
+# command array, not stdin). The user ($1) and SQL ($3) still travel on argv, but neither is
+# sensitive.
+ch_exec() {  # user pw sql
+  # shellcheck disable=SC2016  # $1/$2/$p are expanded by the inner `sh -c`, not the outer shell — intentional.
+  printf '%s\n' "$2" | kubectl exec -i -n "$NS" "$CH_POD" -- \
+    sh -c 'IFS= read -r p; CLICKHOUSE_PASSWORD="$p" clickhouse-client --user "$1" --query "$2"' _ "$1" "$3"
+}
+ch_query() { ch_exec "$1" "$2" "$3" 2>/dev/null || true; }
 
-DB_EXISTS=$(kubectl exec -n "$NS" "$CH_POD" -- \
-  clickhouse-client --user "$CH_READ_USER" --password "$CH_READ_PW" --query "SELECT name FROM system.databases WHERE name='otel_traces'" 2>/dev/null)
-
+DB_EXISTS=$(ch_query "$CH_READ_USER" "$CH_READ_PW" "SELECT name FROM system.databases WHERE name='otel_traces'")
 if [[ -z "$DB_EXISTS" ]]; then
   fail "Database 'otel_traces' does not exist in ClickHouse."
 fi
 
-run_cmd "Tables in otel_traces" \
-  kubectl exec -n "$NS" "$CH_POD" -- \
-    clickhouse-client --user "$CH_READ_USER" --password "$CH_READ_PW" --query "SHOW TABLES FROM otel_traces"
-
-for TABLE in otel_traces otel_traces_trace_id_ts; do
-  TABLE_EXISTS=$(kubectl exec -n "$NS" "$CH_POD" -- \
-    clickhouse-client --user "$CH_READ_USER" --password "$CH_READ_PW" --query "SELECT name FROM system.tables WHERE database='otel_traces' AND name='${TABLE}'" 2>/dev/null)
+for TABLE in otel_traces otel_traces_trace_id_ts llm_worker_info; do
+  TABLE_EXISTS=$(ch_query "$CH_READ_USER" "$CH_READ_PW" "SELECT name FROM system.tables WHERE database='otel_traces' AND name='${TABLE}'")
   if [[ -z "$TABLE_EXISTS" ]]; then
     fail "Table 'otel_traces.${TABLE}' does not exist."
   fi
 done
 
 # Check materialized view
-MV_EXISTS=$(kubectl exec -n "$NS" "$CH_POD" -- \
-  clickhouse-client --user "$CH_READ_USER" --password "$CH_READ_PW" --query "SELECT name FROM system.tables WHERE database='otel_traces' AND name='otel_traces_trace_id_ts_mv'" 2>/dev/null)
+MV_EXISTS=$(ch_query "$CH_READ_USER" "$CH_READ_PW" "SELECT name FROM system.tables WHERE database='otel_traces' AND name='otel_traces_trace_id_ts_mv'")
 if [[ -z "$MV_EXISTS" ]]; then
   fail "Materialized view 'otel_traces.otel_traces_trace_id_ts_mv' does not exist."
 fi
@@ -917,12 +920,7 @@ banner "ClickHouse 'otel' user can authenticate"
 CH_PASSWORD=$(kubectl get secret -n "$NS" ao-clickhouse-otel-credentials \
   -o jsonpath='{.data.password}' | base64 -d)
 
-run_cmd "Authenticating as 'otel' user" \
-  kubectl exec -n "$NS" "$CH_POD" -- \
-    clickhouse-client --user otel --password "$CH_PASSWORD" --query "SELECT 'auth_ok'"
-
-AUTH_RESULT=$(kubectl exec -n "$NS" "$CH_POD" -- \
-  clickhouse-client --user otel --password "$CH_PASSWORD" --query "SELECT 'auth_ok'" 2>/dev/null)
+AUTH_RESULT=$(ch_query otel "$CH_PASSWORD" "SELECT 'auth_ok'")
 
 if [[ "$AUTH_RESULT" != "auth_ok" ]]; then
   fail "ClickHouse 'otel' user authentication failed."
@@ -946,13 +944,22 @@ banner "ClickHouse least-privilege user model"
 # status — a missing secret yields "" and a denied query yields the error text, so the explicit
 # guards/assertions below fire and print instead of the script dying silently mid-check.
 ch_pw() { kubectl get secret -n "$NS" "$1" -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || true; }
-ch_as() { kubectl exec -n "$NS" "$CH_POD" -- env CLICKHOUSE_PASSWORD="$2" clickhouse-client --user "$1" --query "$3" </dev/null 2>&1 || true; }
+ch_as() { ch_exec "$1" "$2" "$3" 2>&1 || true; }
 
 expect_grant() {  # label user pw needle
   if ch_as "$2" "$3" "SHOW GRANTS" | grep -qiF "$4"; then pass "$1"; else fail "$1 — expected grant missing: $4"; fi
 }
 forbid_grant() {  # label user pw needle
-  if ch_as "$2" "$3" "SHOW GRANTS" | grep -qiF "$4"; then fail "$1 — unexpected grant present: $4"; else pass "$1"; fi
+  # Positively confirm SHOW GRANTS actually ran before trusting "needle absent" = grant absent:
+  # a transient exec/auth failure also yields output without the needle, which would false-PASS.
+  local o; o=$(ch_as "$2" "$3" "SHOW GRANTS")
+  if echo "$o" | grep -qiE "exception|access_denied|not enough priv" || ! echo "$o" | grep -qiF "GRANT"; then
+    fail "$1 — could not read grants (SHOW GRANTS failed or returned no grant lines): $o"
+  elif echo "$o" | grep -qiF "$4"; then
+    fail "$1 — unexpected grant present: $4"
+  else
+    pass "$1"
+  fi
 }
 expect_ok() {     # label user pw sql
   local o; o=$(ch_as "$2" "$3" "$4")
@@ -984,6 +991,8 @@ expect_denied  "schema_owner cannot manage users"          schema_owner "$SO_PW"
 # llm_worker — queue read/write only; must NOT read telemetry.
 expect_ok      "llm_worker reads the queue"                llm_worker "$WK_PW" "SELECT count() FROM otel_traces.llm_batches"
 expect_grant   "llm_worker can append results"             llm_worker "$WK_PW" "INSERT ON otel_traces.llm_results"
+expect_ok      "llm_worker reads its cloud/provider marker"  llm_worker "$WK_PW" "SELECT count() FROM otel_traces.llm_worker_info"
+expect_grant   "llm_worker writes its cloud/provider marker" llm_worker "$WK_PW" "INSERT ON otel_traces.llm_worker_info"
 expect_denied  "llm_worker cannot read telemetry"          llm_worker "$WK_PW" "SELECT count() FROM otel_traces.spans_normalized"
 expect_denied  "llm_worker cannot write telemetry"         llm_worker "$WK_PW" "INSERT INTO otel_traces.otel_traces (Timestamp) VALUES (now())"
 
@@ -1119,12 +1128,7 @@ echo ""
 echo -e "  ${YELLOW}▸ Waiting 8 seconds for the batch processor to flush...${RESET}"
 sleep 8
 
-run_cmd "Query ClickHouse for trace ${TRACE_ID}" \
-  kubectl exec -n "$NS" "$CH_POD" -- \
-    clickhouse-client --user "$CH_READ_USER" --password "$CH_READ_PW" --query "SELECT ServiceName, SpanName, TraceId FROM otel_traces.otel_traces WHERE TraceId = '${TRACE_ID}' LIMIT 5"
-
-SMOKE_RESULT=$(kubectl exec -n "$NS" "$CH_POD" -- \
-  clickhouse-client --user "$CH_READ_USER" --password "$CH_READ_PW" --query "SELECT count() FROM otel_traces.otel_traces WHERE TraceId = '${TRACE_ID}'" 2>/dev/null)
+SMOKE_RESULT=$(ch_query "$CH_READ_USER" "$CH_READ_PW" "SELECT count() FROM otel_traces.otel_traces WHERE TraceId = '${TRACE_ID}'")
 
 if [[ "$SMOKE_RESULT" -gt 0 ]] 2>/dev/null; then
   pass "Trace ${TRACE_ID} arrived in ClickHouse (${SMOKE_RESULT} row(s)). End-to-end pipeline is working."
@@ -1181,12 +1185,7 @@ EOJSON2
   echo -e "  ${YELLOW}▸ Waiting 8 seconds for the batch processor to flush...${RESET}"
   sleep 8
 
-  run_cmd "Query ClickHouse for trace ${NLB_TRACE_ID}" \
-    kubectl exec -n "$NS" "$CH_POD" -- \
-      clickhouse-client --user "$CH_READ_USER" --password "$CH_READ_PW" --query "SELECT ServiceName, SpanName, TraceId FROM otel_traces.otel_traces WHERE TraceId = '${NLB_TRACE_ID}' LIMIT 5"
-
-  NLB_SMOKE_RESULT=$(kubectl exec -n "$NS" "$CH_POD" -- \
-    clickhouse-client --user "$CH_READ_USER" --password "$CH_READ_PW" --query "SELECT count() FROM otel_traces.otel_traces WHERE TraceId = '${NLB_TRACE_ID}'" 2>/dev/null)
+  NLB_SMOKE_RESULT=$(ch_query "$CH_READ_USER" "$CH_READ_PW" "SELECT count() FROM otel_traces.otel_traces WHERE TraceId = '${NLB_TRACE_ID}'")
 
   if [[ "$NLB_SMOKE_RESULT" -gt 0 ]] 2>/dev/null; then
     pass "Trace ${NLB_TRACE_ID} sent via OTel NLB arrived in ClickHouse. NLB → OTel → ClickHouse pipeline is working."
