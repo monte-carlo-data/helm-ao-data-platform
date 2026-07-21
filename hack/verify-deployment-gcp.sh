@@ -514,7 +514,16 @@ expect_grant() {  # label user pw needle
   if ch_as "$2" "$3" "SHOW GRANTS" | grep -qiF "$4"; then pass "$1"; else fail "$1 — expected grant missing: $4"; fi
 }
 forbid_grant() {  # label user pw needle
-  if ch_as "$2" "$3" "SHOW GRANTS" | grep -qiF "$4"; then fail "$1 — unexpected grant present: $4"; else pass "$1"; fi
+  # Positively confirm SHOW GRANTS actually ran before trusting "needle absent" = grant absent:
+  # a transient exec/auth failure also yields output without the needle, which would false-PASS.
+  local o; o=$(ch_as "$2" "$3" "SHOW GRANTS")
+  if echo "$o" | grep -qiE "exception|access_denied|not enough priv" || ! echo "$o" | grep -qiF "GRANT"; then
+    fail "$1 — could not read grants (SHOW GRANTS failed or returned no grant lines): $o"
+  elif echo "$o" | grep -qiF "$4"; then
+    fail "$1 — unexpected grant present: $4"
+  else
+    pass "$1"
+  fi
 }
 expect_ok() {     # label user pw sql
   local o; o=$(ch_as "$2" "$3" "$4")
