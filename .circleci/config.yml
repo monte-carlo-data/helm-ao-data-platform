@@ -178,7 +178,21 @@ jobs:
               grep -nE 'cloudDNS|azureDNS|dns01' gw-gke.yaml || true
               exit 1
             fi
-            echo "gke source-range + ClickHouse appProtocol + cloudDNS solver rendered correctly."
+            # HealthCheckPolicy repoints the collector backend's LB health check at the :13133
+            # health_check extension (gke only) — otherwise GKE defaults to HTTPS on the serving
+            # port with path "/", which 404s the OTLP receiver and 503s the listener.
+            if [ "$(grep -c '^kind: HealthCheckPolicy$' gw-gke.yaml)" -ne 1 ]; then
+              echo "Expected exactly 1 HealthCheckPolicy (collector backend)."
+              grep -nE 'HealthCheckPolicy|targetRef|port:|requestPath:' gw-gke.yaml || true
+              exit 1
+            fi
+            if ! grep -Eq '^        port: 13133$' gw-gke.yaml || ! grep -Eq '^        requestPath: /$' gw-gke.yaml \
+               || ! grep -Eq '^    name: opentelemetry-collector$' gw-gke.yaml; then
+              echo "HealthCheckPolicy did not target the collector Service on port 13133 / requestPath /."
+              grep -nE 'HealthCheckPolicy|httpHealthCheck|port:|requestPath:|name:' gw-gke.yaml || true
+              exit 1
+            fi
+            echo "gke source-range + ClickHouse appProtocol + cloudDNS solver + HealthCheckPolicy rendered correctly."
       - run:
           name: Gateway source-range path is provider-exclusive
           # allowedSourceRanges (azure) and gcpBackendSecurityPolicy (gke) must never cross:
