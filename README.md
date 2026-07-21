@@ -433,6 +433,82 @@ For a full post-deploy check, run `hack/verify-deployment-azure.sh -n <namespace
 auto-detects gateway vs internal-LB mode and verifies pods, ClickHouse, the OTel collector,
 certs, and (in gateway mode) the Gateway/HTTPRoute/BackendTLSPolicy resources.
 
+## Deploying to GCP (GKE)
+
+On GKE the chart exposes the collector and ClickHouse through the **GKE Gateway API** using the
+internal regional GatewayClass (`gke-l7-rilb`, set via `gateway.className`), terminating TLS at
+per-hostname HTTPS listeners and re-encrypting to the in-cluster backends. Like the Azure path it
+is **opt-in** (`gateway.enabled=true`, `gateway.provider=gke`) and **disabled by default**, so AWS
+and local installs are unaffected.
+
+The Gateway's load balancer is **always internal** (private IP only) — the collector and ClickHouse
+endpoints are never publicly reachable and are reached over private connectivity.
+
+As with Azure, clients reach the backends over their HTTP interfaces only: the collector takes
+**OTLP/HTTP on 4318**, and ClickHouse over its **HTTPS interface on port 8443** — target
+`https://<clickhouse-host>:8443`. Two GKE-specific pieces differ from Azure:
+
+- **Source-range restriction** is a regional **Cloud Armor** policy attached to each backend via a
+  `GCPBackendPolicy`, named by `gateway.gcpBackendSecurityPolicy` (not the Azure annotation). Leave
+  it empty for no restriction. `gateway.allowedSourceRanges` is the Azure-only path and must stay
+  empty on gke (enforced at render time).
+- **Backend health checks** use a `HealthCheckPolicy` pointing at the collector's `:13133` health
+  endpoint — otherwise the `appProtocol: HTTPS` backend marking makes GKE default to an
+  HTTPS-on-serving-port probe that 404s the OTLP receiver.
+
+### Prerequisites
+
+- A GKE cluster with the **Gateway API** enabled and the internal regional GatewayClass
+  `gke-l7-rilb` (`gateway.className`)
+- [cert-manager](https://cert-manager.io/) and [trust-manager](https://cert-manager.io/docs/trust/trust-manager/),
+  with trust-manager's trust namespace set to the release namespace
+- [External Secrets Operator](https://external-secrets.io/) with a `ClusterSecretStore` for GCP
+  Secret Manager (the ClickHouse user passwords)
+- **Workload Identity Federation** for the cert-manager DNS-01 solver, bound to the Cloud DNS zone
+  (cert-manager uses ambient GKE Workload Identity — no service-account key)
+- A **Cloud DNS** zone for the listener hostnames — Let's Encrypt validates via DNS-01 (DNS records,
+  not endpoint reachability), so it issues publicly-trusted certs even though the endpoints are
+  private. Point `gateway.otelHostname` / `gateway.clickhouseHostname` at the Gateway's private LB IP.
+
+The companion [GCP Terraform module](https://github.com/monte-carlo-data/terraform-google-ao-data-platform)
+provisions all of the above (Gateway API, cert-manager, trust-manager, ESO, Secret Manager, Cloud
+Armor policy, Workload Identity Federation) and renders the matching values; deploying the chart
+standalone means reproducing those prerequisites yourself.
+
+### Enabling the gateway
+
+Supply environment-specific configuration in your own values file and pass it with `-f`:
+
+```yaml
+gateway:
+  enabled: true
+  provider: gke
+  className: gke-l7-rilb
+  otelHostname: otel.<your-zone>          # resolves to the Gateway's private LB IP
+  clickhouseHostname: clickhouse.<your-zone>
+  gcpBackendSecurityPolicy: <cloud-armor-policy-name>   # optional; empty = no source restriction
+  tls:
+    source: letsencrypt                   # only supported source
+    letsencrypt:
+      email: ""                           # optional ACME contact
+      cloudDNS:
+        project: <dns-project-id>         # project hosting the Cloud DNS zone
+```
+
+```bash
+helm dependency build charts/ao-data-platform/
+helm upgrade --install ao-data-platform charts/ao-data-platform/ -n montecarlo --create-namespace \
+  -f my-values.yaml
+```
+
+As on Azure, the Gateway re-encrypts the Gateway→backend hop and **requires `tls.enabled=true`**;
+enabling the gateway with `tls.enabled=false` fails the render. Verify with
+`kubectl get gateway,httproute,certificate -n montecarlo`.
+
+For a full post-deploy check, run `hack/verify-deployment-gcp.sh -n <namespace>` — it verifies
+pods, ClickHouse, the OTel collector, certs, StorageClass, and the Gateway/HTTPRoute/BackendTLSPolicy
++ GCPBackendPolicy/HealthCheckPolicy resources.
+
 ## CI / CD
 
 CircleCI runs on every push:
@@ -502,9 +578,9 @@ Each password-backed user has an ExternalSecret sourcing its password from your 
 per-user `*.externalSecret` values below). Network *reachability* is typically restricted one layer
 up at the load balancer; per-caller CH-user-level network scoping is handled separately.
 
-The `hack/verify-deployment-aws.sh` and `hack/verify-deployment-azure.sh` scripts run their
-ClickHouse data checks as `readonly_user`, so set `clickhouse.readonlyUser.enabled=true` to
-use them.
+The `hack/verify-deployment-aws.sh`, `hack/verify-deployment-azure.sh`, and
+`hack/verify-deployment-gcp.sh` scripts run their ClickHouse data checks as `readonly_user`, so
+set `clickhouse.readonlyUser.enabled=true` to use them.
 
 ### Upgrading an existing install (1.x → 2.0.0)
 
