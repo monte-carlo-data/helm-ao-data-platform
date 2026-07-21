@@ -163,7 +163,7 @@ writer safety here is deliberate.
 - [cert-manager](https://cert-manager.io/) installed in the cluster (for TLS, enabled by default)
 - [External Secrets Operator](https://external-secrets.io/) installed in the cluster
 - A `SecretStore` or `ClusterSecretStore` configured to access your secrets backend (AWS Secrets Manager, Azure Key Vault, Fake provider for local dev, etc.)
-- [trust-manager](https://cert-manager.io/docs/trust/trust-manager/) — **only** for the Azure Gateway path (`gateway.enabled`), which always renders a trust-manager `Bundle` for the Gateway→backend re-encrypt. The [Azure Terraform module](https://github.com/monte-carlo-data/terraform-azurerm-ao-data-platform) installs it; without it, apply fails with a CRD-not-found error.
+- [trust-manager](https://cert-manager.io/docs/trust/trust-manager/) — for the Gateway path (`gateway.enabled`, azure or gke), which always renders a trust-manager `Bundle` for the Gateway→backend re-encrypt. The per-cloud Terraform module ([Azure](https://github.com/monte-carlo-data/terraform-azurerm-ao-data-platform) / [GCP](https://github.com/monte-carlo-data/terraform-google-ao-data-platform)) installs it; without it, apply fails with a CRD-not-found error.
 
 The chart does not ship a default `llmWorker.image` — supply your own (`llmWorker.image.repository` / `llmWorker.image.tag`) or the `llm-worker` Deployment will not start. The public worker image is published as `montecarlodata/ao-llm-worker`.
 
@@ -717,7 +717,7 @@ helm upgrade ao-data-platform oci://registry-1.docker.io/montecarlodata/ao-data-
 | `tls.enabled` | `true` | Enable TLS between services (requires cert-manager) |
 | `tls.certManager.createCA` | `true` | Create a self-signed CA; set to `false` if you have your own issuer |
 | `tls.certManager.existingIssuerRef` | `{}` | Use an existing issuer instead of the generated CA (e.g. `{name: my-issuer, kind: ClusterIssuer}`) |
-| `gateway.enabled` | `false` | Enable the managed AKS Gateway API path (Azure-specific). The Gateway's load balancer is always internal (private IP). See [Deploying to Azure (AKS)](#deploying-to-azure-aks). |
+| `gateway.enabled` | `false` | Enable the internal Gateway API serving path (azure or gke — see `gateway.provider`). The Gateway's load balancer is always internal (private IP). See [Deploying to Azure (AKS)](#deploying-to-azure-aks) / [GCP (GKE)](#deploying-to-gcp-gke). |
 | `gateway.className` | `approuting-istio` | GatewayClass for the managed application-routing add-on. |
 | `gateway.otelHostname` | `""` | Hostname for the OTel collector listener (required when `gateway.enabled`). Must resolve to the Gateway's private LB IP. |
 | `gateway.clickhouseHostname` | `""` | Hostname for the ClickHouse listener (required when `gateway.enabled`). Must resolve to the Gateway's private LB IP. |
