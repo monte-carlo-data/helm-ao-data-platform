@@ -710,7 +710,11 @@ helm upgrade ao-data-platform oci://registry-1.docker.io/montecarlodata/ao-data-
 | `llmWorker.replicaCount` | `1` | Number of `llm-worker` pods — `0` or `1` only (the template rejects `>1`; the worker has no job-claim semantics, so concurrent copies would double-process batches). Set to `0` to pause the worker declaratively (survives `helm upgrade`, unlike a manual `kubectl scale`). |
 | `llmWorker.image.repository` | `""` | Image repository for the `llm-worker` (required — e.g. `montecarlodata/ao-llm-worker`) |
 | `llmWorker.image.tag` | `""` | Image tag for the `llm-worker` |
-| `llmWorker.aws.region` | `us-east-1` | AWS region passed to the `llm-worker` |
+| `llmWorker.provider` | `bedrock` | LLM backend: `bedrock` (Claude on AWS Bedrock), `foundry` (Claude on Microsoft Foundry / Azure), or `vertex` (Claude on GCP Vertex AI). Selects `LLM_PROVIDER` and which provider-specific env the deployment renders. |
+| `llmWorker.aws.region` | `us-east-1` | AWS region passed to the `llm-worker` (bedrock; block named `aws` for backward compatibility). |
+| `llmWorker.foundry.resource` | `""` | Foundry resource name (required when `provider=foundry`). Auth is Entra ID via AKS Workload Identity. |
+| `llmWorker.vertex.project` | `""` | GCP project id for Vertex (required when `provider=vertex`). Auth is ADC via GKE Workload Identity Federation. |
+| `llmWorker.vertex.region` | `global` | Vertex location (`global` = the global endpoint). |
 | `llmWorker.podLabels` | `{}` | Extra labels merged onto the `llm-worker` pod template (e.g. to opt the pod into an identity/admission webhook). |
 | `opentelemetry-collector.service.type` | `ClusterIP` | OTel Collector Service type (`ClusterIP`, `LoadBalancer`) |
 | `opentelemetry-collector.service.annotations` | `{}` | Annotations on the OTel Collector Service (e.g. AWS NLB, external-dns) |
@@ -718,17 +722,20 @@ helm upgrade ao-data-platform oci://registry-1.docker.io/montecarlodata/ao-data-
 | `tls.certManager.createCA` | `true` | Create a self-signed CA; set to `false` if you have your own issuer |
 | `tls.certManager.existingIssuerRef` | `{}` | Use an existing issuer instead of the generated CA (e.g. `{name: my-issuer, kind: ClusterIssuer}`) |
 | `gateway.enabled` | `false` | Enable the internal Gateway API serving path (azure or gke — see `gateway.provider`). The Gateway's load balancer is always internal (private IP). See [Deploying to Azure (AKS)](#deploying-to-azure-aks) / [GCP (GKE)](#deploying-to-gcp-gke). |
-| `gateway.className` | `approuting-istio` | GatewayClass for the managed application-routing add-on. |
+| `gateway.provider` | `""` | Cloud that renders provider-specific Gateway resources: `azure` or `gke`. **Required when `gateway.enabled`** (no default). Selects the source-range mechanism and the cert-manager DNS-01 solver. |
+| `gateway.className` | `approuting-istio` | GatewayClass. Cloud-specific: Azure's managed application-routing add-on by default; set to `gke-l7-rilb` on gke. |
 | `gateway.otelHostname` | `""` | Hostname for the OTel collector listener (required when `gateway.enabled`). Must resolve to the Gateway's private LB IP. |
 | `gateway.clickhouseHostname` | `""` | Hostname for the ClickHouse listener (required when `gateway.enabled`). Must resolve to the Gateway's private LB IP. |
-| `gateway.allowedSourceRanges` | `[]` | CIDRs allowed to reach the Gateway's internal load balancer (renders the `azure-allowed-ip-ranges` annotation). Empty = no source-range restriction. Unioned across both listeners (shared LB). |
+| `gateway.allowedSourceRanges` | `[]` | Azure source-range path: CIDRs allowed to reach the Gateway's internal load balancer (renders the `azure-allowed-ip-ranges` annotation). Empty = no restriction. Set only when `gateway.provider=azure`. |
+| `gateway.gcpBackendSecurityPolicy` | `""` | GKE source-range path: name of a regional Cloud Armor policy attached to each backend via a `GCPBackendPolicy`. Empty = no restriction. Set only when `gateway.provider=gke` (mutually exclusive with `gateway.allowedSourceRanges`). |
 | `gateway.tls.source` | `letsencrypt` | Listener cert source. Only `letsencrypt` is supported; Key Vault (BYO certs) is reserved for a future release. |
 | `gateway.tls.letsencrypt.email` | `""` | ACME contact email (optional; omitted registers a contactless account). |
 | `gateway.tls.letsencrypt.server` | `https://acme-v02.api.letsencrypt.org/directory` | ACME server URL (Let's Encrypt production). |
 | `gateway.tls.letsencrypt.azureDNS.hostedZoneName` | `""` | DNS zone for the DNS-01 solver (required when `gateway.enabled`). |
 | `gateway.tls.letsencrypt.azureDNS.resourceGroupName` | `""` | Resource group of the DNS zone (required when `gateway.enabled`). |
 | `gateway.tls.letsencrypt.azureDNS.subscriptionID` | `""` | Subscription ID of the DNS zone (required when `gateway.enabled`). |
-| `gateway.tls.letsencrypt.azureDNS.managedIdentityClientID` | `""` | cert-manager Workload Identity client ID for the DNS-01 solver (required when `gateway.enabled`). |
+| `gateway.tls.letsencrypt.azureDNS.managedIdentityClientID` | `""` | cert-manager Workload Identity client ID for the DNS-01 solver (azure; required when `gateway.enabled` and `gateway.provider=azure`). |
+| `gateway.tls.letsencrypt.cloudDNS.project` | `""` | GKE DNS-01 solver: project hosting the Cloud DNS zone (cert-manager uses ambient GKE Workload Identity, no key). Required when `gateway.enabled` and `gateway.provider=gke`. |
 
 ### Node scheduling and workload isolation
 
