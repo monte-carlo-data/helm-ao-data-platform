@@ -466,7 +466,7 @@ if [[ "$DB_EXISTS" != "otel_traces" ]]; then
   fail "Database 'otel_traces' does not exist in ClickHouse."
 fi
 
-for TABLE in otel_traces otel_traces_trace_id_ts; do
+for TABLE in otel_traces otel_traces_trace_id_ts llm_worker_info; do
   TABLE_EXISTS=$(ch_query "$CH_READ_USER" "$CH_READ_PW" "SELECT name FROM system.tables WHERE database='otel_traces' AND name='${TABLE}'")
   if [[ "$TABLE_EXISTS" != "$TABLE" ]]; then
     fail "Table 'otel_traces.${TABLE}' does not exist."
@@ -557,6 +557,8 @@ expect_denied  "schema_owner cannot manage users"          schema_owner "$SO_PW"
 # llm_worker — queue read/write only; must NOT read telemetry.
 expect_ok      "llm_worker reads the queue"                llm_worker "$WK_PW" "SELECT count() FROM otel_traces.llm_batches"
 expect_grant   "llm_worker can append results"             llm_worker "$WK_PW" "INSERT ON otel_traces.llm_results"
+expect_ok      "llm_worker reads its cloud/provider marker"  llm_worker "$WK_PW" "SELECT count() FROM otel_traces.llm_worker_info"
+expect_grant   "llm_worker writes its cloud/provider marker" llm_worker "$WK_PW" "INSERT ON otel_traces.llm_worker_info"
 expect_denied  "llm_worker cannot read telemetry"          llm_worker "$WK_PW" "SELECT count() FROM otel_traces.spans_normalized"
 expect_denied  "llm_worker cannot write telemetry"         llm_worker "$WK_PW" "INSERT INTO otel_traces.otel_traces (Timestamp) VALUES (now())"
 
