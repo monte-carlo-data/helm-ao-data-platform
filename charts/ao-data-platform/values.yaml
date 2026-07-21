@@ -278,10 +278,10 @@ gateway:
   # module sets it. Selects the source-range mechanism (azure annotation vs GKE
   # GCPBackendPolicy) and the GKE-only health-check policy.
   provider: ""
-  # GatewayClass. Cloud-specific — this default is Azure's managed application-routing add-on;
-  # on gke set it to "gke-l7-rilb" (the internal regional L7 class; asserted by
-  # hack/verify-deployment-gcp.sh CHECK 13).
-  className: approuting-istio
+  # GatewayClass. Cloud-specific, so it is NOT defaulted to any one cloud — when empty it is
+  # derived from gateway.provider (azure -> approuting-istio, gke -> gke-l7-rilb). Set
+  # explicitly only to override with a custom GatewayClass.
+  className: ""
   # Hostnames for the two listeners. Must resolve to the Gateway's private LB IP (e.g.
   # via a private DNS zone). Let's Encrypt DNS-01 still issues publicly-trusted certs for
   # these names — validation is via DNS records, not endpoint reachability.

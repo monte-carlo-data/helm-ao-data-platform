@@ -482,8 +482,7 @@ Supply environment-specific configuration in your own values file and pass it wi
 ```yaml
 gateway:
   enabled: true
-  provider: gke
-  className: gke-l7-rilb
+  provider: gke                           # className defaults to gke-l7-rilb for gke
   otelHostname: otel.<your-zone>          # resolves to the Gateway's private LB IP
   clickhouseHostname: clickhouse.<your-zone>
   gcpBackendSecurityPolicy: <cloud-armor-policy-name>   # optional; empty = no source restriction
@@ -723,7 +722,7 @@ helm upgrade ao-data-platform oci://registry-1.docker.io/montecarlodata/ao-data-
 | `tls.certManager.existingIssuerRef` | `{}` | Use an existing issuer instead of the generated CA (e.g. `{name: my-issuer, kind: ClusterIssuer}`) |
 | `gateway.enabled` | `false` | Enable the internal Gateway API serving path (azure or gke — see `gateway.provider`). The Gateway's load balancer is always internal (private IP). See [Deploying to Azure (AKS)](#deploying-to-azure-aks) / [GCP (GKE)](#deploying-to-gcp-gke). |
 | `gateway.provider` | `""` | Cloud that renders provider-specific Gateway resources: `azure` or `gke`. **Required when `gateway.enabled`** (no default). Selects the source-range mechanism and the cert-manager DNS-01 solver. |
-| `gateway.className` | `approuting-istio` | GatewayClass. Cloud-specific: Azure's managed application-routing add-on by default; set to `gke-l7-rilb` on gke. |
+| `gateway.className` | `""` | GatewayClass. Cloud-specific — derived from `gateway.provider` when empty (azure → `approuting-istio`, gke → `gke-l7-rilb`). Set only to override with a custom class. |
 | `gateway.otelHostname` | `""` | Hostname for the OTel collector listener (required when `gateway.enabled`). Must resolve to the Gateway's private LB IP. |
 | `gateway.clickhouseHostname` | `""` | Hostname for the ClickHouse listener (required when `gateway.enabled`). Must resolve to the Gateway's private LB IP. |
 | `gateway.allowedSourceRanges` | `[]` | Azure source-range path: CIDRs allowed to reach the Gateway's internal load balancer (renders the `azure-allowed-ip-ranges` annotation). Empty = no restriction. Set only when `gateway.provider=azure`. |

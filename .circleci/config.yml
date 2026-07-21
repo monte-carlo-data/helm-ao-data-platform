@@ -194,6 +194,19 @@ jobs:
             fi
             echo "gke source-range + ClickHouse appProtocol + cloudDNS solver + HealthCheckPolicy rendered correctly."
       - run:
+          name: gateway.className derives from provider when unset
+          # className is not defaulted to any one cloud; when unset it is derived from
+          # gateway.provider. Assert both providers derive their canonical GatewayClass.
+          command: |
+            az=$(helm template charts/ao-data-platform -f charts/ao-data-platform/ci/lint-values.yaml \
+              | grep -E '^  gatewayClassName:' | head -1)
+            echo "$az" | grep -q 'approuting-istio' || { echo "azure did not derive approuting-istio: [$az]"; exit 1; }
+            gk=$(helm template charts/ao-data-platform -f charts/ao-data-platform/ci/lint-values.yaml \
+              --set gateway.provider=gke --set-json 'gateway.allowedSourceRanges=[]' \
+              | grep -E '^  gatewayClassName:' | head -1)
+            echo "$gk" | grep -q 'gke-l7-rilb' || { echo "gke did not derive gke-l7-rilb: [$gk]"; exit 1; }
+            echo "className derives correctly: azure->approuting-istio, gke->gke-l7-rilb."
+      - run:
           name: Gateway source-range path is provider-exclusive
           # allowedSourceRanges (azure) and gcpBackendSecurityPolicy (gke) must never cross:
           # each render below sets the wrong-provider value and must fail.

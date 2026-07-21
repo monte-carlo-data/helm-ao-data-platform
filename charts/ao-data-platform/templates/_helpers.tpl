@@ -71,6 +71,24 @@ in values.yaml.
 {{- end }}
 
 {{/*
+Resolve the Gateway's GatewayClass. Cloud-specific, so it is NOT defaulted to any one cloud in
+values.yaml; when gateway.className is empty it is derived from gateway.provider
+(azure -> approuting-istio, gke -> gke-l7-rilb). An explicit gateway.className overrides the
+derivation (custom / non-default classes). A provider with no mapping fails clearly.
+*/}}
+{{- define "ao-data-platform.gatewayClassName" -}}
+{{- if .Values.gateway.className -}}
+{{- .Values.gateway.className -}}
+{{- else if eq .Values.gateway.provider "azure" -}}
+approuting-istio
+{{- else if eq .Values.gateway.provider "gke" -}}
+gke-l7-rilb
+{{- else -}}
+{{- fail (printf "gateway.className has no default for gateway.provider %q — set gateway.className explicitly." .Values.gateway.provider) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 LLM-worker provider validation — the single source of truth for the worker path's render-time
 guards. Included at the top of the llm-worker templates so any render enforces the same
 invariants: the provider must be a known enum, and foundry requires its resource (auth is

@@ -27,7 +27,7 @@ spec:
       service.beta.kubernetes.io/azure-allowed-ip-ranges: {{ join "," . | quote }}
       {{- end }}
   {{- end }}
-  gatewayClassName: {{ required "gateway.className is required when gateway.enabled" .Values.gateway.className }}
+  gatewayClassName: {{ include "ao-data-platform.gatewayClassName" . }}
   listeners:
     - name: otel
       hostname: {{ required "gateway.otelHostname is required when gateway.enabled" .Values.gateway.otelHostname | quote }}
