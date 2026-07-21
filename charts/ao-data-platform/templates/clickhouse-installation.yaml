@@ -1,3 +1,8 @@
+{{- /* --show-only safety: validate the gateway provider enum even here. This template is
+   cloud-agnostic but carries one gateway.provider-conditional (the gke appProtocol below),
+   so enforcing the same guard the gateway-*.yaml files use keeps an isolated render of just
+   this file from silently emitting a wrong/absent appProtocol for an invalid provider. */ -}}
+{{- include "ao-data-platform.gatewayValidate" . -}}
 apiVersion: "clickhouse.altinity.com/v1"
 kind: "ClickHouseInstallation"
 metadata:
@@ -384,7 +389,7 @@ spec:
             {{- if .Values.tls.enabled }}
             - name: https
               port: 8443
-              {{- if eq .Values.gateway.provider "gke" }}
+              {{- if and .Values.gateway.enabled (eq .Values.gateway.provider "gke") }}
               # GKE keys backend re-encryption + the LB health-check scheme off appProtocol,
               # so mark the ClickHouse HTTPS port: the Gateway's BackendTLSPolicy re-encrypts
               # to it (the collector's otlp-http port is marked equivalently by the TF module).
