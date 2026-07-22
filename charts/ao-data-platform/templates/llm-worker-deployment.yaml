@@ -84,8 +84,9 @@ spec:
               value: {{ .Values.llmWorker.foundry.resource | quote }}
             {{- else if eq .Values.llmWorker.provider "vertex" }}
             # Claude on GCP Vertex AI. Auth is ADC via GKE Workload Identity
-            # Federation — the GCP module grants the worker KSA's WIF principal
-            # roles/aiplatform.user directly (no GCP SA / annotation). The env vars
+            # Federation — the GCP module binds the worker KSA's WIF principal to a
+            # least-privilege Vertex role (aiplatform.endpoints.predict only; no GCP
+            # SA / annotation). The env vars
             # ANTHROPIC_VERTEX_PROJECT_ID + CLOUD_ML_REGION are the AnthropicVertex
             # SDK's native ones (region "global" = the global endpoint). The worker
             # honors the row's model_id (no configured model).

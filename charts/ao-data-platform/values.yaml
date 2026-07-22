@@ -381,8 +381,9 @@ llmWorker:
   # Vertex (GCP) settings — required (and only used) when provider is "vertex".
   # project = the GCP project id; region = the Vertex location ("global" = the
   # global endpoint). Auth is ADC via GKE Workload Identity Federation — the GCP
-  # module grants the worker KSA's WIF principal roles/aiplatform.user directly
-  # (no GCP service account, no annotation needed). Worker honors the row's model_id.
+  # module binds the worker KSA's WIF principal to a least-privilege Vertex role
+  # (aiplatform.endpoints.predict only; no GCP service account, no annotation
+  # needed). Worker honors the row's model_id.
   vertex:
     project: ""
     region: global
