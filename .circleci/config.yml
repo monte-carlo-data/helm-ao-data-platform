@@ -203,9 +203,10 @@ jobs:
             fi
             echo "gke source-range + ClickHouse appProtocol + cloudDNS solver + HealthCheckPolicy rendered correctly."
       - run:
-          name: gateway.className derives from provider when unset
+          name: gateway.className derives from provider, and an explicit value overrides
           # className is not defaulted to any one cloud; when unset it is derived from
-          # gateway.provider. Assert both providers derive their canonical GatewayClass.
+          # gateway.provider. Assert both providers derive their canonical GatewayClass,
+          # and that an explicit className overrides the derived default.
           command: |
             az=$(helm template charts/ao-data-platform -f charts/ao-data-platform/ci/lint-values.yaml \
               | grep -E '^  gatewayClassName:' | head -1)
@@ -214,7 +215,13 @@ jobs:
               --set gateway.provider=gke --set-json 'gateway.allowedSourceRanges=[]' \
               | grep -E '^  gatewayClassName:' | head -1)
             echo "$gk" | grep -q 'gke-l7-rilb' || { echo "gke did not derive gke-l7-rilb: [$gk]"; exit 1; }
-            echo "className derives correctly: azure->approuting-istio, gke->gke-l7-rilb."
+            # Override branch: an explicit className is honored verbatim, not derived.
+            ov=$(helm template charts/ao-data-platform -f charts/ao-data-platform/ci/lint-values.yaml \
+              --set gateway.provider=gke --set gateway.className=my-custom-class \
+              --set-json 'gateway.allowedSourceRanges=[]' \
+              | grep -E '^  gatewayClassName:' | head -1)
+            echo "$ov" | grep -q 'my-custom-class' || { echo "explicit className not honored: [$ov]"; exit 1; }
+            echo "className derives (azure->approuting-istio, gke->gke-l7-rilb) and honors an explicit override."
       - run:
           name: Gateway source-range path is provider-exclusive
           # allowedSourceRanges (azure) and gcpBackendSecurityPolicy (gke) must never cross:
