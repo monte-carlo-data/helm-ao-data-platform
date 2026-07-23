@@ -201,7 +201,14 @@ jobs:
               cat hcp.yaml || true
               exit 1
             fi
-            echo "gke source-range + ClickHouse appProtocol + cloudDNS solver + HealthCheckPolicy rendered correctly."
+            # Azure LB artifacts must never leak into a gke render — a drift in the provider
+            # conditional in gateway.yaml would silently ship azure annotations on gke.
+            if grep -Eq 'azure-load-balancer-internal|azure-allowed-ip-ranges' gw-gke.yaml; then
+              echo "Azure LB annotation leaked into a gke render."
+              grep -nE 'azure-load-balancer-internal|azure-allowed-ip-ranges' gw-gke.yaml || true
+              exit 1
+            fi
+            echo "gke source-range + ClickHouse appProtocol + cloudDNS solver + HealthCheckPolicy rendered correctly (no azure artifacts leaked)."
       - run:
           name: gateway.className derives from provider, and an explicit value overrides
           # className is not defaulted to any one cloud; when unset it is derived from
