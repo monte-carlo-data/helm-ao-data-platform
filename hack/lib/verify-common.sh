@@ -100,11 +100,20 @@ expect_denied() { # label user pw sql
   local o; o=$(ch_as "$2" "$3" "$4")
   if echo "$o" | grep -qiE "access_denied|not enough priv"; then pass "$1"; else fail "$1 — expected ACCESS_DENIED, got: $o"; fi
 }
-expect_rows() {   # label user pw sql — runs a scalar count() query and asserts the result is >= 1
-  local o n; o=$(ch_as "$2" "$3" "$4")
-  if echo "$o" | grep -qiE "exception|access_denied|not enough priv"; then fail "$1 — $o"; fi
-  n=$(printf '%s' "$o" | tr -d '[:space:]')
-  if [[ "$n" =~ ^[0-9]+$ && "$n" -ge 1 ]]; then pass "$1 (${n} row(s))"; else fail "$1 — expected a row (count >= 1), got: $o"; fi
+expect_rows() {   # label user pw sql — polls a scalar count() query, asserting the result is >= 1
+  # Retries a few times before failing: a count() against a Replicated* table can read 0 on the
+  # pinned $CH_POD for a moment right after an insert while replication catches up (e.g. the
+  # llm_worker_info marker under replicasCount: 2). Mirrors the smoke-test's eventual-consistency
+  # poll. A hard error (exception/access-denied) fails immediately — that is not a lag condition.
+  local o n attempts=6
+  for ((i = 1; i <= attempts; i++)); do
+    o=$(ch_as "$2" "$3" "$4")
+    if echo "$o" | grep -qiE "exception|access_denied|not enough priv"; then fail "$1 — $o"; fi
+    n=$(printf '%s' "$o" | tr -d '[:space:]')
+    [[ "$n" =~ ^[0-9]+$ && "$n" -ge 1 ]] && { pass "$1 (${n} row(s))"; return; }
+    [[ "$i" -lt "$attempts" ]] && sleep 2
+  done
+  fail "$1 — expected a row (count >= 1) within ${attempts} attempts, got: $o"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
