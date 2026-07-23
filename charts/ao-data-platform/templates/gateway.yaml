@@ -24,7 +24,13 @@ spec:
       service.beta.kubernetes.io/azure-load-balancer-internal: "true"
       {{- with .Values.gateway.allowedSourceRanges }}
       # Restrict the (internal) LB to these source CIDRs (unioned across both listeners).
+      # azure-allowed-ip-ranges alone only ADDS an NSG allow rule; without the deny-all
+      # companion, Azure's default AllowVnetInBound rule (priority 65000) still permits all
+      # VNet/peered traffic, so the allowlist is a no-op. The deny-all annotation makes
+      # cloud-provider-azure write the deny rule (priority 4095, above AllowVnetInBound) that
+      # actually enforces the restriction.
       service.beta.kubernetes.io/azure-allowed-ip-ranges: {{ join "," . | quote }}
+      service.beta.kubernetes.io/azure-deny-all-except-load-balancer-source-ranges: "true"
       {{- end }}
   {{- end }}
   gatewayClassName: {{ include "ao-data-platform.gatewayClassName" . }}
