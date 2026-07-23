@@ -883,6 +883,9 @@ pass "ClickHouse 'otel' user authenticated successfully."
 # ─────────────────────────────────────────────────────────────────────────────
 # CHECK 31 — ClickHouse least-privilege user model (shared; see lib/verify-common.sh)
 # ─────────────────────────────────────────────────────────────────────────────
+# Expected seeded marker for AWS/EKS: llmWorker.provider=bedrock → cloud=aws.
+VERIFY_LLM_CLOUD=aws
+VERIFY_LLM_PROVIDER=bedrock
 verify_clickhouse_user_model
 
 # ─────────────────────────────────────────────────────────────────────────────

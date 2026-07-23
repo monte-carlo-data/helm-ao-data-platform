@@ -584,6 +584,29 @@ jobs:
               echo "Expected render to fail for vertex with no project, but it succeeded."; exit 1
             fi
             echo "Invalid llmWorker.provider config correctly failed the render."
+      - run:
+          name: schema-job seeds the correct cloud/provider marker per provider
+          # The marker's (cloud, provider) VALUES come from llmWorker.provider via the
+          # llmWorkerCloud helper (bedrock->aws, vertex->gcp, foundry->azure). A swapped branch
+          # would render clean and mis-seed llm_worker_info; assert the exact seeded line per
+          # provider so the mapping is pinned at render time.
+          command: |
+            assert_marker() {  # provider cloud [extra helm --set args...]
+              provider="$1"; cloud="$2"; shift 2
+              helm template charts/ao-data-platform \
+                -f charts/ao-data-platform/ci/lint-values.yaml \
+                --set llmWorker.provider="$provider" "$@" \
+                --show-only templates/schema-job.yaml > marker.yaml
+              if ! grep -qF "INSERT INTO otel_traces.llm_worker_info (cloud, provider) VALUES ('${cloud}', '${provider}')" marker.yaml; then
+                echo "provider=${provider} did not seed the expected marker VALUES ('${cloud}', '${provider}')."
+                grep -n 'llm_worker_info' marker.yaml || echo "(no llm_worker_info INSERT found)"
+                exit 1
+              fi
+            }
+            assert_marker bedrock aws
+            assert_marker foundry azure --set llmWorker.foundry.resource=r
+            assert_marker vertex  gcp   --set llmWorker.vertex.project=p
+            echo "schema-job seeds the correct cloud/provider marker for every provider."
 
   publish-dev:
     docker:

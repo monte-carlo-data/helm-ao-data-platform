@@ -455,6 +455,9 @@ pass "ClickHouse 'otel' user authenticated successfully."
 # ─────────────────────────────────────────────────────────────────────────────
 # CHECK 16 — ClickHouse least-privilege user model (shared; see lib/verify-common.sh)
 # ─────────────────────────────────────────────────────────────────────────────
+# Expected seeded marker for Azure/AKS: llmWorker.provider=foundry → cloud=azure.
+VERIFY_LLM_CLOUD=azure
+VERIFY_LLM_PROVIDER=foundry
 verify_clickhouse_user_model
 
 # ─────────────────────────────────────────────────────────────────────────────

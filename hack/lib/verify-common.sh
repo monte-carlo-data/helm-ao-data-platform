@@ -127,7 +127,9 @@ expect_rows() {   # label user pw sql — polls a scalar count() query, assertin
 # the Service endpoint.
 #
 # Requires $NS and $CH_POD, plus $CH_PASSWORD (otel user) and $CH_READ_PW (readonly_user)
-# set by the caller; reads $VERIFY_OTEL_RESTRICTED.
+# set by the caller; reads $VERIFY_OTEL_RESTRICTED. The caller must also set
+# $VERIFY_LLM_CLOUD / $VERIFY_LLM_PROVIDER to this deployment's expected (cloud, provider)
+# pair (aws/bedrock, azure/foundry, gcp/vertex) — the seeded-marker check asserts those values.
 # ─────────────────────────────────────────────────────────────────────────────
 verify_clickhouse_user_model() {
   banner "ClickHouse least-privilege user model"
@@ -155,9 +157,15 @@ verify_clickhouse_user_model() {
   # llm_worker — queue read/write only; must NOT read telemetry.
   expect_ok      "llm_worker reads the queue"                llm_worker "$WK_PW" "SELECT count() FROM otel_traces.llm_batches"
   expect_grant   "llm_worker can append results"             llm_worker "$WK_PW" "INSERT ON otel_traces.llm_results"
-  # The schema Job seeds a row into llm_worker_info, so assert a row is actually present (not just
-  # that the read is permitted) — a missing seed means the marker was never written.
-  expect_rows    "llm_worker reads its seeded cloud/provider marker" llm_worker "$WK_PW" "SELECT count() FROM otel_traces.llm_worker_info"
+  # The schema Job seeds exactly one row into llm_worker_info carrying this deployment's
+  # (cloud, provider). Assert those specific values are present — not merely that some row exists
+  # — so a swapped llmWorkerCloud mapping (wrong cloud for a provider) is caught here, not only at
+  # render time. The expected pair is cloud-specific, set by the calling per-cloud script.
+  : "${VERIFY_LLM_CLOUD:?VERIFY_LLM_CLOUD must be set by the calling script}"
+  : "${VERIFY_LLM_PROVIDER:?VERIFY_LLM_PROVIDER must be set by the calling script}"
+  expect_rows    "llm_worker reads its seeded ${VERIFY_LLM_CLOUD}/${VERIFY_LLM_PROVIDER} marker" \
+    llm_worker "$WK_PW" \
+    "SELECT count() FROM otel_traces.llm_worker_info WHERE cloud='${VERIFY_LLM_CLOUD}' AND provider='${VERIFY_LLM_PROVIDER}'"
   expect_grant   "llm_worker writes its cloud/provider marker" llm_worker "$WK_PW" "INSERT ON otel_traces.llm_worker_info"
   expect_denied  "llm_worker cannot read telemetry"          llm_worker "$WK_PW" "SELECT count() FROM otel_traces.spans_normalized"
   expect_denied  "llm_worker cannot write telemetry"         llm_worker "$WK_PW" "INSERT INTO otel_traces.otel_traces (Timestamp) VALUES (now())"

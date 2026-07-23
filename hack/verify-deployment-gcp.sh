@@ -498,6 +498,9 @@ pass "ClickHouse 'otel' user authenticated successfully."
 # ─────────────────────────────────────────────────────────────────────────────
 # CHECK 16 — ClickHouse least-privilege user model (shared; see lib/verify-common.sh)
 # ─────────────────────────────────────────────────────────────────────────────
+# Expected seeded marker for GCP/GKE: llmWorker.provider=vertex → cloud=gcp.
+VERIFY_LLM_CLOUD=gcp
+VERIFY_LLM_PROVIDER=vertex
 verify_clickhouse_user_model
 
 # ─────────────────────────────────────────────────────────────────────────────
