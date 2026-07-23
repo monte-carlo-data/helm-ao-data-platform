@@ -139,6 +139,11 @@ expect_rows() {   # label user pw sql — polls a scalar count() query, assertin
 # pair (aws/bedrock, azure/foundry, gcp/vertex) — the seeded-marker check asserts those values.
 # ─────────────────────────────────────────────────────────────────────────────
 verify_clickhouse_user_model() {
+  # Fail loudly if the cluster-state contract is unmet: with $NS or $CH_POD empty, every kubectl
+  # exec below emits a usage error that matches none of expect_ok's failure patterns, so the grant
+  # checks would PASS vacuously against no cluster at all.
+  : "${NS:?NS must be set}"
+  : "${CH_POD:?CH_POD must be set}"
   banner "ClickHouse least-privilege user model"
 
   local SO_PW WK_PW MC_PW AD_PW
