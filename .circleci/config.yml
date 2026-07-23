@@ -186,10 +186,19 @@ jobs:
               grep -nE 'HealthCheckPolicy|targetRef|port:|requestPath:' gw-gke.yaml || true
               exit 1
             fi
-            if ! grep -Eq '^        port: 13133$' gw-gke.yaml || ! grep -Eq '^        requestPath: /$' gw-gke.yaml \
-               || ! grep -Eq '^    name: opentelemetry-collector$' gw-gke.yaml; then
+            # Assert the HealthCheckPolicy's fields in isolation: the combined render also
+            # contains GCPBackendPolicy targetRefs named opentelemetry-collector, so grepping
+            # the whole file would false-pass a mistargeted HealthCheckPolicy.
+            helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --set gateway.provider=gke --set gateway.className=gke-l7-rilb \
+              --set-json 'gateway.allowedSourceRanges=[]' \
+              --set gateway.gcpBackendSecurityPolicy=ci-armor \
+              --show-only templates/gateway-gke-health-check.yaml > hcp.yaml
+            if ! grep -Eq '^        port: 13133$' hcp.yaml || ! grep -Eq '^        requestPath: /$' hcp.yaml \
+               || ! grep -Eq '^    name: opentelemetry-collector$' hcp.yaml; then
               echo "HealthCheckPolicy did not target the collector Service on port 13133 / requestPath /."
-              grep -nE 'HealthCheckPolicy|httpHealthCheck|port:|requestPath:|name:' gw-gke.yaml || true
+              cat hcp.yaml || true
               exit 1
             fi
             echo "gke source-range + ClickHouse appProtocol + cloudDNS solver + HealthCheckPolicy rendered correctly."
