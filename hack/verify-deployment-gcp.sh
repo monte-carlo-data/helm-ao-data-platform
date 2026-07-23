@@ -616,10 +616,15 @@ SEND_RESULT=$(kubectl run -n "$NS" verify-smoke-test-gcp --rm -i --restart=Never
   -H "Content-Type: application/json" \
   -d "$TRACE_JSON" 2>"$SEND_ERR" | grep -oE '\{.*\}' | head -1 || true)
 if grep -qiE "podsecurity|hostNetwork|forbidden|violates" "$SEND_ERR"; then
+  # The send pod never got admitted, so the trace can't arrive — bail now instead of burning the
+  # full ~120s poll below on a request that was never made. The fix is a namespace-label change,
+  # not something more polling will resolve.
   echo -e "  ${YELLOW}⚠ Smoke-test pod creation was rejected — this pod sets hostNetwork:true, which a${RESET}"
   echo -e "  ${YELLOW}    PodSecurity 'baseline'/'restricted' namespace forbids. Relax the namespace's${RESET}"
   echo -e "  ${YELLOW}    pod-security.kubernetes.io/enforce label to run this end-to-end check:${RESET}"
   sed 's/^/    /' "$SEND_ERR"
+  rm -f "$SEND_ERR"
+  fail "Smoke-test pod rejected by PodSecurity — hostNetwork:true is forbidden by this namespace's enforce label. Relax pod-security.kubernetes.io/enforce (or exempt this run) and re-run; not proceeding into the doomed trace poll."
 fi
 rm -f "$SEND_ERR"
 echo "    Response: ${SEND_RESULT}"
