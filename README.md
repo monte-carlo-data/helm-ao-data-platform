@@ -552,7 +552,7 @@ to the normalized target tables. The stock `default` superuser is removed.
 |------|-------|--------|---------|-------------|
 | `schema_owner` | `otel_traces.*` | full DDL on `otel_traces.*`, `ALTER` on 7 system-log tables², `SYSTEM FLUSH LOGS`, `CLUSTER` on `*.*`³ | schema-migration Job; the MV `DEFINER` | always |
 | `otel` | full read (`restrictGrants=false`, default); `—` when `restrictGrants=true` | `INSERT` on `otel_traces.otel_traces` when `clickhouse.otel.restrictGrants=true` (otherwise unrestricted) | OTel collector | always |
-| `llm_worker` | `llm_batches`/`llm_inputs`/`llm_results` | `INSERT` on `llm_batches`/`llm_results` | llm-worker Deployment | always |
+| `llm_worker` | `llm_batches`/`llm_inputs`/`llm_results`/`llm_worker_info` | `INSERT` on `llm_batches`/`llm_results`/`llm_worker_info` | llm-worker Deployment | always |
 | `monte_carlo` | reader bundle¹ | `INSERT` on `llm_inputs`/`llm_batches`/`conversation_eval_scores`/`conversation_cluster_assignments` | Monte Carlo (data-source monitoring + agent observability) | always |
 | `probe` | `system.replicas` + table visibility (`SHOW TABLES` on `otel_traces.*`; no data reads) | — (`readonly=2` profile) | the `/ready` readiness handler (see [Writer-safe readiness](#writer-safe-readiness-ready)) | always (passwordless; no ExternalSecret) |
 | `readonly_user` | reader bundle¹ | — (`readonly=2`, so JDBC `SET` works) | humans / MCP / JDBC clients | `clickhouse.readonlyUser.enabled=true` |
