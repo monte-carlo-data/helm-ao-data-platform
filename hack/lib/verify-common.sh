@@ -100,6 +100,12 @@ expect_denied() { # label user pw sql
   local o; o=$(ch_as "$2" "$3" "$4")
   if echo "$o" | grep -qiE "access_denied|not enough priv"; then pass "$1"; else fail "$1 — expected ACCESS_DENIED, got: $o"; fi
 }
+expect_rows() {   # label user pw sql — runs a scalar count() query and asserts the result is >= 1
+  local o n; o=$(ch_as "$2" "$3" "$4")
+  if echo "$o" | grep -qiE "exception|access_denied|not enough priv"; then fail "$1 — $o"; fi
+  n=$(printf '%s' "$o" | tr -d '[:space:]')
+  if [[ "$n" =~ ^[0-9]+$ && "$n" -ge 1 ]]; then pass "$1 (${n} row(s))"; else fail "$1 — expected a row (count >= 1), got: $o"; fi
+}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ClickHouse least-privilege user model
@@ -140,7 +146,9 @@ verify_clickhouse_user_model() {
   # llm_worker — queue read/write only; must NOT read telemetry.
   expect_ok      "llm_worker reads the queue"                llm_worker "$WK_PW" "SELECT count() FROM otel_traces.llm_batches"
   expect_grant   "llm_worker can append results"             llm_worker "$WK_PW" "INSERT ON otel_traces.llm_results"
-  expect_ok      "llm_worker reads its cloud/provider marker"  llm_worker "$WK_PW" "SELECT count() FROM otel_traces.llm_worker_info"
+  # The schema Job seeds a row into llm_worker_info, so assert a row is actually present (not just
+  # that the read is permitted) — a missing seed means the marker was never written.
+  expect_rows    "llm_worker reads its seeded cloud/provider marker" llm_worker "$WK_PW" "SELECT count() FROM otel_traces.llm_worker_info"
   expect_grant   "llm_worker writes its cloud/provider marker" llm_worker "$WK_PW" "INSERT ON otel_traces.llm_worker_info"
   expect_denied  "llm_worker cannot read telemetry"          llm_worker "$WK_PW" "SELECT count() FROM otel_traces.spans_normalized"
   expect_denied  "llm_worker cannot write telemetry"         llm_worker "$WK_PW" "INSERT INTO otel_traces.otel_traces (Timestamp) VALUES (now())"
