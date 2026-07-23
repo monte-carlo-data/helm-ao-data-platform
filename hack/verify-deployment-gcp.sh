@@ -577,6 +577,11 @@ echo ""
 #   Gateway's backend pods cannot reach the internal VIP at all (verified during the
 #   Phase-0.5 spike), and small reference footprints make that colocation likely —
 #   hostNetwork (node-IP) sourcing works from any node.
+#   hostNetwork:true is a privileged pod field: a namespace enforcing the PodSecurity
+#   "baseline" or "restricted" standard REJECTS this pod at admission with an opaque
+#   "violates PodSecurity" error and the send never runs. If that happens, relax the
+#   namespace's pod-security.kubernetes.io/enforce label (or exempt this run) — see the
+#   hint emitted below on a create failure.
 OTEL_HOST=$(kubectl get httproute -n "$NS" "${GW_NAME}-otel" \
   -o jsonpath='{.spec.hostnames[0]}' 2>/dev/null)
 [[ -z "$OTEL_HOST" ]] && fail "Could not resolve the OTel gateway hostname from HTTPRoute ${GW_NAME}-otel."
@@ -586,12 +591,22 @@ echo "    TraceId: ${TRACE_ID}"
 # --quiet suppresses kubectl's attach/prompt chatter (and the duplicated stream it can
 # emit); grep -oE '\{.*\}' then keeps only the collector's JSON response body, dropping any
 # trailing "pod ... deleted" lifecycle notice that --rm concatenates onto the same line.
+# kubectl's stderr is captured (not /dev/null'd) so a PodSecurity admission rejection of the
+# hostNetwork pod surfaces as an actionable hint instead of a silent empty response.
+SEND_ERR=$(mktemp)
 SEND_RESULT=$(kubectl run -n "$NS" verify-smoke-test-gcp --rm -i --restart=Never --quiet \
   --image=curlimages/curl:8.11.1 \
   --overrides='{"spec":{"hostNetwork":true}}' -- \
   -s -X POST "$SEND_URL" --max-time 30 \
   -H "Content-Type: application/json" \
-  -d "$TRACE_JSON" 2>/dev/null | grep -oE '\{.*\}' | head -1 || true)
+  -d "$TRACE_JSON" 2>"$SEND_ERR" | grep -oE '\{.*\}' | head -1 || true)
+if grep -qiE "podsecurity|hostNetwork|forbidden|violates" "$SEND_ERR"; then
+  echo -e "  ${YELLOW}⚠ Smoke-test pod creation was rejected — this pod sets hostNetwork:true, which a${RESET}"
+  echo -e "  ${YELLOW}    PodSecurity 'baseline'/'restricted' namespace forbids. Relax the namespace's${RESET}"
+  echo -e "  ${YELLOW}    pod-security.kubernetes.io/enforce label to run this end-to-end check:${RESET}"
+  sed 's/^/    /' "$SEND_ERR"
+fi
+rm -f "$SEND_ERR"
 echo "    Response: ${SEND_RESULT}"
 
 echo ""
