@@ -304,6 +304,28 @@ jobs:
               exit 1
             fi
             echo "certificateRefs<->secretName and Bundle<->caCertificateRefs are consistent."
+            # The two gke policy templates (HealthCheckPolicy, GCPBackendPolicy) reference the
+            # collector and ClickHouse Services by string literal, outside the certificateRef
+            # seams above — a rename there renders clean but breaks routing at apply. Render gke
+            # and anchor both names to the rest of the render.
+            helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --set gateway.provider=gke --set gateway.className=gke-l7-rilb \
+              --set-json 'gateway.allowedSourceRanges=[]' \
+              --set gateway.gcpBackendSecurityPolicy=ci-armor > gw-gke.yaml
+            # opentelemetry-collector is rendered by the subchart → static equality: the name the
+            # gke templates target must exist as a real Service.
+            if ! awk '/^kind: Service$/{s=1;next} s&&/^  name: /{if($2=="opentelemetry-collector")f=1; s=0} END{exit !f}' gw-gke.yaml; then
+              echo "No Service named 'opentelemetry-collector' in the gke render — a gke targetRef literal has drifted from the collector Service."
+              exit 1
+            fi
+            # clickhouse-otel is operator-created (not rendered), so anchor it to the HTTPRoute
+            # backendRef it must route to — a rename in one gke template would orphan it.
+            if ! grep -Eq '^        - name: clickhouse-otel$' gw-gke.yaml; then
+              echo "clickhouse-otel is not an HTTPRoute backendRef in the gke render — a service-name literal has drifted."
+              exit 1
+            fi
+            echo "gke Service-name cross-references (opentelemetry-collector, clickhouse-otel) are consistent."
       - run:
           name: llm-worker core labels win over colliding podLabels
           # Guards the round-1 ordering fix (core labels emitted after podLabels, so YAML
