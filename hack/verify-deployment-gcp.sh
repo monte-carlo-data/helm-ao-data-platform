@@ -369,7 +369,7 @@ pass "All PVCs are Bound on pd.csi.storage.gke.io volumes (encrypted at rest by 
 # CHECK 13 — Service load balancers are internal and provisioned
 # ─────────────────────────────────────────────────────────────────────────────
 if [[ "$GATEWAY_MODE" == "true" ]]; then
-  banner "Gateway is programmed with an internal LB, HTTPRoutes, and re-encrypt BackendTLSPolicies"
+  banner "Gateway is programmed with an internal LB, HTTPRoutes, re-encrypt BackendTLSPolicies, and GKE backend policies"
 
   run_cmd "Gateway" kubectl get gateway -n "$NS" "$GW_NAME"
 
@@ -401,7 +401,45 @@ if [[ "$GATEWAY_MODE" == "true" ]]; then
     [[ "$ACCEPTED" != "True" ]] && fail "BackendTLSPolicy ${BTP} is not Accepted (got '${ACCEPTED}')."
   done
 
-  pass "Gateway ${GW_NAME} programmed (internal ${GW_CLASS} @ ${GW_ADDR}), both HTTPRoutes present, BackendTLSPolicies Accepted (re-encrypt active)."
+  # HealthCheckPolicy points the collector backend health check at :13133 (plain HTTP) instead of
+  # the appProtocol: HTTPS default, which 404s the OTLP receiver and 503s the listener. It ships on
+  # every gke deployment (chart: gateway-gke-health-check.yaml), so it must exist and be Attached.
+  # GKE policies (networking.gke.io/v1) report attachment via a top-level "Attached" condition,
+  # unlike the Gateway API BackendTLSPolicy above (which nests conditions under .status.ancestors).
+  HCP_NAME="${GW_NAME}-otel"
+  kubectl get healthcheckpolicy -n "$NS" "$HCP_NAME" >/dev/null 2>&1 \
+    || fail "HealthCheckPolicy ${HCP_NAME} not found — the collector backend health check falls back to an HTTPS-on-serving-port probe that 404s the OTLP receiver."
+  HCP_ATTACHED=$(kubectl get healthcheckpolicy -n "$NS" "$HCP_NAME" \
+    -o jsonpath='{.status.conditions[?(@.type=="Attached")].status}' 2>/dev/null || true)
+  if [[ "$HCP_ATTACHED" != "True" ]]; then
+    run_cmd "HealthCheckPolicy detail (for debugging)" \
+      kubectl describe healthcheckpolicy -n "$NS" "$HCP_NAME"
+    fail "HealthCheckPolicy ${HCP_NAME} is not Attached (got '${HCP_ATTACHED}') — the collector backend health check is not in effect."
+  fi
+
+  # GCPBackendPolicy attaches a Cloud Armor source-range policy to each backend. It renders ONLY
+  # when gateway.gcpBackendSecurityPolicy is set, so absence is a valid (unrestricted) posture —
+  # but a dangling policy that is present yet not Attached fails OPEN (Cloud Armor silently
+  # unenforced), so assert Attached for every one that exists.
+  GBP_NAMES=$(kubectl get gcpbackendpolicy -n "$NS" \
+    -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
+  if [[ -z "$GBP_NAMES" ]]; then
+    echo -e "    no GCPBackendPolicy present — Cloud Armor source-range restriction not configured (gateway.gcpBackendSecurityPolicy empty)"
+    GBP_STATUS="none configured"
+  else
+    for GBP in $GBP_NAMES; do
+      GBP_ATTACHED=$(kubectl get gcpbackendpolicy -n "$NS" "$GBP" \
+        -o jsonpath='{.status.conditions[?(@.type=="Attached")].status}' 2>/dev/null || true)
+      if [[ "$GBP_ATTACHED" != "True" ]]; then
+        run_cmd "GCPBackendPolicy detail (for debugging)" \
+          kubectl describe gcpbackendpolicy -n "$NS" "$GBP"
+        fail "GCPBackendPolicy ${GBP} is not Attached (got '${GBP_ATTACHED}') — Cloud Armor is silently unenforced on this backend."
+      fi
+    done
+    GBP_STATUS="attached (${GBP_NAMES})"
+  fi
+
+  pass "Gateway ${GW_NAME} programmed (internal ${GW_CLASS} @ ${GW_ADDR}), both HTTPRoutes present, BackendTLSPolicies Accepted (re-encrypt active), HealthCheckPolicy ${HCP_NAME} Attached, GCPBackendPolicy ${GBP_STATUS}."
 else
   banner "Gateway presence (the only serving path on GCP)"
   fail "No Gateway found with label app.kubernetes.io/name=ao-data-platform — the internal Gateway (gke-l7-rilb) is the only serving path on GCP. Is gateway.enabled set?"
