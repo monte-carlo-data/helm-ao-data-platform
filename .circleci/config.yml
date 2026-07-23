@@ -336,7 +336,37 @@ jobs:
               echo "clickhouse-otel is not an HTTPRoute backendRef in the gke render — a service-name literal has drifted."
               exit 1
             fi
-            echo "gke Service-name cross-references (opentelemetry-collector, clickhouse-otel) are consistent."
+            # The checks above anchor only the Service/HTTPRoute side, so a typo in a policy
+            # template's OWN targetRef (gateway-gke-security-policy.yaml, gateway-gke-health-check.yaml)
+            # still passes. Render each policy template in isolation and assert its targetRef name
+            # literal(s) — the GCPBackendPolicies target both backends, the HealthCheckPolicy the
+            # collector. (targetRef `name:` is indented 4 spaces; metadata `name:` is 2, so this
+            # can't false-match a resource name.)
+            helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --set gateway.provider=gke --set gateway.className=gke-l7-rilb \
+              --set-json 'gateway.allowedSourceRanges=[]' \
+              --set gateway.gcpBackendSecurityPolicy=ci-armor \
+              --show-only templates/gateway-gke-security-policy.yaml > gbp.yaml
+            for svc in opentelemetry-collector clickhouse-otel; do
+              if ! grep -Eq "^    name: ${svc}$" gbp.yaml; then
+                echo "GCPBackendPolicy targetRef name '${svc}' is missing — a targetRef literal has drifted from its backend Service."
+                grep -nE 'targetRef|name:' gbp.yaml || true
+                exit 1
+              fi
+            done
+            helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --set gateway.provider=gke --set gateway.className=gke-l7-rilb \
+              --set-json 'gateway.allowedSourceRanges=[]' \
+              --set gateway.gcpBackendSecurityPolicy=ci-armor \
+              --show-only templates/gateway-gke-health-check.yaml > hcp-xref.yaml
+            if ! grep -Eq '^    name: opentelemetry-collector$' hcp-xref.yaml; then
+              echo "HealthCheckPolicy targetRef name 'opentelemetry-collector' is missing — the targetRef literal has drifted from the collector Service."
+              grep -nE 'targetRef|name:' hcp-xref.yaml || true
+              exit 1
+            fi
+            echo "gke Service-name cross-references (opentelemetry-collector, clickhouse-otel) and policy targetRef literals are consistent."
       - run:
           name: llm-worker core labels win over colliding podLabels
           # Guards the round-1 ordering fix (core labels emitted after podLabels, so YAML
