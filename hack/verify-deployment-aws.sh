@@ -40,10 +40,7 @@ svc_annotations() {
   kubectl get svc -n "$NS" "$svc" -o json 2>/dev/null | jq '.metadata.annotations'
 }
 
-svc_annotation() {
-  local svc="$1" key="$2"
-  kubectl get svc -n "$NS" "$svc" -o json 2>/dev/null | jq -r ".metadata.annotations[\"${key}\"] // empty"
-}
+# svc_annotation (single annotation, injection-safe --arg form) lives in lib/verify-common.sh.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CHECK 1 — Pods healthy

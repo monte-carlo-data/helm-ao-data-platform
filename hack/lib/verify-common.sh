@@ -77,6 +77,13 @@ ch_query() { ch_exec "$1" "$2" "$3" 2>/dev/null || true; }
 ch_pw() { kubectl get secret -n "$NS" "$1" -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || true; }
 ch_as() { ch_exec "$1" "$2" "$3" 2>&1 || true; }
 
+# Read a single annotation value off a Service, "" if absent. The key travels through jq as a
+# --arg (a data binding), never interpolated into the filter string — so a key containing jq
+# metacharacters can't alter the query. Requires $NS.
+svc_annotation() {  # svc key
+  kubectl get svc -n "$NS" "$1" -o json 2>/dev/null | jq -r --arg k "$2" '.metadata.annotations[$k] // empty' || true
+}
+
 expect_grant() {  # label user pw needle
   if ch_as "$2" "$3" "SHOW GRANTS" | grep -qiF "$4"; then pass "$1"; else fail "$1 — expected grant missing: $4"; fi
 }

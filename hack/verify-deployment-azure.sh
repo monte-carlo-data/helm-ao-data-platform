@@ -41,10 +41,7 @@ while getopts "n:" opt; do
 done
 [[ -z "$NS" ]] && usage
 
-svc_annotation() {
-  local svc="$1" key="$2"
-  kubectl get svc -n "$NS" "$svc" -o json 2>/dev/null | jq -r --arg k "$key" '.metadata.annotations[$k] // empty' || true
-}
+# svc_annotation (injection-safe, --arg form) lives in lib/verify-common.sh.
 
 # Detect managed-Gateway mode vs the internal-LB path — the module supports both, and the
 # TLS/LB checks branch on it. Gateway mode terminates TLS at the managed Gateway (on an
