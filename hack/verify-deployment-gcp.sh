@@ -418,15 +418,27 @@ if [[ "$GATEWAY_MODE" == "true" ]]; then
   fi
 
   # GCPBackendPolicy attaches a Cloud Armor source-range policy to each backend. It renders ONLY
-  # when gateway.gcpBackendSecurityPolicy is set, so absence is a valid (unrestricted) posture —
-  # but a dangling policy that is present yet not Attached fails OPEN (Cloud Armor silently
-  # unenforced), so assert Attached for every one that exists.
+  # when gateway.gcpBackendSecurityPolicy is set, so all-absent is a valid (unrestricted) posture.
+  # But when the policy IS configured the chart emits exactly two — one per Gateway backend — so a
+  # partial set (only one present) would leave the other backend silently unprotected while the
+  # loop still PASSed. When ANY is present, assert both expected policies exist (and nothing else),
+  # then that each is Attached (a present-but-unattached policy fails OPEN, Cloud Armor unenforced).
   GBP_NAMES=$(kubectl get gcpbackendpolicy -n "$NS" \
     -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
   if [[ -z "$GBP_NAMES" ]]; then
     echo -e "    no GCPBackendPolicy present — Cloud Armor source-range restriction not configured (gateway.gcpBackendSecurityPolicy empty)"
     GBP_STATUS="none configured"
   else
+    # The two policy names derive from the fullname helper (= $GW_NAME), one per backend.
+    for EXPECTED_GBP in "${GW_NAME}-otel-sources" "${GW_NAME}-clickhouse-sources"; do
+      if ! echo " $GBP_NAMES " | grep -qF " ${EXPECTED_GBP} "; then
+        fail "GCPBackendPolicy '${EXPECTED_GBP}' is missing — Cloud Armor is configured but not attached to every backend, leaving one silently unprotected. Found: ${GBP_NAMES}"
+      fi
+    done
+    GBP_COUNT=$(echo "$GBP_NAMES" | wc -w | tr -d '[:space:]')
+    if [[ "$GBP_COUNT" -ne 2 ]]; then
+      fail "Expected exactly 2 GCPBackendPolicies (${GW_NAME}-otel-sources, ${GW_NAME}-clickhouse-sources); found ${GBP_COUNT}: ${GBP_NAMES}"
+    fi
     for GBP in $GBP_NAMES; do
       GBP_ATTACHED=$(kubectl get gcpbackendpolicy -n "$NS" "$GBP" \
         -o jsonpath='{.status.conditions[?(@.type=="Attached")].status}' 2>/dev/null || true)
