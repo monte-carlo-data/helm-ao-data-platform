@@ -273,17 +273,28 @@ tls:
 # supplies the GatewayClass, the internal-LB add-on, and the cert-manager identity.
 gateway:
   enabled: false
-  # GatewayClass. Cloud-specific — this default is Azure's managed application-routing add-on.
-  className: approuting-istio
+  # Cloud that renders provider-specific Gateway resources: "azure" or "gke". REQUIRED when
+  # gateway.enabled — there is no default (no cloud is privileged); each cloud's Terraform
+  # module sets it. Selects the source-range mechanism (azure annotation vs GKE
+  # GCPBackendPolicy) and the GKE-only health-check policy.
+  provider: ""
+  # GatewayClass. Cloud-specific, so it is NOT defaulted to any one cloud — when empty it is
+  # derived from gateway.provider (azure -> approuting-istio, gke -> gke-l7-rilb). Set
+  # explicitly only to override with a custom GatewayClass.
+  className: ""
   # Hostnames for the two listeners. Must resolve to the Gateway's private LB IP (e.g.
   # via a private DNS zone). Let's Encrypt DNS-01 still issues publicly-trusted certs for
   # these names — validation is via DNS records, not endpoint reachability.
   otelHostname: ""
   clickhouseHostname: ""
-  # Restrict the Gateway's (internal) load balancer to these source CIDRs. Empty = no
-  # restriction (any client with network reach to the private LB). Unioned across both
-  # listeners (shared LB). Rendered as the cloud provider's source-range LB annotation.
+  # Restrict the Gateway's (internal) load balancer to source CIDRs. Empty = no restriction
+  # (any client with network reach to the private LB). The mechanism is provider-specific:
+  #   - azure: allowedSourceRanges (CIDRs) → azure-allowed-ip-ranges LB annotation.
+  #   - gke:   gcpBackendSecurityPolicy (the name of a regional Cloud Armor policy the
+  #            Terraform module builds from the CIDRs) → a GCPBackendPolicy per backend.
+  # Set only the one matching gateway.provider; the other must stay empty (enforced at render).
   allowedSourceRanges: []
+  gcpBackendSecurityPolicy: ""
   tls:
     # letsencrypt is the only supported source. A BYO-cert source is reserved for a
     # future release; any other value fails at render time.
@@ -291,13 +302,19 @@ gateway:
     letsencrypt:
       email: ""
       server: https://acme-v02.api.letsencrypt.org/directory
-      # Cloud-specific cert-manager DNS-01 solver config (Azure DNS). Other clouds
-      # supply their own solver block (e.g. cloudDNS, route53).
+      # Cloud-specific cert-manager DNS-01 solver config, selected by gateway.provider. Each
+      # cloud's Terraform module fills in the block for its provider; the other stays empty.
+      # (route53 etc. reserved for future clouds.)
+      # azure:
       azureDNS:
         hostedZoneName: ""
         resourceGroupName: ""
         subscriptionID: ""
         managedIdentityClientID: "" # cert-manager Workload Identity (from the TF module)
+      # gke: cert-manager uses ambient GKE Workload Identity (no SA key); only the project
+      # hosting the Cloud DNS zone is needed.
+      cloudDNS:
+        project: ""
 
 # Altinity ClickHouse Operator
 altinity-clickhouse-operator:
@@ -344,8 +361,33 @@ llmWorker:
   image:
     repository: ""
     tag: ""
+  # LLM backend: "bedrock" (Claude on AWS Bedrock, configured via the llmWorker.aws.*
+  # block — see the naming note below), "foundry" (Claude on Microsoft Foundry / Azure,
+  # llmWorker.foundry.*), or "vertex" (Claude on GCP Vertex AI, llmWorker.vertex.*).
+  # Selects LLM_PROVIDER + which provider-specific env the deployment renders.
+  provider: bedrock
+  # Bedrock (AWS) settings — used when provider is "bedrock". This block is named "aws" (not
+  # "bedrock", unlike the foundry/vertex blocks below) for backward compatibility with existing
+  # Terraform callers that set llmWorker.aws.region.
   aws:
     region: us-east-1
+  # Foundry (Azure) settings — required (and only used) when provider is "foundry".
+  # resource = the Foundry resource name; the AnthropicFoundry SDK builds
+  # https://<resource>.services.ai.azure.com/anthropic/ from it. Auth is Entra ID
+  # via AKS Workload Identity (no key) — set the managed-identity client-id on
+  # serviceAccount.annotations ("azure.workload.identity/client-id") and the
+  # "azure.workload.identity/use": "true" label on podLabels (Terraform wires both).
+  foundry:
+    resource: ""
+  # Vertex (GCP) settings — required (and only used) when provider is "vertex".
+  # project = the GCP project id; region = the Vertex location ("global" = the
+  # global endpoint). Auth is ADC via GKE Workload Identity Federation — the GCP
+  # module binds the worker KSA's WIF principal to a least-privilege Vertex role
+  # (aiplatform.endpoints.predict only; no GCP service account, no annotation
+  # needed). Worker honors the row's model_id.
+  vertex:
+    project: ""
+    region: global
   serviceAccount:
     annotations: {}
   # Additional labels for the worker pod template — set per-environment as needed

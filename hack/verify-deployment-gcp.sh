@@ -1,25 +1,38 @@
 #!/usr/bin/env bash
 #
-# verify-deployment-azure.sh — Post-deployment verification for the ao-data-platform
-# Helm chart on Azure (AKS). The Azure/AKS counterpart to verify-deployment-aws.sh
-# (AWS/EKS) in this directory; pure kubectl, no cloud CLI required.
+# verify-deployment-gcp.sh — Post-deployment verification for the ao-data-platform
+# Helm chart on GCP (GKE). The GKE counterpart to verify-deployment-{aws,azure}.sh
+# in this directory; pure kubectl, no cloud CLI required.
 #
-# Mirrors the AWS script's checks (pods, ClickHouse operator/StatefulSet, OTel collector,
+# Mirrors the Azure script's checks (pods, ClickHouse operator/StatefulSet, OTel collector,
 # schema job, ExternalSecret sync, cert-manager Issuers/Certificates, TLS secrets, the
 # ClickHouse database/schema + materialized views, and the least-privilege user model) and
-# adapts the cloud-coupled ones for Azure:
-#   - StorageClass: ebs.csi.aws.com/gp3 → disk.csi.azure.com/Premium SSD v2
-#   - Ingress: AWS NLB Service annotations → the managed Gateway API
-#     (Gateway/HTTPRoute/BackendTLSPolicy) in gateway mode, or the internal-LB
-#     Service annotation otherwise — auto-detected.
+# adapts the cloud-coupled ones for GKE:
+#   - StorageClass: disk.csi.azure.com/PremiumV2 → pd.csi.storage.gke.io with
+#     type pd-ssd (default) or hyperdisk-balanced (provisioned IOPS/throughput).
+#   - Ingress: the internal Gateway (gke-l7-rilb) is the ONLY serving path — the
+#     Gateway must exist, be Programmed, and hold a PRIVATE (RFC1918) address.
+#   - Smoke test: the OTLP send pod runs hostNetwork — on GKE a pod-IP client
+#     colocated with an LB backend pod cannot reach the internal Gateway VIP
+#     (unlike AKS, where in-cluster hairpin works), and small reference
+#     footprints make that colocation likely.
 # A final end-to-end trace-ingestion test proves data flows OTLP → collector → ClickHouse.
+# NOTE: llm-worker readiness is intentionally not asserted (matches the other clouds) —
+# a crashlooping worker (e.g. a provider the image does not support yet) surfaces only
+# as a restart warning in CHECK 1.
 #
 # Usage:
-#   ./verify-deployment-azure.sh -n <namespace>
+#   ./verify-deployment-gcp.sh -n <namespace>
 #
 # Requirements: kubectl (authenticated to the cluster), jq, openssl, base64. The
 # end-to-end check queries ClickHouse as readonly_user, so it requires
 # clickhouse.readonlyUser.enabled=true (same as verify-deployment-aws.sh).
+#
+# Environment variables (optional):
+#   VERIFY_OTEL_RESTRICTED=true  assert the otel user is INSERT-only (post-cutover posture);
+#                                default warns-and-passes for pre-cutover clusters (CHECK 16).
+#   SMOKE_TEST_ATTEMPTS=<n>      poll iterations (x5s) for the end-to-end trace check
+#                                (default 24 = ~120s) (CHECK 19).
 
 set -euo pipefail
 
@@ -40,8 +53,6 @@ while getopts "n:" opt; do
   esac
 done
 [[ -z "$NS" ]] && usage
-
-# svc_annotation (injection-safe, --arg form) lives in lib/verify-common.sh.
 
 # Detect managed-Gateway mode vs the internal-LB path — the module supports both, and the
 # TLS/LB checks branch on it. Gateway mode terminates TLS at the managed Gateway (on an
@@ -282,9 +293,9 @@ done
 pass "All TLS certificates have valid SANs and are not expired."
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHECK 11 — StorageClass is Azure Disk Premium SSD v2
+# CHECK 11 — StorageClass is GCE Persistent Disk / Hyperdisk
 # ─────────────────────────────────────────────────────────────────────────────
-banner "StorageClass uses disk.csi.azure.com and Premium SSD v2"
+banner "StorageClass uses pd.csi.storage.gke.io with pd-ssd or hyperdisk-balanced"
 
 # Filter to the ClickHouse CHI's own PVCs (label mirrors the CH_POD lookup), so a Keeper or
 # other-component PVC sorting first can't stand in for the ClickHouse data volume this check
@@ -300,31 +311,38 @@ run_cmd "StorageClass '${CH_SC}' details" \
   kubectl get storageclass "$CH_SC" -o yaml
 
 SC_PROVISIONER=$(kubectl get storageclass "$CH_SC" -o jsonpath='{.provisioner}' || true)
-SC_SKU=$(kubectl get storageclass "$CH_SC" -o jsonpath='{.parameters.skuName}' || true)
-SC_IOPS=$(kubectl get storageclass "$CH_SC" -o jsonpath='{.parameters.DiskIOPSReadWrite}' || true)
-SC_MBPS=$(kubectl get storageclass "$CH_SC" -o jsonpath='{.parameters.DiskMBpsReadWrite}' || true)
+SC_TYPE=$(kubectl get storageclass "$CH_SC" -o jsonpath='{.parameters.type}' || true)
+SC_IOPS=$(kubectl get storageclass "$CH_SC" -o jsonpath='{.parameters.provisioned-iops-on-create}' || true)
+SC_TPUT=$(kubectl get storageclass "$CH_SC" -o jsonpath='{.parameters.provisioned-throughput-on-create}' || true)
+SC_RECLAIM=$(kubectl get storageclass "$CH_SC" -o jsonpath='{.reclaimPolicy}' || true)
 
-if [[ "$SC_PROVISIONER" != "disk.csi.azure.com" ]]; then
-  fail "StorageClass provisioner is '${SC_PROVISIONER}', expected 'disk.csi.azure.com'."
+if [[ "$SC_PROVISIONER" != "pd.csi.storage.gke.io" ]]; then
+  fail "StorageClass provisioner is '${SC_PROVISIONER}', expected 'pd.csi.storage.gke.io'."
 fi
-if [[ "$SC_SKU" != PremiumV2_* ]]; then
-  fail "StorageClass skuName is '${SC_SKU}', expected a Premium SSD v2 SKU (e.g. PremiumV2_LRS)."
+if [[ "$SC_TYPE" != "pd-ssd" && "$SC_TYPE" != "hyperdisk-balanced" ]]; then
+  fail "StorageClass type is '${SC_TYPE}', expected 'pd-ssd' or 'hyperdisk-balanced'."
 fi
-# PremiumV2 provisions IOPS/throughput explicitly (they don't scale with size), so the class
-# must set them.
-if [[ -z "$SC_IOPS" || -z "$SC_MBPS" ]]; then
-  fail "StorageClass '${CH_SC}' is PremiumV2 but missing DiskIOPSReadWrite/DiskMBpsReadWrite (got iops='${SC_IOPS}', throughput='${SC_MBPS}')."
+if [[ "$SC_RECLAIM" != "Retain" ]]; then
+  fail "StorageClass reclaimPolicy is '${SC_RECLAIM}', expected 'Retain' (data must survive claim deletion)."
+fi
+# pd-ssd performance scales with size (no provisioning keys); hyperdisk provisions explicitly.
+if [[ "$SC_TYPE" == "pd-ssd" && ( -n "$SC_IOPS" || -n "$SC_TPUT" ) ]]; then
+  fail "StorageClass '${CH_SC}' is pd-ssd but carries Hyperdisk provisioning keys (iops='${SC_IOPS}', throughput='${SC_TPUT}')."
 fi
 
-pass "StorageClass '${CH_SC}' uses disk.csi.azure.com with SKU '${SC_SKU}' (${SC_IOPS} IOPS / ${SC_MBPS} MB/s)."
+if [[ "$SC_TYPE" == "hyperdisk-balanced" ]]; then
+  pass "StorageClass '${CH_SC}' uses pd.csi.storage.gke.io / hyperdisk-balanced (${SC_IOPS:-default} IOPS / ${SC_TPUT:-default} throughput), Retain."
+else
+  pass "StorageClass '${CH_SC}' uses pd.csi.storage.gke.io / pd-ssd, Retain."
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHECK 12 — PVCs bound on Azure managed disks
+# CHECK 12 — PVCs bound on GCE persistent disks
 # ─────────────────────────────────────────────────────────────────────────────
-# Azure managed disks are encrypted at rest by default (platform-managed keys),
+# GCE persistent disks are encrypted at rest by default (Google-managed keys),
 # so there is no per-volume encryption flag to assert as on AWS — confirming the
-# PVs are azuredisk CSI volumes is the equivalent signal.
-banner "PersistentVolumeClaims are Bound on Azure managed disks"
+# PVs are PD CSI volumes is the equivalent signal.
+banner "PersistentVolumeClaims are Bound on GCE persistent disks"
 
 run_cmd "PVCs in namespace" \
   kubectl get pvc -n "$NS"
@@ -340,18 +358,18 @@ fi
 PV_NAMES=$(kubectl get pvc -n "$NS" --no-headers -o custom-columns=":spec.volumeName")
 for PV in $PV_NAMES; do
   PV_DRIVER=$(kubectl get pv "$PV" -o jsonpath='{.spec.csi.driver}' 2>/dev/null || true)
-  if [[ "$PV_DRIVER" != "disk.csi.azure.com" ]]; then
-    fail "PV ${PV} CSI driver is '${PV_DRIVER}', expected 'disk.csi.azure.com'."
+  if [[ "$PV_DRIVER" != "pd.csi.storage.gke.io" ]]; then
+    fail "PV ${PV} CSI driver is '${PV_DRIVER}', expected 'pd.csi.storage.gke.io'."
   fi
 done
 
-pass "All PVCs are Bound on disk.csi.azure.com volumes (encrypted at rest by default)."
+pass "All PVCs are Bound on pd.csi.storage.gke.io volumes (encrypted at rest by default)."
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CHECK 13 — Service load balancers are internal and provisioned
 # ─────────────────────────────────────────────────────────────────────────────
 if [[ "$GATEWAY_MODE" == "true" ]]; then
-  banner "Gateway is programmed with an internal LB, HTTPRoutes, and re-encrypt BackendTLSPolicies"
+  banner "Gateway is programmed with an internal LB, HTTPRoutes, re-encrypt BackendTLSPolicies, and GKE backend policies"
 
   run_cmd "Gateway" kubectl get gateway -n "$NS" "$GW_NAME"
 
@@ -364,6 +382,14 @@ if [[ "$GATEWAY_MODE" == "true" ]]; then
   [[ -z "$GW_ADDR" ]] && fail "Gateway ${GW_NAME} has no assigned LB address."
   echo -e "    gateway LB address: ${GW_ADDR}"
 
+  # gke-l7-rilb is internal BY CLASS — assert both the class and that the
+  # programmed address is actually RFC1918 (never a public VIP).
+  GW_CLASS=$(kubectl get gateway -n "$NS" "$GW_NAME" -o jsonpath='{.spec.gatewayClassName}' 2>/dev/null || true)
+  [[ "$GW_CLASS" != "gke-l7-rilb" ]] && fail "Gateway class is '${GW_CLASS}', expected 'gke-l7-rilb' (the internal regional class)."
+  if ! echo "$GW_ADDR" | grep -qE '^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)'; then
+    fail "Gateway address ${GW_ADDR} is not an RFC1918 private IP — the LB must never be public."
+  fi
+
   for HR in "${GW_NAME}-otel" "${GW_NAME}-clickhouse"; do
     kubectl get httproute -n "$NS" "$HR" >/dev/null 2>&1 || fail "HTTPRoute ${HR} not found."
   done
@@ -375,28 +401,60 @@ if [[ "$GATEWAY_MODE" == "true" ]]; then
     [[ "$ACCEPTED" != "True" ]] && fail "BackendTLSPolicy ${BTP} is not Accepted (got '${ACCEPTED}')."
   done
 
-  pass "Gateway ${GW_NAME} programmed (internal LB ${GW_ADDR}), both HTTPRoutes present, BackendTLSPolicies Accepted (re-encrypt active)."
+  # HealthCheckPolicy points the collector backend health check at :13133 (plain HTTP) instead of
+  # the appProtocol: HTTPS default, which 404s the OTLP receiver and 503s the listener. It ships on
+  # every gke deployment (chart: gateway-gke-health-check.yaml), so it must exist and be Attached.
+  # GKE policies (networking.gke.io/v1) report attachment via a top-level "Attached" condition,
+  # unlike the Gateway API BackendTLSPolicy above (which nests conditions under .status.ancestors).
+  HCP_NAME="${GW_NAME}-otel"
+  kubectl get healthcheckpolicy -n "$NS" "$HCP_NAME" >/dev/null 2>&1 \
+    || fail "HealthCheckPolicy ${HCP_NAME} not found — the collector backend health check falls back to an HTTPS-on-serving-port probe that 404s the OTLP receiver."
+  HCP_ATTACHED=$(kubectl get healthcheckpolicy -n "$NS" "$HCP_NAME" \
+    -o jsonpath='{.status.conditions[?(@.type=="Attached")].status}' 2>/dev/null || true)
+  if [[ "$HCP_ATTACHED" != "True" ]]; then
+    run_cmd "HealthCheckPolicy detail (for debugging)" \
+      kubectl describe healthcheckpolicy -n "$NS" "$HCP_NAME"
+    fail "HealthCheckPolicy ${HCP_NAME} is not Attached (got '${HCP_ATTACHED}') — the collector backend health check is not in effect."
+  fi
+
+  # GCPBackendPolicy attaches a Cloud Armor source-range policy to each backend. It renders ONLY
+  # when gateway.gcpBackendSecurityPolicy is set, so all-absent is a valid (unrestricted) posture.
+  # But when the policy IS configured the chart emits exactly two — one per Gateway backend — so a
+  # partial set (only one present) would leave the other backend silently unprotected while the
+  # loop still PASSed. When ANY is present, assert both expected policies exist (and nothing else),
+  # then that each is Attached (a present-but-unattached policy fails OPEN, Cloud Armor unenforced).
+  GBP_NAMES=$(kubectl get gcpbackendpolicy -n "$NS" \
+    -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
+  if [[ -z "$GBP_NAMES" ]]; then
+    echo -e "    no GCPBackendPolicy present — Cloud Armor source-range restriction not configured (gateway.gcpBackendSecurityPolicy empty)"
+    GBP_STATUS="none configured"
+  else
+    # The two policy names derive from the fullname helper (= $GW_NAME), one per backend.
+    for EXPECTED_GBP in "${GW_NAME}-otel-sources" "${GW_NAME}-clickhouse-sources"; do
+      if ! echo " $GBP_NAMES " | grep -qF " ${EXPECTED_GBP} "; then
+        fail "GCPBackendPolicy '${EXPECTED_GBP}' is missing — Cloud Armor is configured but not attached to every backend, leaving one silently unprotected. Found: ${GBP_NAMES}"
+      fi
+    done
+    GBP_COUNT=$(echo "$GBP_NAMES" | wc -w | tr -d '[:space:]')
+    if [[ "$GBP_COUNT" -ne 2 ]]; then
+      fail "Expected exactly 2 GCPBackendPolicies (${GW_NAME}-otel-sources, ${GW_NAME}-clickhouse-sources); found ${GBP_COUNT}: ${GBP_NAMES}"
+    fi
+    for GBP in $GBP_NAMES; do
+      GBP_ATTACHED=$(kubectl get gcpbackendpolicy -n "$NS" "$GBP" \
+        -o jsonpath='{.status.conditions[?(@.type=="Attached")].status}' 2>/dev/null || true)
+      if [[ "$GBP_ATTACHED" != "True" ]]; then
+        run_cmd "GCPBackendPolicy detail (for debugging)" \
+          kubectl describe gcpbackendpolicy -n "$NS" "$GBP"
+        fail "GCPBackendPolicy ${GBP} is not Attached (got '${GBP_ATTACHED}') — Cloud Armor is silently unenforced on this backend."
+      fi
+    done
+    GBP_STATUS="attached (${GBP_NAMES})"
+  fi
+
+  pass "Gateway ${GW_NAME} programmed (internal ${GW_CLASS} @ ${GW_ADDR}), both HTTPRoutes present, BackendTLSPolicies Accepted (re-encrypt active), HealthCheckPolicy ${HCP_NAME} Attached, GCPBackendPolicy ${GBP_STATUS}."
 else
-  banner "ClickHouse and OTel Services are internal LBs with an assigned IP"
-
-  for SVC in clickhouse-otel opentelemetry-collector; do
-    echo ""
-    echo -e "  ${YELLOW}▸ Service ${SVC}${RESET}"
-
-    INTERNAL=$(svc_annotation "$SVC" "service.beta.kubernetes.io/azure-load-balancer-internal")
-    if [[ "$INTERNAL" != "true" ]]; then
-      fail "Service ${SVC} is missing the azure-load-balancer-internal=true annotation (got '${INTERNAL}')."
-    fi
-
-    LB_IP=$(kubectl get svc -n "$NS" "$SVC" \
-      -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
-    if [[ -z "$LB_IP" ]]; then
-      fail "Service ${SVC} has no loadBalancer ingress IP — the internal LB may not be provisioned yet."
-    fi
-    echo -e "    internal LB IP: ${LB_IP}"
-  done
-
-  pass "ClickHouse and OTel Services are internal load balancers with assigned IPs."
+  banner "Gateway presence (the only serving path on GCP)"
+  fail "No Gateway found with label app.kubernetes.io/name=ao-data-platform — the internal Gateway (gke-l7-rilb) is the only serving path on GCP. Is gateway.enabled set?"
 fi
 
 # Read-only ClickHouse credential, reused by the schema + least-privilege checks and the
@@ -452,9 +510,9 @@ pass "ClickHouse 'otel' user authenticated successfully."
 # ─────────────────────────────────────────────────────────────────────────────
 # CHECK 16 — ClickHouse least-privilege user model (shared; see lib/verify-common.sh)
 # ─────────────────────────────────────────────────────────────────────────────
-# Expected seeded marker for Azure/AKS: llmWorker.provider=foundry → cloud=azure.
-VERIFY_LLM_CLOUD=azure
-VERIFY_LLM_PROVIDER=foundry
+# Expected seeded marker for GCP/GKE: llmWorker.provider=vertex → cloud=gcp.
+VERIFY_LLM_CLOUD=gcp
+VERIFY_LLM_PROVIDER=vertex
 verify_clickhouse_user_model
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -525,35 +583,50 @@ EOJSON
 )
 
 echo ""
-# Default (gateway mode): send through the gateway hostname, exercising the true agent
-# ingress path end-to-end — publicly-trusted TLS terminate → HTTPRoute → BackendTLSPolicy
-# re-encrypt → collector. The gateway's Let's Encrypt cert is trusted, so no -k. As a
-# bonus, the ephemeral pod's VNet source IP traverses the LB source-range restriction, so
-# a success also confirms the restriction admits in-VNet clients.
-#   Notes: relies on in-cluster DNS resolving the public hostname (CoreDNS → upstream) and
-#   on internal-LB hairpin; both hold on AKS. Falls back to the collector's in-cluster
-#   endpoint (self-signed, -k) in the internal-LB path, which has no gateway hostname.
-if [[ "$GATEWAY_MODE" == "true" ]]; then
-  OTEL_HOST=$(kubectl get httproute -n "$NS" "${GW_NAME}-otel" \
-    -o jsonpath='{.spec.hostnames[0]}' 2>/dev/null)
-  [[ -z "$OTEL_HOST" ]] && fail "Could not resolve the OTel gateway hostname from HTTPRoute ${GW_NAME}-otel."
-  SEND_URL="https://${OTEL_HOST}/v1/traces"
-  CURL_OPTS="-s"
-  echo -e "  ${YELLOW}▸ Sending a test trace via the gateway (${OTEL_HOST})${RESET}"
-else
-  SEND_URL="https://opentelemetry-collector:4318/v1/traces"
-  CURL_OPTS="-sk"
-  echo -e "  ${YELLOW}▸ Sending a test trace to the collector (in-cluster internal-LB path)${RESET}"
-fi
+# Send through the gateway hostname, exercising the true agent ingress path end-to-end —
+# publicly-trusted TLS terminate → HTTPRoute → BackendTLSPolicy re-encrypt → collector.
+# The gateway's Let's Encrypt cert is trusted, so no -k. As a bonus, the send pod's
+# node-subnet source IP traverses the Cloud Armor source-range restriction, so a success
+# also confirms the restriction admits in-VPC clients.
+#   GKE-specific: the pod runs hostNetwork. A pod-IP client colocated with one of the
+#   Gateway's backend pods cannot reach the internal VIP at all (verified during the
+#   Phase-0.5 spike), and small reference footprints make that colocation likely —
+#   hostNetwork (node-IP) sourcing works from any node.
+#   hostNetwork:true is a privileged pod field: a namespace enforcing the PodSecurity
+#   "baseline" or "restricted" standard REJECTS this pod at admission with an opaque
+#   "violates PodSecurity" error and the send never runs. If that happens, relax the
+#   namespace's pod-security.kubernetes.io/enforce label (or exempt this run) — see the
+#   hint emitted below on a create failure.
+OTEL_HOST=$(kubectl get httproute -n "$NS" "${GW_NAME}-otel" \
+  -o jsonpath='{.spec.hostnames[0]}' 2>/dev/null)
+[[ -z "$OTEL_HOST" ]] && fail "Could not resolve the OTel gateway hostname from HTTPRoute ${GW_NAME}-otel."
+SEND_URL="https://${OTEL_HOST}/v1/traces"
+echo -e "  ${YELLOW}▸ Sending a test trace via the gateway (${OTEL_HOST}) from a hostNetwork pod${RESET}"
 echo "    TraceId: ${TRACE_ID}"
 # --quiet suppresses kubectl's attach/prompt chatter (and the duplicated stream it can
 # emit); grep -oE '\{.*\}' then keeps only the collector's JSON response body, dropping any
 # trailing "pod ... deleted" lifecycle notice that --rm concatenates onto the same line.
-SEND_RESULT=$(kubectl run -n "$NS" verify-smoke-test-azure --rm -i --restart=Never --quiet \
-  --image=curlimages/curl:8.11.1 -- \
-  "$CURL_OPTS" -X POST "$SEND_URL" --max-time 30 \
+# kubectl's stderr is captured (not /dev/null'd) so a PodSecurity admission rejection of the
+# hostNetwork pod surfaces as an actionable hint instead of a silent empty response.
+SEND_ERR=$(mktemp)
+SEND_RESULT=$(kubectl run -n "$NS" verify-smoke-test-gcp --rm -i --restart=Never --quiet \
+  --image=curlimages/curl:8.11.1 \
+  --overrides='{"spec":{"hostNetwork":true}}' -- \
+  -s -X POST "$SEND_URL" --max-time 30 \
   -H "Content-Type: application/json" \
-  -d "$TRACE_JSON" 2>/dev/null | grep -oE '\{.*\}' | head -1 || true)
+  -d "$TRACE_JSON" 2>"$SEND_ERR" | grep -oE '\{.*\}' | head -1 || true)
+if grep -qiE "podsecurity|hostNetwork|forbidden|violates" "$SEND_ERR"; then
+  # The send pod never got admitted, so the trace can't arrive — bail now instead of burning the
+  # full ~120s poll below on a request that was never made. The fix is a namespace-label change,
+  # not something more polling will resolve.
+  echo -e "  ${YELLOW}⚠ Smoke-test pod creation was rejected — this pod sets hostNetwork:true, which a${RESET}"
+  echo -e "  ${YELLOW}    PodSecurity 'baseline'/'restricted' namespace forbids. Relax the namespace's${RESET}"
+  echo -e "  ${YELLOW}    pod-security.kubernetes.io/enforce label to run this end-to-end check:${RESET}"
+  sed 's/^/    /' "$SEND_ERR"
+  rm -f "$SEND_ERR"
+  fail "Smoke-test pod rejected by PodSecurity — hostNetwork:true is forbidden by this namespace's enforce label. Relax pod-security.kubernetes.io/enforce (or exempt this run) and re-run; not proceeding into the doomed trace poll."
+fi
+rm -f "$SEND_ERR"
 echo "    Response: ${SEND_RESULT}"
 
 echo ""

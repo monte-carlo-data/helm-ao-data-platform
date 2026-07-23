@@ -131,6 +131,17 @@ spec:
               modify_ttl_if_exists system.metric_log "event_date + INTERVAL 7 DAY"
               modify_ttl_if_exists system.text_log "event_date + INTERVAL 7 DAY"
               echo "System log TTL configuration complete."
+
+              # Seed the llm_worker_info marker so the monolith can resolve this
+              # deployment's cloud immediately — before the llm-worker's first startup
+              # write, which remains the authoritative source. The table is
+              # ReplacingMergeTree(updated_at), so this is idempotent across re-runs and
+              # the worker's later write (newer updated_at) overwrites it. schema_owner
+              # already holds INSERT on otel_traces.* (see clickhouse-installation.yaml);
+              # the Replicated engine fans the row out to all replicas without ON CLUSTER.
+              echo "Seeding llm_worker_info marker (cloud={{ include "ao-data-platform.llmWorkerCloud" . }}, provider={{ .Values.llmWorker.provider }})..."
+              ch --query "INSERT INTO otel_traces.llm_worker_info (cloud, provider) VALUES ('{{ include "ao-data-platform.llmWorkerCloud" . }}', '{{ .Values.llmWorker.provider }}')"
+              echo "llm_worker_info marker seeded."
           env:
             - name: CLICKHOUSE_PASSWORD
               valueFrom:

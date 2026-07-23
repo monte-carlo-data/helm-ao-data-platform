@@ -38,6 +38,14 @@ Gateway feature validation — the single source of truth for the gateway path's
 guards. Included at the top of every gateway template so ANY gateway render (not just
 gateway.yaml) enforces the same invariants; when a new gateway.tls.source branch lands, add
 its guard here once instead of in each template. A no-op when gateway.enabled is false.
+
+Adding a new gateway.provider is NOT confined to this helper — the provider axis fans out
+across templates. Files to touch when adding one: (1) the provider enum guard below;
+(2) gateway.yaml (provider-specific LB annotations); (3) gateway-certificates.yaml (the
+cert-manager DNS-01 solver); (4) clickhouse-installation.yaml (the backend appProtocol
+marker); (5) new gateway-<provider>-*.yaml files for provider-only resources (cf.
+gateway-gke-security-policy.yaml / gateway-gke-health-check.yaml); (6) the provider's block
+in values.yaml.
 */}}
 {{- define "ao-data-platform.gatewayValidate" -}}
 {{- if .Values.gateway.enabled -}}
@@ -50,6 +58,75 @@ its guard here once instead of in each template. A no-op when gateway.enabled is
 {{- if not .Values.tls.certManager.createCA -}}
 {{- fail "gateway.enabled currently requires tls.certManager.createCA=true — the Gateway backend-TLS Bundle sources the chart-managed ao-data-platform-ca secret and does not yet support tls.certManager.existingIssuerRef." -}}
 {{- end -}}
+{{- if not (or (eq .Values.gateway.provider "azure") (eq .Values.gateway.provider "gke")) -}}
+{{- fail (printf "gateway.provider must be \"azure\" or \"gke\", got %q." .Values.gateway.provider) -}}
+{{- end -}}
+{{- if and .Values.gateway.allowedSourceRanges (ne .Values.gateway.provider "azure") -}}
+{{- fail "gateway.allowedSourceRanges is the Azure source-range path — set it only when gateway.provider=\"azure\". On gke, use gateway.gcpBackendSecurityPolicy." -}}
+{{- end -}}
+{{- if and .Values.gateway.gcpBackendSecurityPolicy (ne .Values.gateway.provider "gke") -}}
+{{- fail "gateway.gcpBackendSecurityPolicy is the GKE source-range path — set it only when gateway.provider=\"gke\". On azure, use gateway.allowedSourceRanges." -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Resolve the Gateway's GatewayClass. Cloud-specific, so it is NOT defaulted to any one cloud in
+values.yaml; when gateway.className is empty it is derived from gateway.provider
+(azure -> approuting-istio, gke -> gke-l7-rilb). An explicit gateway.className overrides the
+derivation (custom / non-default classes). A provider with no mapping fails clearly.
+*/}}
+{{- define "ao-data-platform.gatewayClassName" -}}
+{{- if .Values.gateway.className -}}
+{{- .Values.gateway.className -}}
+{{- else if eq .Values.gateway.provider "azure" -}}
+approuting-istio
+{{- else if eq .Values.gateway.provider "gke" -}}
+gke-l7-rilb
+{{- else -}}
+{{- fail (printf "gateway.className has no default for gateway.provider %q — set gateway.className explicitly." .Values.gateway.provider) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+LLM-worker provider validation — the single source of truth for the worker path's render-time
+guards. Included at the top of the llm-worker templates so any render enforces the same
+invariants: the provider must be a known enum, and foundry requires its resource (auth is
+Entra ID via AKS Workload Identity, wired separately via serviceAccount.annotations + podLabels).
+Each provider (bedrock, foundry, vertex) is guarded below; when a new one lands, add its guard here once.
+*/}}
+{{- define "ao-data-platform.llmWorkerValidate" -}}
+{{- $p := .Values.llmWorker.provider -}}
+{{- if not (or (eq $p "bedrock") (eq $p "foundry") (eq $p "vertex")) -}}
+{{- fail (printf "llmWorker.provider must be \"bedrock\", \"foundry\", or \"vertex\", got %q." $p) -}}
+{{- end -}}
+{{- if eq $p "foundry" -}}
+{{- if not .Values.llmWorker.foundry.resource -}}
+{{- fail "llmWorker.provider=foundry requires llmWorker.foundry.resource." -}}
+{{- end -}}
+{{- end -}}
+{{- if eq $p "vertex" -}}
+{{- if not .Values.llmWorker.vertex.project -}}
+{{- fail "llmWorker.provider=vertex requires llmWorker.vertex.project." -}}
+{{- end -}}
+{{- if not .Values.llmWorker.vertex.region -}}
+{{- fail "llmWorker.provider=vertex requires llmWorker.vertex.region (e.g. \"global\")." -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Map llmWorker.provider to its cloud platform, matching what the worker publishes
+to the llm_worker_info marker (bedrock->aws, vertex->gcp, foundry->azure). Used to
+seed the marker at schema-migration time so the monolith can resolve the cloud
+before the worker's first startup write.
+*/}}
+{{- define "ao-data-platform.llmWorkerCloud" -}}
+{{- $p := .Values.llmWorker.provider -}}
+{{- if eq $p "bedrock" -}}aws
+{{- else if eq $p "vertex" -}}gcp
+{{- else if eq $p "foundry" -}}azure
+{{- else -}}{{- fail (printf "llmWorker.provider %q has no cloud mapping (expected bedrock|vertex|foundry)." $p) -}}
 {{- end -}}
 {{- end }}
 

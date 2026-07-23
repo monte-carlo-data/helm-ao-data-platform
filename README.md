@@ -18,6 +18,8 @@ The ClickHouse instance ships with production hardening: a capped memory ceiling
 
 > **Chart-version bumps no longer recreate ClickHouse:** the ClickHouse operator propagates only a fixed allowlist of stable labels onto the resources it generates. A chart-version bump changes the volatile `helm.sh/chart` label, but that label is no longer stamped onto the StatefulSet's immutable `volumeClaimTemplates`, so the bump no longer forces a delete/recreate of the ClickHouse StatefulSet.
 
+> **Upgrading to 4.0.0:** a breaking major release for gateway installs. When `gateway.enabled=true`, `gateway.provider` (`azure` or `gke`) is now **required with no default** — a gateway-enabled install that omits it fails render with `gateway.provider must be "azure" or "gke"`. This is deliberate: the chart is cloud-neutral, and a silent default would misroute a forgetful install (e.g. send a GKE user into an `azureDNS` error). Existing Azure gateway installs upgrading from ≤3.x must add **`gateway.provider: azure`** — a one-line change (the companion Terraform module sets it). Relatedly, `gateway.className` is no longer hard-defaulted; it is **derived** from `gateway.provider` (`azure`→`approuting-istio`, `gke`→`gke-l7-rilb`), with an explicit `gateway.className` still honored as an override. Non-gateway installs (the default, and all AWS installs) are unaffected.
+>
 > **Upgrading to 3.0.0:** a breaking major release — the default install shape changes. The schema SQL is now clustered-only — every table is a path-less `Replicated*` engine, all DDL (including the schema-Job TTL `ALTER`s) runs `ON CLUSTER '{cluster}'`, and `clickhouse.replicasCount` defaults to **2**. A bare install now deploys the prod HA shape (2 ClickHouse replicas + 3 Keeper voters, both hard-spread across zones); dev/single-AZ installs set both counts to `1`. **Installs upgrading with existing pre-3.0.0 (plain `MergeTree`) data must pin `clickhouse.replicasCount: 1` until the tables have been converted in place** — see [the migration ordering](#high-availability-and-the-migration-ordering). Readiness also switches from the operator-injected `/ping` to the writer-safe `/ready` handler: a replica partitioned from Keeper drops out of the Service until it rejoins, and a joining replica stays not-Ready through its registration/metadata phase — though it can turn Ready before its historical part fetches finish, so gate operational waits on `system.replicas`, not pod Ready (see [Writer-safe readiness](#writer-safe-readiness-ready)).
 >
 > **Upgrading to 2.3.0:** every install now renders a `ClickHouseKeeperInstallation` alongside the ClickHouse server — 3 Keeper voters with a hard one-voter-per-AZ topology spread by default. On clusters that can't schedule across three zones (local dev, single-AZ), the extra voters stay `Pending`; set `keeper.replicasCount: 1` there. The ClickHouse server is wired to Keeper from this version, but the tables are still plain `MergeTree` and don't use it yet — runtime behavior is otherwise unchanged. The Keeper client port ships network-isolated by a `NetworkPolicy` (inert on clusters without a NetworkPolicy engine) with a trimmed four-letter-word allowlist — see [Keeper network exposure and hardening](#keeper-network-exposure-and-hardening).
@@ -159,11 +161,11 @@ writer safety here is deliberate.
 ## Prerequisites
 
 - Helm 3
-- A Kubernetes cluster (k3s for local dev, EKS for AWS, AKS for Azure)
+- A Kubernetes cluster (k3s for local dev, EKS for AWS, AKS for Azure, GKE for GCP)
 - [cert-manager](https://cert-manager.io/) installed in the cluster (for TLS, enabled by default)
 - [External Secrets Operator](https://external-secrets.io/) installed in the cluster
-- A `SecretStore` or `ClusterSecretStore` configured to access your secrets backend (AWS Secrets Manager, Azure Key Vault, Fake provider for local dev, etc.)
-- [trust-manager](https://cert-manager.io/docs/trust/trust-manager/) — **only** for the Azure Gateway path (`gateway.enabled`), which always renders a trust-manager `Bundle` for the Gateway→backend re-encrypt. The [Azure Terraform module](https://github.com/monte-carlo-data/terraform-azurerm-ao-data-platform) installs it; without it, apply fails with a CRD-not-found error.
+- A `SecretStore` or `ClusterSecretStore` configured to access your secrets backend (AWS Secrets Manager, Azure Key Vault, GCP Secret Manager, Fake provider for local dev, etc.)
+- [trust-manager](https://cert-manager.io/docs/trust/trust-manager/) — for the Gateway path (`gateway.enabled`, azure or gke), which always renders a trust-manager `Bundle` for the Gateway→backend re-encrypt. The per-cloud Terraform module ([Azure](https://github.com/monte-carlo-data/terraform-azurerm-ao-data-platform) / [GCP](https://github.com/monte-carlo-data/terraform-google-ao-data-platform)) installs it; without it, apply fails with a CRD-not-found error.
 
 The chart does not ship a default `llmWorker.image` — supply your own (`llmWorker.image.repository` / `llmWorker.image.tag`) or the `llm-worker` Deployment will not start. The public worker image is published as `montecarlodata/ao-llm-worker`.
 
@@ -404,6 +406,7 @@ Supply environment-specific configuration in your own values file and pass it wi
 ```yaml
 gateway:
   enabled: true
+  provider: azure                         # required when gateway.enabled — "azure" or "gke"
   otelHostname: otel.<your-zone>          # resolves to the Gateway's private LB IP
   clickhouseHostname: clickhouse.<your-zone>
   tls:
@@ -431,6 +434,81 @@ with `kubectl get gateway,httproute,certificate -n montecarlo`.
 For a full post-deploy check, run `hack/verify-deployment-azure.sh -n <namespace>` — it
 auto-detects gateway vs internal-LB mode and verifies pods, ClickHouse, the OTel collector,
 certs, and (in gateway mode) the Gateway/HTTPRoute/BackendTLSPolicy resources.
+
+## Deploying to GCP (GKE)
+
+On GKE the chart exposes the collector and ClickHouse through the **GKE Gateway API** using the
+internal regional GatewayClass (`gke-l7-rilb`, derived from `gateway.provider`; override with `gateway.className`), terminating TLS at
+per-hostname HTTPS listeners and re-encrypting to the in-cluster backends. Like the Azure path it
+is **opt-in** (`gateway.enabled=true`, `gateway.provider=gke`) and **disabled by default**, so AWS
+and local installs are unaffected.
+
+The Gateway's load balancer is **always internal** (private IP only) — the collector and ClickHouse
+endpoints are never publicly reachable and are reached over private connectivity.
+
+As with Azure, clients reach the backends over their HTTP interfaces only: the collector takes
+**OTLP/HTTP on 4318**, and ClickHouse over its **HTTPS interface on port 8443** — target
+`https://<clickhouse-host>:8443`. Two GKE-specific pieces differ from Azure:
+
+- **Source-range restriction** is a regional **Cloud Armor** policy attached to each backend via a
+  `GCPBackendPolicy`, named by `gateway.gcpBackendSecurityPolicy` (not the Azure annotation). Leave
+  it empty for no restriction. `gateway.allowedSourceRanges` is the Azure-only path and must stay
+  empty on gke (enforced at render time).
+- **Backend health checks** use a `HealthCheckPolicy` pointing at the collector's `:13133` health
+  endpoint — otherwise the `appProtocol: HTTPS` backend marking makes GKE default to an
+  HTTPS-on-serving-port probe that 404s the OTLP receiver.
+
+### Prerequisites
+
+- A GKE cluster with the **Gateway API** enabled and the internal regional GatewayClass
+  `gke-l7-rilb` (derived from `gateway.provider=gke`; override with `gateway.className`)
+- [cert-manager](https://cert-manager.io/) and [trust-manager](https://cert-manager.io/docs/trust/trust-manager/),
+  with trust-manager's trust namespace set to the release namespace
+- [External Secrets Operator](https://external-secrets.io/) with a `ClusterSecretStore` for GCP
+  Secret Manager (the ClickHouse user passwords)
+- **Workload Identity Federation** for the cert-manager DNS-01 solver, bound to the Cloud DNS zone
+  (cert-manager uses ambient GKE Workload Identity — no service-account key)
+- A **Cloud DNS** zone for the listener hostnames — Let's Encrypt validates via DNS-01 (DNS records,
+  not endpoint reachability), so it issues publicly-trusted certs even though the endpoints are
+  private. Point `gateway.otelHostname` / `gateway.clickhouseHostname` at the Gateway's private LB IP.
+
+The companion [GCP Terraform module](https://github.com/monte-carlo-data/terraform-google-ao-data-platform)
+provisions all of the above (Gateway API, cert-manager, trust-manager, ESO, Secret Manager, Cloud
+Armor policy, Workload Identity Federation) and renders the matching values; deploying the chart
+standalone means reproducing those prerequisites yourself.
+
+### Enabling the gateway
+
+Supply environment-specific configuration in your own values file and pass it with `-f`:
+
+```yaml
+gateway:
+  enabled: true
+  provider: gke                           # className defaults to gke-l7-rilb for gke
+  otelHostname: otel.<your-zone>          # resolves to the Gateway's private LB IP
+  clickhouseHostname: clickhouse.<your-zone>
+  gcpBackendSecurityPolicy: <cloud-armor-policy-name>   # optional; empty = no source restriction
+  tls:
+    source: letsencrypt                   # only supported source
+    letsencrypt:
+      email: ""                           # optional ACME contact
+      cloudDNS:
+        project: <dns-project-id>         # project hosting the Cloud DNS zone
+```
+
+```bash
+helm dependency build charts/ao-data-platform/
+helm upgrade --install ao-data-platform charts/ao-data-platform/ -n montecarlo --create-namespace \
+  -f my-values.yaml
+```
+
+As on Azure, the Gateway re-encrypts the Gateway→backend hop and **requires `tls.enabled=true`**;
+enabling the gateway with `tls.enabled=false` fails the render. Verify with
+`kubectl get gateway,httproute,certificate -n montecarlo`.
+
+For a full post-deploy check, run `hack/verify-deployment-gcp.sh -n <namespace>` — it verifies
+pods, ClickHouse, the OTel collector, certs, StorageClass, and the Gateway/HTTPRoute/BackendTLSPolicy
++ GCPBackendPolicy/HealthCheckPolicy resources.
 
 ## CI / CD
 
@@ -476,7 +554,7 @@ to the normalized target tables. The stock `default` superuser is removed.
 |------|-------|--------|---------|-------------|
 | `schema_owner` | `otel_traces.*` | full DDL on `otel_traces.*`, `ALTER` on 7 system-log tables², `SYSTEM FLUSH LOGS`, `CLUSTER` on `*.*`³ | schema-migration Job; the MV `DEFINER` | always |
 | `otel` | full read (`restrictGrants=false`, default); `—` when `restrictGrants=true` | `INSERT` on `otel_traces.otel_traces` when `clickhouse.otel.restrictGrants=true` (otherwise unrestricted) | OTel collector | always |
-| `llm_worker` | `llm_batches`/`llm_inputs`/`llm_results` | `INSERT` on `llm_batches`/`llm_results` | llm-worker Deployment | always |
+| `llm_worker` | `llm_batches`/`llm_inputs`/`llm_results`/`llm_worker_info` | `INSERT` on `llm_batches`/`llm_results`/`llm_worker_info` | llm-worker Deployment | always |
 | `monte_carlo` | reader bundle¹ | `INSERT` on `llm_inputs`/`llm_batches`/`conversation_eval_scores`/`conversation_cluster_assignments` | Monte Carlo (data-source monitoring + agent observability) | always |
 | `probe` | `system.replicas` + table visibility (`SHOW TABLES` on `otel_traces.*`; no data reads) | — (`readonly=2` profile) | the `/ready` readiness handler (see [Writer-safe readiness](#writer-safe-readiness-ready)) | always (passwordless; no ExternalSecret) |
 | `readonly_user` | reader bundle¹ | — (`readonly=2`, so JDBC `SET` works) | humans / MCP / JDBC clients | `clickhouse.readonlyUser.enabled=true` |
@@ -501,9 +579,9 @@ Each password-backed user has an ExternalSecret sourcing its password from your 
 per-user `*.externalSecret` values below). Network *reachability* is typically restricted one layer
 up at the load balancer; per-caller CH-user-level network scoping is handled separately.
 
-The `hack/verify-deployment-aws.sh` and `hack/verify-deployment-azure.sh` scripts run their
-ClickHouse data checks as `readonly_user`, so set `clickhouse.readonlyUser.enabled=true` to
-use them.
+The `hack/verify-deployment-aws.sh`, `hack/verify-deployment-azure.sh`, and
+`hack/verify-deployment-gcp.sh` scripts run their ClickHouse data checks as `readonly_user`, so
+set `clickhouse.readonlyUser.enabled=true` to use them.
 
 ### Upgrading an existing install (1.x → 2.0.0)
 
@@ -633,25 +711,32 @@ helm upgrade ao-data-platform oci://registry-1.docker.io/montecarlodata/ao-data-
 | `llmWorker.replicaCount` | `1` | Number of `llm-worker` pods — `0` or `1` only (the template rejects `>1`; the worker has no job-claim semantics, so concurrent copies would double-process batches). Set to `0` to pause the worker declaratively (survives `helm upgrade`, unlike a manual `kubectl scale`). |
 | `llmWorker.image.repository` | `""` | Image repository for the `llm-worker` (required — e.g. `montecarlodata/ao-llm-worker`) |
 | `llmWorker.image.tag` | `""` | Image tag for the `llm-worker` |
-| `llmWorker.aws.region` | `us-east-1` | AWS region passed to the `llm-worker` |
+| `llmWorker.provider` | `bedrock` | LLM backend: `bedrock` (Claude on AWS Bedrock), `foundry` (Claude on Microsoft Foundry / Azure), or `vertex` (Claude on GCP Vertex AI). Selects `LLM_PROVIDER` and which provider-specific env the deployment renders. |
+| `llmWorker.aws.region` | `us-east-1` | AWS region passed to the `llm-worker` (bedrock; block named `aws` for backward compatibility). |
+| `llmWorker.foundry.resource` | `""` | Foundry resource name (required when `provider=foundry`). Auth is Entra ID via AKS Workload Identity. |
+| `llmWorker.vertex.project` | `""` | GCP project id for Vertex (required when `provider=vertex`). Auth is ADC via GKE Workload Identity Federation. |
+| `llmWorker.vertex.region` | `global` | Vertex location (`global` = the global endpoint). |
 | `llmWorker.podLabels` | `{}` | Extra labels merged onto the `llm-worker` pod template (e.g. to opt the pod into an identity/admission webhook). |
 | `opentelemetry-collector.service.type` | `ClusterIP` | OTel Collector Service type (`ClusterIP`, `LoadBalancer`) |
 | `opentelemetry-collector.service.annotations` | `{}` | Annotations on the OTel Collector Service (e.g. AWS NLB, external-dns) |
 | `tls.enabled` | `true` | Enable TLS between services (requires cert-manager) |
 | `tls.certManager.createCA` | `true` | Create a self-signed CA; set to `false` if you have your own issuer |
 | `tls.certManager.existingIssuerRef` | `{}` | Use an existing issuer instead of the generated CA (e.g. `{name: my-issuer, kind: ClusterIssuer}`) |
-| `gateway.enabled` | `false` | Enable the managed AKS Gateway API path (Azure-specific). The Gateway's load balancer is always internal (private IP). See [Deploying to Azure (AKS)](#deploying-to-azure-aks). |
-| `gateway.className` | `approuting-istio` | GatewayClass for the managed application-routing add-on. |
+| `gateway.enabled` | `false` | Enable the internal Gateway API serving path (azure or gke — see `gateway.provider`). The Gateway's load balancer is always internal (private IP). See [Deploying to Azure (AKS)](#deploying-to-azure-aks) / [GCP (GKE)](#deploying-to-gcp-gke). |
+| `gateway.provider` | `""` | Cloud that renders provider-specific Gateway resources: `azure` or `gke`. **Required when `gateway.enabled`** (no default). Selects the source-range mechanism and the cert-manager DNS-01 solver. |
+| `gateway.className` | `""` | GatewayClass. Cloud-specific — derived from `gateway.provider` when empty (azure → `approuting-istio`, gke → `gke-l7-rilb`). Set only to override with a custom class. |
 | `gateway.otelHostname` | `""` | Hostname for the OTel collector listener (required when `gateway.enabled`). Must resolve to the Gateway's private LB IP. |
 | `gateway.clickhouseHostname` | `""` | Hostname for the ClickHouse listener (required when `gateway.enabled`). Must resolve to the Gateway's private LB IP. |
-| `gateway.allowedSourceRanges` | `[]` | CIDRs allowed to reach the Gateway's internal load balancer (renders the `azure-allowed-ip-ranges` annotation). Empty = no source-range restriction. Unioned across both listeners (shared LB). |
+| `gateway.allowedSourceRanges` | `[]` | Azure source-range path: CIDRs allowed to reach the Gateway's internal load balancer (renders the `azure-allowed-ip-ranges` annotation). Empty = no restriction. Set only when `gateway.provider=azure`. |
+| `gateway.gcpBackendSecurityPolicy` | `""` | GKE source-range path: name of a regional Cloud Armor policy attached to each backend via a `GCPBackendPolicy`. Empty = no restriction. Set only when `gateway.provider=gke` (mutually exclusive with `gateway.allowedSourceRanges`). |
 | `gateway.tls.source` | `letsencrypt` | Listener cert source. Only `letsencrypt` is supported; Key Vault (BYO certs) is reserved for a future release. |
 | `gateway.tls.letsencrypt.email` | `""` | ACME contact email (optional; omitted registers a contactless account). |
 | `gateway.tls.letsencrypt.server` | `https://acme-v02.api.letsencrypt.org/directory` | ACME server URL (Let's Encrypt production). |
 | `gateway.tls.letsencrypt.azureDNS.hostedZoneName` | `""` | DNS zone for the DNS-01 solver (required when `gateway.enabled`). |
 | `gateway.tls.letsencrypt.azureDNS.resourceGroupName` | `""` | Resource group of the DNS zone (required when `gateway.enabled`). |
 | `gateway.tls.letsencrypt.azureDNS.subscriptionID` | `""` | Subscription ID of the DNS zone (required when `gateway.enabled`). |
-| `gateway.tls.letsencrypt.azureDNS.managedIdentityClientID` | `""` | cert-manager Workload Identity client ID for the DNS-01 solver (required when `gateway.enabled`). |
+| `gateway.tls.letsencrypt.azureDNS.managedIdentityClientID` | `""` | cert-manager Workload Identity client ID for the DNS-01 solver (azure; required when `gateway.enabled` and `gateway.provider=azure`). |
+| `gateway.tls.letsencrypt.cloudDNS.project` | `""` | GKE DNS-01 solver: project hosting the Cloud DNS zone (cert-manager uses ambient GKE Workload Identity, no key). Required when `gateway.enabled` and `gateway.provider=gke`. |
 
 ### Node scheduling and workload isolation
 

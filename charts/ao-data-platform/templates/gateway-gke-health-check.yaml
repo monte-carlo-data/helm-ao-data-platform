@@ -1,0 +1,31 @@
+{{- include "ao-data-platform.gatewayValidate" . }}
+{{- if and .Values.gateway.enabled (eq .Values.gateway.provider "gke") }}
+# LB health check for the collector backend (gke provider only).
+#
+# With appProtocol: HTTPS on the otlp-http port, GKE defaults the backend
+# health check to HTTPS on the serving port with requestPath "/" — which the
+# OTLP receiver 404s, marking the backend UNHEALTHY and 503ing the listener.
+# Point the check at the collector's health_check extension instead (plain
+# HTTP on 13133, the same endpoint the pod's readinessProbe uses).
+#
+# ClickHouse needs no policy: its HTTP interface returns 200 ("Ok.") on "/",
+# so the default HTTPS-on-serving-port check passes.
+apiVersion: networking.gke.io/v1
+kind: HealthCheckPolicy
+metadata:
+  name: {{ include "ao-data-platform.fullname" . }}-otel
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ao-data-platform.labels" . | nindent 4 }}
+spec:
+  default:
+    config:
+      type: HTTP
+      httpHealthCheck:
+        port: 13133
+        requestPath: /
+  targetRef:
+    group: ""
+    kind: Service
+    name: opentelemetry-collector
+{{- end }}

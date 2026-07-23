@@ -36,6 +36,17 @@ jobs:
       - image: cimg/base:current
     steps:
       - checkout
+      - run:
+          name: Shell syntax check (hack/)
+          # 700+ lines of `set -euo pipefail` deploy-verification shell only run against a
+          # live cluster, so a parse error would otherwise surface mid-deploy. Fail fast on
+          # any syntax error (noexec parse — no cluster or side effects).
+          command: |
+            for f in hack/*.sh hack/lib/*.sh; do
+              [ -e "$f" ] || continue
+              bash -n "$f" || { echo "syntax error in $f"; exit 1; }
+            done
+            echo "hack/ shell syntax OK."
       - install-helm
       - add-helm-repos
       - run:
@@ -144,6 +155,142 @@ jobs:
             fi
             echo "allowedSourceRanges rendered the azure-allowed-ip-ranges annotation correctly."
       - run:
+          name: gke gcpBackendSecurityPolicy renders a GCPBackendPolicy per backend
+          # The gke source-range path attaches a Cloud Armor policy to each Gateway backend
+          # via a GCPBackendPolicy (not an annotation). Assert both backends get one, wired
+          # to the passed policy name.
+          command: |
+            helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --set gateway.provider=gke --set gateway.className=gke-l7-rilb \
+              --set-json 'gateway.allowedSourceRanges=[]' \
+              --set gateway.gcpBackendSecurityPolicy=ci-armor > gw-gke.yaml
+            count=$(grep -c '^kind: GCPBackendPolicy$' gw-gke.yaml)
+            if [ "$count" -ne 2 ]; then
+              echo "Expected 2 GCPBackendPolicy resources (otel + clickhouse backends); found ${count}."
+              grep -nE 'GCPBackendPolicy|securityPolicy|targetRef' gw-gke.yaml || true
+              exit 1
+            fi
+            if ! grep -Eq '^    securityPolicy: "ci-armor"$' gw-gke.yaml; then
+              echo "GCPBackendPolicy did not reference the expected securityPolicy 'ci-armor'."
+              exit 1
+            fi
+            # GKE re-encrypts to a backend only if the Service port is marked appProtocol:
+            # HTTPS. The collector port is marked by the TF module; the ClickHouse https port
+            # is marked by the CHI serviceTemplate here (gke only). Assert it renders.
+            if ! grep -Eq '^              appProtocol: HTTPS$' gw-gke.yaml; then
+              echo "Expected the gke ClickHouse https port to be marked appProtocol: HTTPS."
+              exit 1
+            fi
+            # gke selects the cert-manager DNS-01 solver by provider: assert the ClusterIssuer
+            # emits the cloudDNS solver (not azureDNS) with the passed project.
+            if ! grep -q 'cloudDNS:' gw-gke.yaml || grep -q 'azureDNS:' gw-gke.yaml; then
+              echo "Expected the gke ClusterIssuer to use the cloudDNS DNS-01 solver, not azureDNS."
+              grep -nE 'cloudDNS|azureDNS|dns01' gw-gke.yaml || true
+              exit 1
+            fi
+            # HealthCheckPolicy repoints the collector backend's LB health check at the :13133
+            # health_check extension (gke only) — otherwise GKE defaults to HTTPS on the serving
+            # port with path "/", which 404s the OTLP receiver and 503s the listener.
+            if [ "$(grep -c '^kind: HealthCheckPolicy$' gw-gke.yaml)" -ne 1 ]; then
+              echo "Expected exactly 1 HealthCheckPolicy (collector backend)."
+              grep -nE 'HealthCheckPolicy|targetRef|port:|requestPath:' gw-gke.yaml || true
+              exit 1
+            fi
+            # Assert the HealthCheckPolicy's fields in isolation: the combined render also
+            # contains GCPBackendPolicy targetRefs named opentelemetry-collector, so grepping
+            # the whole file would false-pass a mistargeted HealthCheckPolicy.
+            helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --set gateway.provider=gke --set gateway.className=gke-l7-rilb \
+              --set-json 'gateway.allowedSourceRanges=[]' \
+              --set gateway.gcpBackendSecurityPolicy=ci-armor \
+              --show-only templates/gateway-gke-health-check.yaml > hcp.yaml
+            if ! grep -Eq '^        port: 13133$' hcp.yaml || ! grep -Eq '^        requestPath: /$' hcp.yaml \
+               || ! grep -Eq '^    name: opentelemetry-collector$' hcp.yaml; then
+              echo "HealthCheckPolicy did not target the collector Service on port 13133 / requestPath /."
+              cat hcp.yaml || true
+              exit 1
+            fi
+            # Azure LB artifacts must never leak into a gke render — a drift in the provider
+            # conditional in gateway.yaml would silently ship azure annotations on gke.
+            if grep -Eq 'azure-load-balancer-internal|azure-allowed-ip-ranges' gw-gke.yaml; then
+              echo "Azure LB annotation leaked into a gke render."
+              grep -nE 'azure-load-balancer-internal|azure-allowed-ip-ranges' gw-gke.yaml || true
+              exit 1
+            fi
+            echo "gke source-range + ClickHouse appProtocol + cloudDNS solver + HealthCheckPolicy rendered correctly (no azure artifacts leaked)."
+      - run:
+          name: gateway.className derives from provider, and an explicit value overrides
+          # className is not defaulted to any one cloud; when unset it is derived from
+          # gateway.provider. Assert both providers derive their canonical GatewayClass,
+          # and that an explicit className overrides the derived default.
+          command: |
+            az=$(helm template charts/ao-data-platform -f charts/ao-data-platform/ci/lint-values.yaml \
+              | grep -E '^  gatewayClassName:' | head -1)
+            echo "$az" | grep -q 'approuting-istio' || { echo "azure did not derive approuting-istio: [$az]"; exit 1; }
+            gk=$(helm template charts/ao-data-platform -f charts/ao-data-platform/ci/lint-values.yaml \
+              --set gateway.provider=gke --set-json 'gateway.allowedSourceRanges=[]' \
+              | grep -E '^  gatewayClassName:' | head -1)
+            echo "$gk" | grep -q 'gke-l7-rilb' || { echo "gke did not derive gke-l7-rilb: [$gk]"; exit 1; }
+            # Override branch: an explicit className is honored verbatim, not derived.
+            ov=$(helm template charts/ao-data-platform -f charts/ao-data-platform/ci/lint-values.yaml \
+              --set gateway.provider=gke --set gateway.className=my-custom-class \
+              --set-json 'gateway.allowedSourceRanges=[]' \
+              | grep -E '^  gatewayClassName:' | head -1)
+            echo "$ov" | grep -q 'my-custom-class' || { echo "explicit className not honored: [$ov]"; exit 1; }
+            echo "className derives (azure->approuting-istio, gke->gke-l7-rilb) and honors an explicit override."
+      - run:
+          name: Gateway source-range path is provider-exclusive
+          # allowedSourceRanges (azure) and gcpBackendSecurityPolicy (gke) must never cross:
+          # each render below sets the wrong-provider value and must fail.
+          command: |
+            if helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --set gateway.provider=gke --set gateway.className=gke-l7-rilb > /dev/null 2>&1; then
+              echo "Expected render to fail: allowedSourceRanges (from lint-values) set with provider=gke."
+              exit 1
+            fi
+            if helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --set gateway.gcpBackendSecurityPolicy=x > /dev/null 2>&1; then
+              echo "Expected render to fail: gcpBackendSecurityPolicy set with provider=azure."
+              exit 1
+            fi
+            echo "Provider-exclusive source-range validation correctly rejected both crossovers."
+      - run:
+          name: Invalid or missing gateway.provider fails render
+          # gateway.provider is a required, validated field (no default). A logic error in the
+          # gatewayValidate enum guard would render clean for the azure/gke values CI already
+          # exercises; assert an unknown value and the empty default both fail the render.
+          command: |
+            for bad in bogus ""; do
+              if helm template charts/ao-data-platform \
+                -f charts/ao-data-platform/ci/lint-values.yaml \
+                --set-json 'gateway.allowedSourceRanges=[]' \
+                --set gateway.provider="$bad" > /dev/null 2>&1; then
+                echo "Expected render to fail for gateway.provider='${bad}', but it succeeded."
+                exit 1
+              fi
+            done
+            echo "Invalid and empty gateway.provider both correctly failed the render."
+      - run:
+          name: gke with empty gcpBackendSecurityPolicy renders no GCPBackendPolicy
+          # Empty gcpBackendSecurityPolicy = "no Cloud Armor restriction" (mirrors azure's empty
+          # allowedSourceRanges). Assert the unrestricted default renders zero policies, so a
+          # regression that always emits the policy is caught.
+          command: |
+            helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --set gateway.provider=gke --set gateway.className=gke-l7-rilb \
+              --set-json 'gateway.allowedSourceRanges=[]' > gw-gke-noarmor.yaml
+            count=$(grep -c '^kind: GCPBackendPolicy$' gw-gke-noarmor.yaml || true)
+            if [ "$count" -ne 0 ]; then
+              echo "Expected 0 GCPBackendPolicy resources with empty gcpBackendSecurityPolicy; found ${count}."
+              exit 1
+            fi
+            echo "Empty gcpBackendSecurityPolicy correctly rendered no GCPBackendPolicy."
+      - run:
           name: Gateway cross-references are internally consistent
           # The gateway templates cross-reference by string literal, so a rename in one file
           # renders clean but breaks TLS at apply. Assert the in-render seams line up. (Service
@@ -168,6 +315,58 @@ jobs:
               exit 1
             fi
             echo "certificateRefs<->secretName and Bundle<->caCertificateRefs are consistent."
+            # The two gke policy templates (HealthCheckPolicy, GCPBackendPolicy) reference the
+            # collector and ClickHouse Services by string literal, outside the certificateRef
+            # seams above — a rename there renders clean but breaks routing at apply. Render gke
+            # and anchor both names to the rest of the render.
+            helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --set gateway.provider=gke --set gateway.className=gke-l7-rilb \
+              --set-json 'gateway.allowedSourceRanges=[]' \
+              --set gateway.gcpBackendSecurityPolicy=ci-armor > gw-gke.yaml
+            # opentelemetry-collector is rendered by the subchart → static equality: the name the
+            # gke templates target must exist as a real Service.
+            if ! awk '/^kind: Service$/{s=1;next} s&&/^  name: /{if($2=="opentelemetry-collector")f=1; s=0} END{exit !f}' gw-gke.yaml; then
+              echo "No Service named 'opentelemetry-collector' in the gke render — a gke targetRef literal has drifted from the collector Service."
+              exit 1
+            fi
+            # clickhouse-otel is operator-created (not rendered), so anchor it to the HTTPRoute
+            # backendRef it must route to — a rename in one gke template would orphan it.
+            if ! grep -Eq '^        - name: clickhouse-otel$' gw-gke.yaml; then
+              echo "clickhouse-otel is not an HTTPRoute backendRef in the gke render — a service-name literal has drifted."
+              exit 1
+            fi
+            # The checks above anchor only the Service/HTTPRoute side, so a typo in a policy
+            # template's OWN targetRef (gateway-gke-security-policy.yaml, gateway-gke-health-check.yaml)
+            # still passes. Render each policy template in isolation and assert its targetRef name
+            # literal(s) — the GCPBackendPolicies target both backends, the HealthCheckPolicy the
+            # collector. (targetRef `name:` is indented 4 spaces; metadata `name:` is 2, so this
+            # can't false-match a resource name.)
+            helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --set gateway.provider=gke --set gateway.className=gke-l7-rilb \
+              --set-json 'gateway.allowedSourceRanges=[]' \
+              --set gateway.gcpBackendSecurityPolicy=ci-armor \
+              --show-only templates/gateway-gke-security-policy.yaml > gbp.yaml
+            for svc in opentelemetry-collector clickhouse-otel; do
+              if ! grep -Eq "^    name: ${svc}$" gbp.yaml; then
+                echo "GCPBackendPolicy targetRef name '${svc}' is missing — a targetRef literal has drifted from its backend Service."
+                grep -nE 'targetRef|name:' gbp.yaml || true
+                exit 1
+              fi
+            done
+            helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --set gateway.provider=gke --set gateway.className=gke-l7-rilb \
+              --set-json 'gateway.allowedSourceRanges=[]' \
+              --set gateway.gcpBackendSecurityPolicy=ci-armor \
+              --show-only templates/gateway-gke-health-check.yaml > hcp-xref.yaml
+            if ! grep -Eq '^    name: opentelemetry-collector$' hcp-xref.yaml; then
+              echo "HealthCheckPolicy targetRef name 'opentelemetry-collector' is missing — the targetRef literal has drifted from the collector Service."
+              grep -nE 'targetRef|name:' hcp-xref.yaml || true
+              exit 1
+            fi
+            echo "gke Service-name cross-references (opentelemetry-collector, clickhouse-otel) and policy targetRef literals are consistent."
       - run:
           name: llm-worker core labels win over colliding podLabels
           # Guards the round-1 ordering fix (core labels emitted after podLabels, so YAML
@@ -336,6 +535,115 @@ jobs:
             fi
             [ "$fail" -eq 0 ] && echo "Schema SQL is clustered-only: ON CLUSTER DDL, path-less Replicated engines."
             exit $fail
+      - run:
+          name: llm-worker foundry provider renders Foundry env, no AWS env
+          # provider=foundry emits LLM_PROVIDER=foundry + ANTHROPIC_FOUNDRY_RESOURCE
+          # and drops the bedrock-only AWS_REGION.
+          command: |
+            helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --set llmWorker.provider=foundry \
+              --set llmWorker.foundry.resource=mc-ao-foundry \
+              --show-only templates/llm-worker-deployment.yaml > lw-foundry.yaml
+            if ! grep -q 'value: "foundry"' lw-foundry.yaml; then
+              echo "LLM_PROVIDER=foundry not rendered."; exit 1
+            fi
+            if ! grep -q 'name: ANTHROPIC_FOUNDRY_RESOURCE' lw-foundry.yaml; then
+              echo "ANTHROPIC_FOUNDRY_RESOURCE not rendered for foundry."; exit 1
+            fi
+            if grep -q 'name: AWS_REGION' lw-foundry.yaml; then
+              echo "AWS_REGION must not render for foundry."; exit 1
+            fi
+            echo "foundry provider renders Foundry env, no AWS env."
+      - run:
+          name: llm-worker bedrock provider renders AWS env, no Foundry env
+          # Default (bedrock) keeps AWS_REGION and emits no Foundry env — the AWS
+          # path is behaviorally unchanged by the provider-selection addition.
+          command: |
+            helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --show-only templates/llm-worker-deployment.yaml > lw-bedrock.yaml
+            if ! grep -q 'value: "bedrock"' lw-bedrock.yaml; then
+              echo "LLM_PROVIDER=bedrock not rendered."; exit 1
+            fi
+            if ! grep -q 'name: AWS_REGION' lw-bedrock.yaml; then
+              echo "AWS_REGION not rendered for bedrock."; exit 1
+            fi
+            if grep -q 'ANTHROPIC_FOUNDRY_RESOURCE' lw-bedrock.yaml; then
+              echo "Foundry env must not render for bedrock."; exit 1
+            fi
+            echo "bedrock provider renders AWS env, no Foundry env."
+      - run:
+          name: llm-worker vertex provider renders Vertex env, no AWS/Foundry env
+          # provider=vertex emits LLM_PROVIDER=vertex + ANTHROPIC_VERTEX_PROJECT_ID
+          # + CLOUD_ML_REGION, and no AWS_REGION / ANTHROPIC_FOUNDRY_RESOURCE.
+          command: |
+            helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --set llmWorker.provider=vertex \
+              --set llmWorker.vertex.project=mc-ao-gcp \
+              --show-only templates/llm-worker-deployment.yaml > lw-vertex.yaml
+            if ! grep -q 'value: "vertex"' lw-vertex.yaml; then
+              echo "LLM_PROVIDER=vertex not rendered."; exit 1
+            fi
+            if ! grep -q 'name: ANTHROPIC_VERTEX_PROJECT_ID' lw-vertex.yaml; then
+              echo "ANTHROPIC_VERTEX_PROJECT_ID not rendered for vertex."; exit 1
+            fi
+            if grep -qE 'name: (AWS_REGION|ANTHROPIC_FOUNDRY_RESOURCE)' lw-vertex.yaml; then
+              echo "AWS/Foundry env must not render for vertex."; exit 1
+            fi
+            echo "vertex provider renders Vertex env, no AWS/Foundry env."
+      - run:
+          name: Invalid llmWorker.provider config fails render
+          # The llmWorkerValidate guard must fail fast for an unknown provider and
+          # for foundry missing its required resource.
+          command: |
+            if helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --set llmWorker.provider=bogus > /dev/null 2>&1; then
+              echo "Expected render to fail for llmWorker.provider=bogus, but it succeeded."; exit 1
+            fi
+            if helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --set llmWorker.provider=foundry > /dev/null 2>&1; then
+              echo "Expected render to fail for foundry with no resource, but it succeeded."; exit 1
+            fi
+            if helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --set llmWorker.provider=vertex > /dev/null 2>&1; then
+              echo "Expected render to fail for vertex with no project, but it succeeded."; exit 1
+            fi
+            if helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --set llmWorker.provider=vertex \
+              --set llmWorker.vertex.project=p \
+              --set llmWorker.vertex.region= > /dev/null 2>&1; then
+              echo "Expected render to fail for vertex with empty region, but it succeeded."; exit 1
+            fi
+            echo "Invalid llmWorker.provider config correctly failed the render."
+      - run:
+          name: schema-job seeds the correct cloud/provider marker per provider
+          # The marker's (cloud, provider) VALUES come from llmWorker.provider via the
+          # llmWorkerCloud helper (bedrock->aws, vertex->gcp, foundry->azure). A swapped branch
+          # would render clean and mis-seed llm_worker_info; assert the exact seeded line per
+          # provider so the mapping is pinned at render time.
+          command: |
+            assert_marker() {  # provider cloud [extra helm --set args...]
+              provider="$1"; cloud="$2"; shift 2
+              helm template charts/ao-data-platform \
+                -f charts/ao-data-platform/ci/lint-values.yaml \
+                --set llmWorker.provider="$provider" "$@" \
+                --show-only templates/schema-job.yaml > marker.yaml
+              if ! grep -qF "INSERT INTO otel_traces.llm_worker_info (cloud, provider) VALUES ('${cloud}', '${provider}')" marker.yaml; then
+                echo "provider=${provider} did not seed the expected marker VALUES ('${cloud}', '${provider}')."
+                grep -n 'llm_worker_info' marker.yaml || echo "(no llm_worker_info INSERT found)"
+                exit 1
+              fi
+            }
+            assert_marker bedrock aws
+            assert_marker foundry azure --set llmWorker.foundry.resource=r
+            assert_marker vertex  gcp   --set llmWorker.vertex.project=p
+            echo "schema-job seeds the correct cloud/provider marker for every provider."
 
   publish-dev:
     docker:

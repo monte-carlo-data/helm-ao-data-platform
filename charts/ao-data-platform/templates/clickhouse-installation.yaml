@@ -1,3 +1,8 @@
+{{- /* --show-only safety: validate the gateway provider enum even here. This template is
+   cloud-agnostic but carries one gateway.provider-conditional (the gke appProtocol below),
+   so enforcing the same guard the gateway-*.yaml files use keeps an isolated render of just
+   this file from silently emitting a wrong/absent appProtocol for an invalid provider. */ -}}
+{{- include "ao-data-platform.gatewayValidate" . -}}
 apiVersion: "clickhouse.altinity.com/v1"
 kind: "ClickHouseInstallation"
 metadata:
@@ -77,7 +82,8 @@ spec:
         # by default in this CH line) — without this the Job fails ACCESS_DENIED on its first
         # statement. The privilege is irreducibly global; it cannot be scoped below *.*.
         - "GRANT CLUSTER ON *.*"
-      # llm_worker — the llm-worker Deployment. Reads the queue, appends results (no mutations).
+      # llm_worker — the llm-worker Deployment. Reads the queue, appends results, and writes its
+      # (cloud, provider) marker to llm_worker_info on startup (for monolith cloud identification).
       llm_worker/password:
         valueFrom:
           secretKeyRef:
@@ -89,8 +95,10 @@ spec:
         - "GRANT SELECT ON otel_traces.llm_batches"
         - "GRANT SELECT ON otel_traces.llm_inputs"
         - "GRANT SELECT ON otel_traces.llm_results"
+        - "GRANT SELECT ON otel_traces.llm_worker_info"
         - "GRANT INSERT ON otel_traces.llm_batches"
         - "GRANT INSERT ON otel_traces.llm_results"
+        - "GRANT INSERT ON otel_traces.llm_worker_info"
       # monte_carlo — Monte Carlo read-only service account + agent queue producer. Shared reader
       # bundle plus the queue/eval-score INSERTs. NO readonly profile: readonly=2 would block these
       # INSERTs, so the read-mostly shape is enforced by grants alone.
@@ -381,6 +389,12 @@ spec:
             {{- if .Values.tls.enabled }}
             - name: https
               port: 8443
+              {{- if and .Values.gateway.enabled (eq .Values.gateway.provider "gke") }}
+              # GKE keys backend re-encryption + the LB health-check scheme off appProtocol,
+              # so mark the ClickHouse HTTPS port: the Gateway's BackendTLSPolicy re-encrypts
+              # to it (the collector's otlp-http port is marked equivalently by the TF module).
+              appProtocol: HTTPS
+              {{- end }}
             - name: tcp-secure
               port: 9440
             {{- else }}

@@ -6,8 +6,9 @@
 #
 # The Gateway's load balancer is forced internal (private IP only): the collector
 # and ClickHouse endpoints are never publicly reachable and are accessed over private
-# connectivity. The load-balancer annotations below are the cloud provider's
-# (Azure shown) — other providers substitute their own keys.
+# connectivity. How internal-ness + source restriction are expressed is cloud-specific
+# (see gateway.provider) — azure uses LB annotations; gke uses the internal GatewayClass
+# (gke-l7-rilb) plus a GCPBackendPolicy (gateway-gke-security-policy.yaml).
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:
@@ -16,16 +17,23 @@ metadata:
   labels:
     {{- include "ao-data-platform.labels" . | nindent 4 }}
 spec:
+  {{- if eq .Values.gateway.provider "azure" }}
   infrastructure:
     annotations:
-      # Force the Gateway's load balancer internal (private IP only). Azure key;
-      # other clouds use their own internal-LB annotation.
+      # Force the Gateway's load balancer internal (private IP only).
       service.beta.kubernetes.io/azure-load-balancer-internal: "true"
       {{- with .Values.gateway.allowedSourceRanges }}
       # Restrict the (internal) LB to these source CIDRs (unioned across both listeners).
+      # azure-allowed-ip-ranges alone only ADDS an NSG allow rule; without the deny-all
+      # companion, Azure's default AllowVnetInBound rule (priority 65000) still permits all
+      # VNet/peered traffic, so the allowlist is a no-op. The deny-all annotation makes
+      # cloud-provider-azure write the deny rule (priority 4095, above AllowVnetInBound) that
+      # actually enforces the restriction.
       service.beta.kubernetes.io/azure-allowed-ip-ranges: {{ join "," . | quote }}
+      service.beta.kubernetes.io/azure-deny-all-except-load-balancer-source-ranges: "true"
       {{- end }}
-  gatewayClassName: {{ required "gateway.className is required when gateway.enabled" .Values.gateway.className }}
+  {{- end }}
+  gatewayClassName: {{ include "ao-data-platform.gatewayClassName" . }}
   listeners:
     - name: otel
       hostname: {{ required "gateway.otelHostname is required when gateway.enabled" .Values.gateway.otelHostname | quote }}
