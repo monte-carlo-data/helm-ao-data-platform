@@ -436,7 +436,7 @@ certs, and (in gateway mode) the Gateway/HTTPRoute/BackendTLSPolicy resources.
 ## Deploying to GCP (GKE)
 
 On GKE the chart exposes the collector and ClickHouse through the **GKE Gateway API** using the
-internal regional GatewayClass (`gke-l7-rilb`, set via `gateway.className`), terminating TLS at
+internal regional GatewayClass (`gke-l7-rilb`, derived from `gateway.provider`; override with `gateway.className`), terminating TLS at
 per-hostname HTTPS listeners and re-encrypting to the in-cluster backends. Like the Azure path it
 is **opt-in** (`gateway.enabled=true`, `gateway.provider=gke`) and **disabled by default**, so AWS
 and local installs are unaffected.
@@ -459,7 +459,7 @@ As with Azure, clients reach the backends over their HTTP interfaces only: the c
 ### Prerequisites
 
 - A GKE cluster with the **Gateway API** enabled and the internal regional GatewayClass
-  `gke-l7-rilb` (`gateway.className`)
+  `gke-l7-rilb` (derived from `gateway.provider=gke`; override with `gateway.className`)
 - [cert-manager](https://cert-manager.io/) and [trust-manager](https://cert-manager.io/docs/trust/trust-manager/),
   with trust-manager's trust namespace set to the release namespace
 - [External Secrets Operator](https://external-secrets.io/) with a `ClusterSecretStore` for GCP
