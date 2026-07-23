@@ -109,6 +109,9 @@ Each provider (bedrock, foundry, vertex) is guarded below; when a new one lands,
 {{- if not .Values.llmWorker.vertex.project -}}
 {{- fail "llmWorker.provider=vertex requires llmWorker.vertex.project." -}}
 {{- end -}}
+{{- if not .Values.llmWorker.vertex.region -}}
+{{- fail "llmWorker.provider=vertex requires llmWorker.vertex.region (e.g. \"global\")." -}}
+{{- end -}}
 {{- end -}}
 {{- end }}
 
