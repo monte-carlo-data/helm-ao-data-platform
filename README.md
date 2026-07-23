@@ -159,10 +159,10 @@ writer safety here is deliberate.
 ## Prerequisites
 
 - Helm 3
-- A Kubernetes cluster (k3s for local dev, EKS for AWS, AKS for Azure)
+- A Kubernetes cluster (k3s for local dev, EKS for AWS, AKS for Azure, GKE for GCP)
 - [cert-manager](https://cert-manager.io/) installed in the cluster (for TLS, enabled by default)
 - [External Secrets Operator](https://external-secrets.io/) installed in the cluster
-- A `SecretStore` or `ClusterSecretStore` configured to access your secrets backend (AWS Secrets Manager, Azure Key Vault, Fake provider for local dev, etc.)
+- A `SecretStore` or `ClusterSecretStore` configured to access your secrets backend (AWS Secrets Manager, Azure Key Vault, GCP Secret Manager, Fake provider for local dev, etc.)
 - [trust-manager](https://cert-manager.io/docs/trust/trust-manager/) — for the Gateway path (`gateway.enabled`, azure or gke), which always renders a trust-manager `Bundle` for the Gateway→backend re-encrypt. The per-cloud Terraform module ([Azure](https://github.com/monte-carlo-data/terraform-azurerm-ao-data-platform) / [GCP](https://github.com/monte-carlo-data/terraform-google-ao-data-platform)) installs it; without it, apply fails with a CRD-not-found error.
 
 The chart does not ship a default `llmWorker.image` — supply your own (`llmWorker.image.repository` / `llmWorker.image.tag`) or the `llm-worker` Deployment will not start. The public worker image is published as `montecarlodata/ao-llm-worker`.
