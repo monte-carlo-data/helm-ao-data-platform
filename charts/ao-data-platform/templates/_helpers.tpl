@@ -113,6 +113,21 @@ Each provider (bedrock, foundry, vertex) is guarded below; when a new one lands,
 {{- end }}
 
 {{/*
+Map llmWorker.provider to its cloud platform, matching what the worker publishes
+to the llm_worker_info marker (bedrock->aws, vertex->gcp, foundry->azure). Used to
+seed the marker at schema-migration time so the monolith can resolve the cloud
+before the worker's first startup write.
+*/}}
+{{- define "ao-data-platform.llmWorkerCloud" -}}
+{{- $p := .Values.llmWorker.provider -}}
+{{- if eq $p "bedrock" -}}aws
+{{- else if eq $p "vertex" -}}gcp
+{{- else if eq $p "foundry" -}}azure
+{{- else -}}{{- fail (printf "llmWorker.provider %q has no cloud mapping (expected bedrock|vertex|foundry)." $p) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 ClickHouseInstallation name.
 The Altinity operator stamps the label `clickhouse.altinity.com/chi: <name>`
 onto the ClickHouse pods, so anything selecting those pods must use this same
