@@ -36,6 +36,17 @@ jobs:
       - image: cimg/base:current
     steps:
       - checkout
+      - run:
+          name: Shell syntax check (hack/)
+          # 700+ lines of `set -euo pipefail` deploy-verification shell only run against a
+          # live cluster, so a parse error would otherwise surface mid-deploy. Fail fast on
+          # any syntax error (noexec parse — no cluster or side effects).
+          command: |
+            for f in hack/*.sh hack/lib/*.sh; do
+              [ -e "$f" ] || continue
+              bash -n "$f" || { echo "syntax error in $f"; exit 1; }
+            done
+            echo "hack/ shell syntax OK."
       - install-helm
       - add-helm-repos
       - run:
