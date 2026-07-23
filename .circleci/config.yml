@@ -583,6 +583,13 @@ jobs:
               --set llmWorker.provider=vertex > /dev/null 2>&1; then
               echo "Expected render to fail for vertex with no project, but it succeeded."; exit 1
             fi
+            if helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --set llmWorker.provider=vertex \
+              --set llmWorker.vertex.project=p \
+              --set llmWorker.vertex.region= > /dev/null 2>&1; then
+              echo "Expected render to fail for vertex with empty region, but it succeeded."; exit 1
+            fi
             echo "Invalid llmWorker.provider config correctly failed the render."
       - run:
           name: schema-job seeds the correct cloud/provider marker per provider
