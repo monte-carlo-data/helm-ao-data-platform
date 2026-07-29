@@ -95,10 +95,10 @@ spec:
               # Apply the configured retention to the telemetry tables. The SQL
               # files carry the same value as their create-time default; this ALTER
               # is the source of truth and keeps existing tables in sync on upgrade.
-              # Scope covers spans telemetry plus the conversations source derived
-              # from it (conversations_normalized), its eval scores, and its cluster
-              # assignments — all designed to age out in lockstep with the
-              # conversations they annotate.
+              # Scope covers spans telemetry plus its derived annotations — the
+              # conversations source (conversations_normalized), the conversation
+              # and span eval scores, and the cluster assignments — all designed
+              # to age out in lockstep with the telemetry they annotate.
               # Excluded: the llm_* tables are LLM-worker queue state, not telemetry,
               # and keep their own fixed TTL (sql/0008–0010).
               echo "Applying {{ .Values.clickhouse.ttlDays }}-day TTL to telemetry tables..."
@@ -107,6 +107,7 @@ spec:
               modify_ttl otel_traces.spans_normalized "start_time + toIntervalDay({{ .Values.clickhouse.ttlDays }})"
               modify_ttl otel_traces.conversations_normalized "turn_start + toIntervalDay({{ .Values.clickhouse.ttlDays }})"
               modify_ttl otel_traces.conversation_eval_scores "scored_at + toIntervalDay({{ .Values.clickhouse.ttlDays }})"
+              modify_ttl otel_traces.span_eval_scores "scored_at + toIntervalDay({{ .Values.clickhouse.ttlDays }})"
               modify_ttl otel_traces.conversation_cluster_assignments "classified_at + toIntervalDay({{ .Values.clickhouse.ttlDays }})"
               echo "TTL configuration complete."
               # Cap system log retention at 7 days. CH otherwise grows these
