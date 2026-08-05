@@ -187,7 +187,12 @@ SELECT
     coalesce(
         CAST(SpanAttributes.gen_ai.usage.total_tokens AS Nullable(UInt32)),
         CAST(SpanAttributes.llm.usage.total_tokens AS Nullable(UInt32)),
-        CAST(SpanAttributes.llm.token_count.total AS Nullable(UInt32))
+        CAST(SpanAttributes.llm.token_count.total AS Nullable(UInt32)),
+        -- New-semconv emitters (e.g. Google ADK) report input/output but no
+        -- total; derive it from the resolved prompt/completion columns so total
+        -- renders instead of NULL. A Nullable sum yields NULL unless BOTH sides
+        -- are present, and any explicit total above still wins.
+        prompt_tokens + completion_tokens
     ) AS total_tokens,
 
     (coalesce(CAST(SpanAttributes.gen_ai.request.model AS Nullable(String)), '') != '')
