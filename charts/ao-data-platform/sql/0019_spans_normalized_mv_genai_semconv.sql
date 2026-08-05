@@ -36,6 +36,19 @@ WITH
     JSONExtractString(_attrs_json, 'gen_ai', 'input', 'messages')  AS _input_messages,
     JSONExtractString(_attrs_json, 'gen_ai', 'output', 'messages') AS _output_messages,
 
+    -- New gen_ai semconv system prompt. Anthropic, LangChain, and google-genai/ADK
+    -- instrumentors split the system prompt out of input.messages into a separate
+    -- top-level attribute, gen_ai.system_instructions: a bare parts array
+    -- ([{type, content}], no role wrapper). Concatenate its parts' text into one
+    -- system-role message (prepended to prompts below) so these agents surface their
+    -- system prompt in the same section legacy (gen_ai.prompt.{N}.role=system) agents
+    -- already populate. '' when absent, keeping non-emitters byte-identical.
+    JSONExtractString(_attrs_json, 'gen_ai', 'system_instructions') AS _system_instructions,
+    arrayStringConcat(
+        arrayMap(part -> JSONExtractString(part, 'content'), JSONExtractArrayRaw(_system_instructions)),
+        ''
+    ) AS _system_prompt_text,
+
     -- =============================================================
     -- Prompt index discovery — union of all formats, sorted/deduped.
     -- =============================================================
@@ -186,7 +199,9 @@ SELECT
         OR (coalesce(CAST(SpanAttributes.gen_ai.operation.name AS Nullable(String)), '') = 'execute_tool')
         OR (coalesce(CAST(SpanAttributes.openinference.span.kind AS Nullable(String)), '') = 'TOOL') AS is_tool_call,
 
-    notEmpty(_prompt_indices) AS has_prompts,
+    -- system_instructions is a prompt too (it prepends a system message below), so
+    -- keep the has_prompts <=> notEmpty(prompts) invariant the list/detail gates rely on.
+    notEmpty(_prompt_indices) OR (_system_prompt_text != '') AS has_prompts,
     notEmpty(_completion_indices) AS has_completions,
 
     ResourceAttributes     AS resource_attributes,
@@ -205,8 +220,19 @@ SELECT
 
     -- =============================================================
     -- Prompts: one tuple per discovered position, content/role coalesced
-    -- across formats.
+    -- across formats. The new gen_ai semconv system prompt
+    -- (gen_ai.system_instructions) is prepended as a leading system-role message,
+    -- matching legacy agents that carry system as gen_ai.prompt.0.role=system.
+    -- Empty array when absent, so non-emitters stay byte-identical.
     -- =============================================================
+    arrayConcat(
+        if(_system_prompt_text != '',
+            [CAST(
+                (_system_prompt_text, toUInt16(0), 'system')
+                AS Tuple(message String, position UInt16, role LowCardinality(String))
+            )],
+            CAST([] AS Array(Tuple(message String, position UInt16, role LowCardinality(String))))
+        ),
     arrayMap(
         idx -> CAST((
             -- message
@@ -262,6 +288,7 @@ SELECT
             )
         ) AS Tuple(message String, position UInt16, role LowCardinality(String))),
         _prompt_indices
+    )
     ) AS prompts,
 
     -- =============================================================
