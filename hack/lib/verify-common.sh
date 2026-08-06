@@ -230,3 +230,54 @@ verify_clickhouse_user_model() {
 
   pass "ClickHouse least-privilege user model verified."
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Zone spread — replicas/voters each occupy a distinct availability zone
+#
+# The chart's hard topologySpreadConstraints (maxSkew: 1, minDomains, DoNotSchedule)
+# are meant to guarantee one ClickHouse replica and one Keeper voter per zone. Before
+# the minDomains fix that guarantee could silently fail: with a single eligible zone at
+# scheduling time every replica packed into it, and a bound zonal PV then pinned them
+# there for the StatefulSet's life — a cluster that reads as "Running" and healthy while
+# it has already lost the single-AZ-failure tolerance HA exists for, until the first
+# reschedule turns a co-located replica into a wiped one. Placement is not visible in any
+# other check here, so read it directly: fail if any replica set occupies fewer distinct
+# zones than it has pods. Requires $NS.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Assert the pods matching a selector occupy as many distinct zones as there are pods
+# (no two share a zone). Fails if a pod is unscheduled (no node — an under-zoned cluster
+# leaves the excess replica Pending) or its node carries no zone label. Requires $NS and
+# a precomputed node→zone TSV in $2. $1 = friendly name, $3 = label selector.
+_assert_distinct_zones() {  # friendly-name node-zone-tsv selector
+  local what="$1" node_zones="$2" selector="$3"
+  local pod_nodes rows pods_n zones_n pod node zone
+  pod_nodes=$(kubectl get pods -n "$NS" -l "$selector" -o json 2>/dev/null \
+    | jq -r '.items[] | [.metadata.name, (.spec.nodeName // "")] | @tsv')
+  [[ -z "$pod_nodes" ]] && fail "$what — no pods matched '$selector'; cannot verify zone spread."
+  rows=""
+  while IFS=$'\t' read -r pod node; do
+    [[ -z "$pod" ]] && continue
+    [[ -z "$node" ]] && fail "$what — pod '$pod' is not scheduled onto a node; an under-zoned cluster leaves replicas Pending."
+    zone=$(printf '%s\n' "$node_zones" | awk -F'\t' -v n="$node" '$1 == n { print $2; exit }')
+    [[ -z "$zone" ]] && fail "$what — node '$node' (pod '$pod') has no topology.kubernetes.io/zone label; cannot confirm zone spread."
+    rows+="$pod"$'\t'"$node"$'\t'"$zone"$'\n'
+  done <<< "$pod_nodes"
+  printf '%s' "$rows" | sed 's/^/    /'
+  pods_n=$(printf '%s' "$rows" | grep -c .)
+  zones_n=$(printf '%s' "$rows" | awk -F'\t' 'NF { print $3 }' | sort -u | grep -c .)
+  [[ "$zones_n" -lt "$pods_n" ]] && fail "$what — ${pods_n} replica(s) occupy only ${zones_n} distinct zone(s); replicas are co-located and a single AZ failure can break the cluster."
+  echo -e "  ${GREEN}  ${what}: ${pods_n} replica(s) across ${zones_n} distinct zone(s)${RESET}"
+}
+
+verify_zone_spread() {
+  : "${NS:?NS must be set}"
+  banner "ClickHouse replicas and Keeper voters each occupy a distinct zone"
+  local node_zones
+  node_zones=$(kubectl get nodes -o json 2>/dev/null \
+    | jq -r '.items[] | [.metadata.name, (.metadata.labels["topology.kubernetes.io/zone"] // "")] | @tsv')
+  [[ -z "$node_zones" ]] && fail "Could not read any nodes to resolve zones."
+  _assert_distinct_zones "ClickHouse (chi=otel)"    "$node_zones" "clickhouse.altinity.com/chi=otel"
+  _assert_distinct_zones "Keeper (chk=otel)"        "$node_zones" "clickhouse-keeper.altinity.com/chk=otel"
+  pass "ClickHouse replicas and Keeper voters are spread across distinct zones."
+}
