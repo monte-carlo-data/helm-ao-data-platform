@@ -3,6 +3,10 @@ name: ao-data-platform
 description: Monte Carlo data platform — ClickHouse, OTel collector, and schema management
 version: 4.2.0
 type: application
+# minDomains on the ClickHouse/Keeper zone topologySpreadConstraints is GA in
+# Kubernetes 1.30. Declare the floor so a render/install against an older API
+# server fails fast rather than silently dropping the field.
+kubeVersion: ">=1.30.0-0"
 
 dependencies:
   - name: altinity-clickhouse-operator
