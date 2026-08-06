@@ -17,7 +17,10 @@ clickhouse:
   # convert_to_replicated conversion has verified — the consuming terraform owns
   # the value during that migration and stages it 1 → 2; raising it against
   # unconverted tables starts an independent, empty second lineage. See the
-  # README's "ClickHouse replication and Keeper" section.
+  # README's "ClickHouse replication and Keeper" section. This count also feeds
+  # minDomains on the CHI zone spread (templates/clickhouse-installation.yaml) —
+  # one replica per zone — so an under-zoned cluster leaves the excess replica
+  # Pending rather than silently co-locating both replicas in one AZ.
   replicasCount: 2
   storageClass: ""
   storageSize: 100Gi
@@ -201,7 +204,10 @@ keeper:
   # Number of Keeper voters. Prod HA = 3 (a quorum of 2 tolerates losing one voter /
   # one AZ); dev = 1. Should be odd (Raft quorum). The consuming terraform derives
   # this from the length of its Keeper availability-zone list, so the voter count
-  # cannot drift from the number of per-AZ Keeper node groups. Named `replicasCount`
+  # cannot drift from the number of per-AZ Keeper node groups. It also feeds
+  # minDomains on the CHK zone spread (templates/clickhouse-keeper-installation.yaml),
+  # so an under-zoned ensemble leaves later voters Pending rather than packing an AZ.
+  # Named `replicasCount`
   # (not the Helm-conventional `replicaCount`) to match both the CRD field it feeds
   # (the CHK's layout.replicasCount) and its sibling clickhouse.replicasCount.
   replicasCount: 3
