@@ -397,9 +397,11 @@ jobs:
           # MergeTree->Replicated conversion (see the README's Keeper section). Same
           # failure class as the label allowlist above, so assert the rendered CHI:
           # the macro-based default_replica_path/name at their exact nesting depth,
-          # the zookeeper wiring to the Keeper Service, and that keeper.replicasCount
-          # (set to a non-default 5 in ci/lint-values.yaml) actually reaches the
-          # CHK's layout — a misnamed values key would silently render the default.
+          # the zookeeper wiring to the Keeper Service, that both replicasCount values
+          # (non-default 3 for ClickHouse, 5 for Keeper in ci/lint-values.yaml) actually
+          # reach their CR layouts, and that each drives the minDomains on its own zone
+          # spread — a misnamed or hardcoded key would silently render the default, and
+          # a broken minDomains derivation would let an under-zoned cluster pack an AZ.
           command: |
             facts=$(awk '
               /^---$/ { chi = 0; chk = 0; zk = 0; set = 0 }
@@ -412,10 +414,13 @@ jobs:
               chi && zk  && /^          port: /             { print "zkport=" $2 }
               chi && set && /^      default_replica_path: / { print "path=" $2 }
               chi && set && /^      default_replica_name: / { print "name=" $2 }
+              chi && /^          replicasCount: /           { print "chreplicas=" $2 }
+              chi && /^              minDomains: /          { print "chminDomains=" $2 }
               chk && /^    [a-zA-Z]/   { kset = 0 }
               chk && /^    settings:/  { kset = 1 }
               chk && kset && /^      keeper_server\/four_letter_word_allow_list: / { print "fourlw=" $2 }
               chk && /^          replicasCount: /           { print "voters=" $2 }
+              chk && /^              minDomains: /          { print "kpminDomains=" $2 }
             ' rendered.yaml)
             assert_fact() {
               if ! echo "$facts" | grep -qxF "$1"; then
@@ -429,7 +434,12 @@ jobs:
             assert_fact 'name="{replica}"'
             assert_fact 'zkhost=keeper-otel'
             assert_fact 'zkport=2181'
+            assert_fact 'chreplicas=3'
             assert_fact 'voters=5'
+            # minDomains must track each CR's own replicasCount (the anti-drift guarantee
+            # that an under-zoned cluster fails loud instead of packing replicas into one AZ).
+            assert_fact 'chminDomains=3'
+            assert_fact 'kpminDomains=5'
             assert_fact 'fourlw="ruok,mntr,srvr,stat,conf"'
             echo "ClickHouse replication wiring rendered correctly."
       - run:
@@ -491,6 +501,13 @@ jobs:
             count=$(grep -Ec '^          replicasCount: 1$' dev-shape.yaml)
             if [ "$count" -ne 2 ]; then
               echo "Expected replicasCount: 1 in both the CHI and CHK layouts; found ${count} occurrence(s)."
+              exit 1
+            fi
+            # minDomains tracks replicasCount, so the dev shape must render minDomains: 1
+            # on both zone spreads (a trivially-satisfied single-domain constraint).
+            md=$(grep -Ec '^              minDomains: 1$' dev-shape.yaml)
+            if [ "$md" -ne 2 ]; then
+              echo "Expected minDomains: 1 in both the CHI and CHK zone spreads; found ${md} occurrence(s)."
               exit 1
             fi
             probe=$(grep -A3 'path: /ready' dev-shape.yaml)
