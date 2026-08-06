@@ -8,6 +8,12 @@
 # here so the render reaches every template. These are CI placeholders only and
 # are never deployed.
 clickhouse:
+  # Non-default replica count — and distinct from keeper's 5 below — so the CI render
+  # proves clickhouse.replicasCount actually reaches BOTH the CHI's layout.replicasCount
+  # and the minDomains on its zone spread (a hardcoded or misnamed key would render the
+  # default and Helm would never complain — no values.schema.json). Distinct from keeper
+  # so neither CR can borrow the other's value and still pass.
+  replicasCount: 3
   # Exercise the ClickHouse nodeSelector/tolerations `with` branches in the CHI pod
   # template (skipped at the empty defaults), mirroring the keeper block below and
   # how the consuming terraform pins ClickHouse to its dedicated per-AZ node groups.
