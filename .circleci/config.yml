@@ -56,6 +56,22 @@ jobs:
           name: Lint chart
           command: helm lint charts/ao-data-platform
       - run:
+          name: Kubernetes 1.29 render fails the kubeVersion floor
+          # Chart.yaml declares kubeVersion: ">=1.30.0-0" so minDomains (GA in 1.30)
+          # never renders against an API server too old to honor it. That floor is
+          # otherwise untested here: every render job pins its own --kube-version or
+          # falls back to the Helm binary's default, so a regression that weakens or
+          # drops the floor (e.g. losing the "-0" suffix, or deleting the line) would
+          # go green. Assert a pre-floor version is rejected at render time.
+          command: |
+            if helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --kube-version 1.29.0 > /dev/null 2>&1; then
+              echo "Expected render to fail against Kubernetes 1.29.0 (below the chart's kubeVersion floor of >=1.30.0-0), but it succeeded."
+              exit 1
+            fi
+            echo "Kubernetes 1.29.0 correctly failed the kubeVersion floor."
+      - run:
           name: Render chart and verify operator label allowlist
           # `helm lint` does not fully render subchart values, so a typo or wrong
           # nesting in a deep path would pass lint while being silently ignored.
@@ -63,8 +79,12 @@ jobs:
           # guard) and assert the operator's `label.include` allowlist actually
           # reaches the generated operator config — the exact gap a no-op
           # chart-version bump exploited to recreate the ClickHouse StatefulSet.
+          # --kube-version pins the render to the chart's declared floor itself,
+          # not the Helm binary's own default, so this and every step downstream
+          # that reuses rendered.yaml exercise the floor CI is meant to enforce.
           command: |
             helm template charts/ao-data-platform \
+              --kube-version 1.30.0 \
               -f charts/ao-data-platform/ci/lint-values.yaml > rendered.yaml
             keys=$(awk '
               /^    label:/ { inlabel = 1 }
@@ -404,7 +424,7 @@ jobs:
           # a broken minDomains derivation would let an under-zoned cluster pack an AZ.
           command: |
             facts=$(awk '
-              /^---$/ { chi = 0; chk = 0; zk = 0; set = 0 }
+              /^---$/ { chi = 0; chk = 0; zk = 0; set = 0; chcs = 0; kpcs = 0 }
               /^kind: "ClickHouseInstallation"$/       { chi = 1 }
               /^kind: "ClickHouseKeeperInstallation"$/ { chk = 1 }
               chi && /^    [a-zA-Z]/   { zk = 0; set = 0 }
@@ -415,12 +435,16 @@ jobs:
               chi && set && /^      default_replica_path: / { print "path=" $2 }
               chi && set && /^      default_replica_name: / { print "name=" $2 }
               chi && /^          replicasCount: /           { print "chreplicas=" $2 }
-              chi && /^              minDomains: /          { print "chminDomains=" $2 }
+              chi && /^              minDomains: /          { print "chminDomains=" $2; chcs = 1 }
+              chi && chcs && /^              topologyKey: /       { print "chkey=" $2 }
+              chi && chcs && /^              whenUnsatisfiable: / { print "chwhen=" $2; chcs = 0 }
               chk && /^    [a-zA-Z]/   { kset = 0 }
               chk && /^    settings:/  { kset = 1 }
               chk && kset && /^      keeper_server\/four_letter_word_allow_list: / { print "fourlw=" $2 }
               chk && /^          replicasCount: /           { print "voters=" $2 }
-              chk && /^              minDomains: /          { print "kpminDomains=" $2 }
+              chk && /^              minDomains: /          { print "kpminDomains=" $2; kpcs = 1 }
+              chk && kpcs && /^              topologyKey: /       { print "kpkey=" $2 }
+              chk && kpcs && /^              whenUnsatisfiable: / { print "kpwhen=" $2; kpcs = 0 }
             ' rendered.yaml)
             assert_fact() {
               if ! echo "$facts" | grep -qxF "$1"; then
@@ -440,6 +464,14 @@ jobs:
             # that an under-zoned cluster fails loud instead of packing replicas into one AZ).
             assert_fact 'chminDomains=3'
             assert_fact 'kpminDomains=5'
+            # minDomains is only valid alongside whenUnsatisfiable: DoNotSchedule — the API
+            # server rejects it under ScheduleAnyway — and only means anything on the zone
+            # topology key. Pin both on the same constraint that carries minDomains so a
+            # flip to ScheduleAnyway or a topologyKey typo fails here instead of at apply.
+            assert_fact 'chwhen=DoNotSchedule'
+            assert_fact 'chkey=topology.kubernetes.io/zone'
+            assert_fact 'kpwhen=DoNotSchedule'
+            assert_fact 'kpkey=topology.kubernetes.io/zone'
             assert_fact 'fourlw="ruok,mntr,srvr,stat,conf"'
             echo "ClickHouse replication wiring rendered correctly."
       - run:
@@ -498,14 +530,17 @@ jobs:
               --set tls.enabled=false \
               --set clickhouse.replicasCount=1 \
               --set keeper.replicasCount=1 > dev-shape.yaml
-            count=$(grep -Ec '^          replicasCount: 1$' dev-shape.yaml)
+            # `grep -c` exits 1 on zero matches, which would kill the step under
+            # `-eo pipefail` before the check below can echo its own diagnostic —
+            # `|| true` keeps the exit code out of the assignment.
+            count=$(grep -Ec '^          replicasCount: 1$' dev-shape.yaml || true)
             if [ "$count" -ne 2 ]; then
               echo "Expected replicasCount: 1 in both the CHI and CHK layouts; found ${count} occurrence(s)."
               exit 1
             fi
             # minDomains tracks replicasCount, so the dev shape must render minDomains: 1
             # on both zone spreads (a trivially-satisfied single-domain constraint).
-            md=$(grep -Ec '^              minDomains: 1$' dev-shape.yaml)
+            md=$(grep -Ec '^              minDomains: 1$' dev-shape.yaml || true)
             if [ "$md" -ne 2 ]; then
               echo "Expected minDomains: 1 in both the CHI and CHK zone spreads; found ${md} occurrence(s)."
               exit 1

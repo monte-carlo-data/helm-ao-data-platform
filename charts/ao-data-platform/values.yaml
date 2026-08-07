@@ -19,8 +19,10 @@ clickhouse:
   # unconverted tables starts an independent, empty second lineage. See the
   # README's "ClickHouse replication and Keeper" section. This count also feeds
   # minDomains on the CHI zone spread (templates/clickhouse-installation.yaml) —
-  # one replica per zone — so an under-zoned cluster leaves the excess replica
-  # Pending rather than silently co-locating both replicas in one AZ.
+  # one replica per zone — which makes it a ceiling, not just a target: it must
+  # not exceed the number of availability zones with eligible nodes, or the
+  # excess replicas stay Pending permanently instead of co-locating the way
+  # pre-4.2.0 releases allowed.
   replicasCount: 2
   storageClass: ""
   storageSize: 100Gi
@@ -202,14 +204,16 @@ clickhouse:
 # the two-apply HA migration ordering.
 keeper:
   # Number of Keeper voters. Prod HA = 3 (a quorum of 2 tolerates losing one voter /
-  # one AZ); dev = 1. Should be odd (Raft quorum). The consuming terraform derives
-  # this from the length of its Keeper availability-zone list, so the voter count
-  # cannot drift from the number of per-AZ Keeper node groups. It also feeds
-  # minDomains on the CHK zone spread (templates/clickhouse-keeper-installation.yaml),
-  # so an under-zoned ensemble leaves later voters Pending rather than packing an AZ.
-  # Named `replicasCount`
-  # (not the Helm-conventional `replicaCount`) to match both the CRD field it feeds
-  # (the CHK's layout.replicasCount) and its sibling clickhouse.replicasCount.
+  # one AZ); dev = 1. Should be odd (Raft quorum), and capped at the number of
+  # availability zones with eligible nodes — it also feeds minDomains on the CHK
+  # zone spread (templates/clickhouse-keeper-installation.yaml), so a count above
+  # the AZ ceiling leaves the excess voters Pending permanently rather than
+  # packing an AZ the way pre-4.2.0 releases allowed. The consuming terraform
+  # derives this from the length of its Keeper availability-zone list, so the
+  # voter count cannot drift from the number of per-AZ Keeper node groups. Named
+  # `replicasCount` (not the Helm-conventional `replicaCount`) to match both the
+  # CRD field it feeds (the CHK's layout.replicasCount) and its sibling
+  # clickhouse.replicasCount.
   replicasCount: 3
   # Keeper image. Pinned to track the ClickHouse server release line (clickhouse.image
   # is clickhouse-server:26.4.3); the AO team owns periodic bumps, same as the server
