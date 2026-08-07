@@ -18,6 +18,8 @@ The ClickHouse instance ships with production hardening: a capped memory ceiling
 
 > **Chart-version bumps no longer recreate ClickHouse:** the ClickHouse operator propagates only a fixed allowlist of stable labels onto the resources it generates. A chart-version bump changes the volatile `helm.sh/chart` label, but that label is no longer stamped onto the StatefulSet's immutable `volumeClaimTemplates`, so the bump no longer forces a delete/recreate of the ClickHouse StatefulSet.
 
+> **Upgrading to 4.3.0:** the ClickHouse and Keeper zone topology spreads now set `minDomains` (equal to `replicasCount`), which makes the one-replica/voter-per-zone guarantee real. Previously `maxSkew: 1` alone did not enforce it: when only one zone had an eligible node at scheduling time, every replica/voter packed into that zone and a bound zonal PV then pinned them there for the StatefulSet's life — a cluster that reads as healthy while it has already lost the single-AZ-failure tolerance HA exists for. Before upgrading, check current placement — `kubectl get pods -o wide` against your nodes' zones — because the upgrade does not rebalance a cluster that's already packed this way. A fresh, under-zoned install still leaves the excess replicas/voters `Pending` until a node in the missing zone appears, same as before. A correctly-provisioned cluster (nodes already present in every zone) lands its pods back in the same zones they already occupy — but the upgrade still rolls every ClickHouse replica and Keeper voter one at a time, since the podTemplate changed; it is not a no-op. A cluster that was already co-located, though, hits the constraint on that same rolling restart: the recreated pod now fails it and sticks `Pending` — and adding a node in the missing zone will **not** fix it, because the pod's PVC is already bound to a zonal PV in the old zone whose `nodeAffinity` excludes the new one. The fix is to make sure the missing zone's node group exists, then delete the co-located pod **and its PVC** so it re-binds to a fresh PV in the empty zone — a Keeper voter re-syncs from the Raft quorum and a ClickHouse replica re-replicates from a surviving replica, both safe by design. `minDomains` is GA in Kubernetes 1.30, so the chart now declares `kubeVersion: ">=1.30.0-0"` — an install against an older cluster fails render rather than silently dropping the field — and it is valid only with `DoNotSchedule`, which is already set.
+>
 > **Upgrading to 4.0.0:** a breaking major release for gateway installs. When `gateway.enabled=true`, `gateway.provider` (`azure` or `gke`) is now **required with no default** — a gateway-enabled install that omits it fails render with `gateway.provider must be "azure" or "gke"`. This is deliberate: the chart is cloud-neutral, and a silent default would misroute a forgetful install (e.g. send a GKE user into an `azureDNS` error). Existing Azure gateway installs upgrading from ≤3.x must add **`gateway.provider: azure`** — a one-line change (the companion Terraform module sets it). Relatedly, `gateway.className` is no longer hard-defaulted; it is **derived** from `gateway.provider` (`azure`→`approuting-istio`, `gke`→`gke-l7-rilb`), with an explicit `gateway.className` still honored as an override. Non-gateway installs (the default, and all AWS installs) are unaffected.
 >
 > **Upgrading to 3.0.0:** a breaking major release — the default install shape changes. The schema SQL is now clustered-only — every table is a path-less `Replicated*` engine, all DDL (including the schema-Job TTL `ALTER`s) runs `ON CLUSTER '{cluster}'`, and `clickhouse.replicasCount` defaults to **2**. A bare install now deploys the prod HA shape (2 ClickHouse replicas + 3 Keeper voters, both hard-spread across zones); dev/single-AZ installs set both counts to `1`. **Installs upgrading with existing pre-3.0.0 (plain `MergeTree`) data must pin `clickhouse.replicasCount: 1` until the tables have been converted in place** — see [the migration ordering](#high-availability-and-the-migration-ordering). Readiness also switches from the operator-injected `/ping` to the writer-safe `/ready` handler: a replica partitioned from Keeper drops out of the Service until it rejoins, and a joining replica stays not-Ready through its registration/metadata phase — though it can turn Ready before its historical part fetches finish, so gate operational waits on `system.replicas`, not pod Ready (see [Writer-safe readiness](#writer-safe-readiness-ready)).
@@ -39,12 +41,20 @@ rather than ClickHouse's built-in `{uuid}` default.
 
 ### Keeper sizing and scheduling
 
-- **Voter count should be odd** (Raft quorum). 3 voters tolerate losing one; use `1` for dev.
+- **Voter count should be odd** (Raft quorum) and capped at the number of AZs with
+  eligible nodes — 3 voters tolerate losing one; use `1` for dev. `minDomains` (below)
+  requires one zone per voter, so odd is not license to go above the AZ count: 3 voters
+  in 3 AZs is fine, but 5 voters in a 3-AZ region — which pre-4.3.0 just packed as
+  2/2/1 — no longer schedules, and the excess stays `Pending` permanently.
 - **Hard per-AZ spread:** the CHK pod template applies a `DoNotSchedule` topology spread on
-  `topology.kubernetes.io/zone`, so a 3-voter ensemble demands schedulable nodes in three
-  zones. A voter with no valid zone stays `Pending` — expected on single-AZ or local
-  clusters; set `keeper.replicasCount: 1` there. The spread is deliberately hard: packing two
-  voters into one AZ would silently forfeit the ensemble's single-AZ-failure tolerance.
+  `topology.kubernetes.io/zone` with `minDomains` set to the voter count, so a 3-voter
+  ensemble demands schedulable nodes in three distinct zones. `minDomains` is what enforces
+  it: `maxSkew: 1` alone would let all voters pack into a single eligible zone — a zone with
+  no eligible node is not a zero-count domain, it is not a domain at all — so without it an
+  under-zoned ensemble co-locates silently. A voter with no zone to land in stays `Pending`
+  — expected on single-AZ or local clusters; set `keeper.replicasCount: 1` there. The spread
+  is deliberately hard: packing two voters into one AZ would forfeit the ensemble's
+  single-AZ-failure tolerance.
 - Keeper persists only coordination metadata (Raft log + snapshots), so its PVCs are small
   (`keeper.storageSize`, default `10Gi`) and a replaced voter re-syncs from the quorum.
 - Pin voters to dedicated nodes with `keeper.nodeSelector` / `keeper.tolerations`, same
@@ -87,8 +97,10 @@ From chart `3.0.0` the default install is HA: the `sql/*.sql` table definitions 
 path-less `Replicated*` engines, every DDL statement runs `ON CLUSTER '{cluster}'` (so the
 single schema Job propagates schema to every replica via Keeper's distributed DDL queue),
 and the ClickHouse pods carry the same hard per-zone topology spread as the Keeper voters —
-`DoNotSchedule`, so the second replica needs a schedulable node in a second zone or it
-stays `Pending`.
+`DoNotSchedule` with `minDomains` set to `clickhouse.replicasCount`, so the second replica
+needs a schedulable node in a second zone or it stays `Pending`. `minDomains` is what makes
+that unconditional: without it two replicas would silently pack into a single eligible zone
+at install and a bound zonal PV would pin them there for good.
 
 Fresh installs need no ceremony: both replicas create their tables at the same macro-based
 ZooKeeper path and replicate from the first insert. Dev/small installs set
@@ -161,7 +173,7 @@ writer safety here is deliberate.
 ## Prerequisites
 
 - Helm 3
-- A Kubernetes cluster (k3s for local dev, EKS for AWS, AKS for Azure, GKE for GCP)
+- A Kubernetes cluster, **1.30 or newer** (k3s for local dev, EKS for AWS, AKS for Azure, GKE for GCP) — the chart declares `kubeVersion: ">=1.30.0-0"`, the floor for the `minDomains` zone-spread field; an older cluster fails render.
 - [cert-manager](https://cert-manager.io/) installed in the cluster (for TLS, enabled by default)
 - [External Secrets Operator](https://external-secrets.io/) installed in the cluster
 - A `SecretStore` or `ClusterSecretStore` configured to access your secrets backend (AWS Secrets Manager, Azure Key Vault, GCP Secret Manager, Fake provider for local dev, etc.)
@@ -364,7 +376,8 @@ helm upgrade --install ao-data-platform charts/ao-data-platform/ -n montecarlo -
 ```
 
 For a full post-deploy check, run `hack/verify-deployment-aws.sh -n <namespace> -r <region>` —
-it verifies pods, ClickHouse, the OTel collector, certs, and the NLB/DNS endpoints.
+it verifies pods, ClickHouse, the OTel collector, certs, zone spread (replicas/voters in
+distinct AZs), and the NLB/DNS endpoints.
 
 ## Deploying to Azure (AKS)
 
@@ -433,7 +446,8 @@ with `kubectl get gateway,httproute,certificate -n montecarlo`.
 
 For a full post-deploy check, run `hack/verify-deployment-azure.sh -n <namespace>` — it
 auto-detects gateway vs internal-LB mode and verifies pods, ClickHouse, the OTel collector,
-certs, and (in gateway mode) the Gateway/HTTPRoute/BackendTLSPolicy resources.
+certs, zone spread (replicas/voters in distinct AZs), and (in gateway mode) the
+Gateway/HTTPRoute/BackendTLSPolicy resources.
 
 ## Deploying to GCP (GKE)
 
@@ -507,8 +521,9 @@ enabling the gateway with `tls.enabled=false` fails the render. Verify with
 `kubectl get gateway,httproute,certificate -n montecarlo`.
 
 For a full post-deploy check, run `hack/verify-deployment-gcp.sh -n <namespace>` — it verifies
-pods, ClickHouse, the OTel collector, certs, StorageClass, and the Gateway/HTTPRoute/BackendTLSPolicy
-+ GCPBackendPolicy/HealthCheckPolicy resources.
+pods, ClickHouse, the OTel collector, certs, StorageClass, zone spread (replicas/voters in
+distinct AZs), and the Gateway/HTTPRoute/BackendTLSPolicy + GCPBackendPolicy/HealthCheckPolicy
+resources.
 
 ## CI / CD
 
@@ -660,7 +675,7 @@ helm upgrade ao-data-platform oci://registry-1.docker.io/montecarlodata/ao-data-
 
 | Value | Default | Description |
 |-------|---------|-------------|
-| `clickhouse.replicasCount` | `2` | Number of ClickHouse replicas in the single-shard cluster. Default is the HA shape (hard per-zone spread); set `1` for dev/single-AZ installs. On installs with pre-existing plain-`MergeTree` data, hold at `1` until the in-place conversion has verified — see [ClickHouse replication and Keeper](#clickhouse-replication-and-keeper). |
+| `clickhouse.replicasCount` | `2` | Number of ClickHouse replicas in the single-shard cluster. Default is the HA shape (hard per-zone spread; also sets `minDomains` on the zone constraint, so this value is a ceiling — it must not exceed the number of availability zones with eligible nodes, or the excess replicas stay `Pending` permanently instead of co-locating); set `1` for dev/single-AZ installs. On installs with pre-existing plain-`MergeTree` data, hold at `1` until the in-place conversion has verified — see [ClickHouse replication and Keeper](#clickhouse-replication-and-keeper). |
 | `clickhouse.storageSize` | `100Gi` | PVC size for ClickHouse data. |
 | `clickhouse.ttlDays` | `30` | Retention in days for the telemetry tables (raw traces, trace-id index, normalized spans) and their derived annotations (`conversation_eval_scores`, `span_eval_scores`, `conversation_cluster_assignments`). Re-applied on every install/upgrade via `ALTER TABLE … MODIFY TTL`. Does **not** govern the `llm_*` worker queue tables (they keep a fixed TTL). See the telemetry-retention note above. |
 | `clickhouse.nodeSelector` | `{}` | Node selector for the ClickHouse pod (wired into the CHI's `podTemplate`) |
@@ -699,7 +714,7 @@ helm upgrade ao-data-platform oci://registry-1.docker.io/montecarlodata/ao-data-
 | `clickhouse.hostname` | `""` | If set, adds `external-dns.alpha.kubernetes.io/hostname` annotation to the ClickHouse Service |
 | `clickhouse.service.type` | `ClusterIP` | ClickHouse Service type (`ClusterIP`, `LoadBalancer`) |
 | `clickhouse.service.annotations` | `{}` | Annotations on the ClickHouse Service (e.g. AWS NLB annotations) |
-| `keeper.replicasCount` | `3` | Number of Keeper voters. Should be odd (Raft quorum); 3 for production HA, `1` for dev/single-AZ clusters (the default 3 require nodes in three zones — see the Keeper section). |
+| `keeper.replicasCount` | `3` | Number of Keeper voters. Should be odd (Raft quorum) and must not exceed the number of availability zones with eligible nodes; 3 for production HA, `1` for dev/single-AZ clusters (the default 3 require nodes in three zones — see the Keeper section). Also sets `minDomains` on the voter zone spread, so a count above the AZ ceiling leaves the excess voters `Pending` permanently rather than packing an AZ. |
 | `keeper.image` | `clickhouse/clickhouse-keeper:26.4.3` | Keeper image; pinned to track the ClickHouse server release line. |
 | `keeper.storageClass` | `""` | StorageClass for the Keeper PVCs (empty = cluster default). |
 | `keeper.storageSize` | `10Gi` | PVC size per Keeper voter. Keeper stores only Raft log + snapshots, so a small volume is ample. |

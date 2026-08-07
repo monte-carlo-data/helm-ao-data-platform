@@ -1,3 +1,6 @@
+{{- if lt (int .Values.clickhouse.replicasCount) 1 }}
+{{- fail "clickhouse.replicasCount must be >= 1. minDomains on the zone topologySpreadConstraints below is set from this value, and the Kubernetes API rejects minDomains: 0." }}
+{{- end }}
 {{- /* --show-only safety: validate the gateway provider enum even here. This template is
    cloud-agnostic but carries one gateway.provider-conditional (the gke appProtocol below),
    so enforcing the same guard the gateway-*.yaml files use keeps an isolated render of just
@@ -363,8 +366,20 @@ spec:
           # deliberate: two replicas in one AZ would silently forfeit the
           # single-AZ-failure tolerance HA exists for. Trivially satisfied at
           # replicasCount: 1 (dev).
+          #
+          # minDomains is what makes that guarantee real; maxSkew alone does not.
+          # Skew is measured only across zones that already hold an eligible
+          # (nodeSelector-matching) node — a zone with no such node is not a
+          # zero-count domain, it is not a domain at all. With one eligible zone the
+          # global minimum is that zone's own count, so skew stays 0 and both
+          # replicas pack in. minDomains forces the global minimum to 0 while fewer
+          # than this many eligible domains exist, so replica 2's skew becomes 2 and
+          # it stays Pending until a node in the second zone appears. This chart runs
+          # one replica per zone, so minDomains == replicasCount == the zone count it
+          # must cover. GA in k8s 1.30; valid only with DoNotSchedule.
           topologySpreadConstraints:
             - maxSkew: 1
+              minDomains: {{ .Values.clickhouse.replicasCount }}
               topologyKey: topology.kubernetes.io/zone
               whenUnsatisfiable: DoNotSchedule
               labelSelector:
