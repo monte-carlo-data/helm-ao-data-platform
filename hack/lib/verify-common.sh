@@ -9,9 +9,10 @@
 #   source "$SCRIPT_DIR/lib/verify-common.sh"
 #
 # It provides the presentation helpers (banner/run_cmd/pass/fail + colours), the
-# ClickHouse exec helpers, and the cloud-independent least-privilege user-model check
-# that is identical across all three clouds. Cloud-specific checks (gateway/DNS/LB,
-# AWS IRSA/NLB, StorageClass, smoke test, etc.) stay in the per-cloud scripts.
+# ClickHouse exec helpers, and the cloud-independent checks that are identical across
+# all three clouds: the least-privilege user model and the zone-spread assertion.
+# Cloud-specific checks (gateway/DNS/LB, AWS IRSA/NLB, StorageClass, smoke test, etc.)
+# stay in the per-cloud scripts.
 #
 # Sourcing scripts must have `set -euo pipefail` in effect. Helpers that read cluster
 # state resolve $NS (namespace) and $CH_POD (ClickHouse pod) at call time, so those
@@ -241,19 +242,27 @@ verify_clickhouse_user_model() {
 # there for the StatefulSet's life — a cluster that reads as "Running" and healthy while
 # it has already lost the single-AZ-failure tolerance HA exists for, until the first
 # reschedule turns a co-located replica into a wiped one. Placement is not visible in any
-# other check here, so read it directly: fail if any replica set occupies fewer distinct
-# zones than it has pods. Requires $NS.
+# other check here, so read it directly: fail if a replica set's pod count doesn't match
+# its CR's declared replicasCount, or if it occupies fewer distinct zones than it has
+# pods. Requires $NS.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Assert the pods matching a selector occupy as many distinct zones as there are pods
-# (no two share a zone). Fails if a pod is unscheduled (no node — an under-zoned cluster
-# leaves the excess replica Pending) or its node carries no zone label. Requires $NS and
-# a precomputed node→zone TSV in $2. $1 = friendly name, $3 = label selector.
-_assert_distinct_zones() {  # friendly-name node-zone-tsv selector
-  local what="$1" node_zones="$2" selector="$3"
+# Assert the pods matching a selector (a) match the CR's declared replica count and
+# (b) occupy as many distinct zones as there are pods (no two share a zone). Fails if:
+# the declared count can't be read (empty — never silently skip), the observed pod
+# count differs from it (a half-built cluster, e.g. 1 of 2 replicas, must not pass), a
+# pod is unscheduled (no node — an under-zoned cluster leaves the excess replica
+# Pending), or its node carries no zone label. A terminating pod (deletionTimestamp
+# set) is excluded so it can't inflate the count while still Running. Requires $NS and
+# a precomputed node→zone TSV in $2. $1 = friendly name, $3 = label selector, $4 =
+# declared replica count from the owning CR.
+_assert_distinct_zones() {  # friendly-name node-zone-tsv selector declared-count
+  local what="$1" node_zones="$2" selector="$3" declared="$4"
   local pod_nodes rows pods_n zones_n pod node zone
+  [[ -z "$declared" ]] && fail "$what — could not read the declared replica count from its CR; cannot verify zone spread."
   pod_nodes=$(kubectl get pods -n "$NS" -l "$selector" -o json 2>/dev/null \
-    | jq -r '.items[] | [.metadata.name, (.spec.nodeName // "")] | @tsv')
+    | jq -r '.items[] | select(.metadata.deletionTimestamp == null) | [.metadata.name, (.spec.nodeName // "")] | @tsv' \
+    || true)
   [[ -z "$pod_nodes" ]] && fail "$what — no pods matched '$selector'; cannot verify zone spread."
   rows=""
   while IFS=$'\t' read -r pod node; do
@@ -265,6 +274,7 @@ _assert_distinct_zones() {  # friendly-name node-zone-tsv selector
   done <<< "$pod_nodes"
   printf '%s' "$rows" | sed 's/^/    /'
   pods_n=$(printf '%s' "$rows" | grep -c .)
+  [[ "$pods_n" -ne "$declared" ]] && fail "$what — ${pods_n} pod(s) found for a declared replicasCount of ${declared}."
   zones_n=$(printf '%s' "$rows" | awk -F'\t' 'NF { print $3 }' | sort -u | grep -c .)
   [[ "$zones_n" -lt "$pods_n" ]] && fail "$what — ${pods_n} replica(s) occupy only ${zones_n} distinct zone(s); replicas are co-located and a single AZ failure can break the cluster."
   echo -e "  ${GREEN}  ${what}: ${pods_n} replica(s) across ${zones_n} distinct zone(s)${RESET}"
@@ -273,11 +283,17 @@ _assert_distinct_zones() {  # friendly-name node-zone-tsv selector
 verify_zone_spread() {
   : "${NS:?NS must be set}"
   banner "ClickHouse replicas and Keeper voters each occupy a distinct zone"
-  local node_zones
+  local node_zones ch_expected keeper_expected
   node_zones=$(kubectl get nodes -o json 2>/dev/null \
-    | jq -r '.items[] | [.metadata.name, (.metadata.labels["topology.kubernetes.io/zone"] // "")] | @tsv')
-  [[ -z "$node_zones" ]] && fail "Could not read any nodes to resolve zones."
-  _assert_distinct_zones "ClickHouse (chi=otel)"    "$node_zones" "clickhouse.altinity.com/chi=otel"
-  _assert_distinct_zones "Keeper (chk=otel)"        "$node_zones" "clickhouse-keeper.altinity.com/chk=otel"
+    | jq -r '.items[] | [.metadata.name, (.metadata.labels["topology.kubernetes.io/zone"] // "")] | @tsv' \
+    || true)
+  [[ -z "$node_zones" ]] && fail "Could not read any nodes to resolve zones (listing nodes is cluster-scoped — check RBAC)."
+  # Declared replica/voter counts, read the same way as CHECK 4's KEEPER_EXPECTED.
+  ch_expected=$(kubectl get chi -n "$NS" otel \
+    -o jsonpath='{.spec.configuration.clusters[0].layout.replicasCount}' 2>/dev/null || true)
+  keeper_expected=$(kubectl get chk -n "$NS" otel \
+    -o jsonpath='{.spec.configuration.clusters[0].layout.replicasCount}' 2>/dev/null || true)
+  _assert_distinct_zones "ClickHouse (chi=otel)"    "$node_zones" "clickhouse.altinity.com/chi=otel"        "$ch_expected"
+  _assert_distinct_zones "Keeper (chk=otel)"        "$node_zones" "clickhouse-keeper.altinity.com/chk=otel" "$keeper_expected"
   pass "ClickHouse replicas and Keeper voters are spread across distinct zones."
 }

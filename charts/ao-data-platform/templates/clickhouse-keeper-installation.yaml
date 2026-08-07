@@ -1,3 +1,6 @@
+{{- if lt (int .Values.keeper.replicasCount) 1 }}
+{{- fail "keeper.replicasCount must be >= 1. minDomains on the zone topologySpreadConstraints below is set from this value, and the Kubernetes API rejects minDomains: 0." }}
+{{- end }}
 # ClickHouse Keeper ensemble (Raft coordination for ReplicatedMergeTree).
 #
 # Deployed as an Altinity ClickHouseKeeperInstallation (CHK); the same

@@ -1,3 +1,6 @@
+{{- if lt (int .Values.clickhouse.replicasCount) 1 }}
+{{- fail "clickhouse.replicasCount must be >= 1. minDomains on the zone topologySpreadConstraints below is set from this value, and the Kubernetes API rejects minDomains: 0." }}
+{{- end }}
 {{- /* --show-only safety: validate the gateway provider enum even here. This template is
    cloud-agnostic but carries one gateway.provider-conditional (the gke appProtocol below),
    so enforcing the same guard the gateway-*.yaml files use keeps an isolated render of just

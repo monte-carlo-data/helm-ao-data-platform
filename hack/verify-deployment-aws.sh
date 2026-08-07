@@ -1067,11 +1067,6 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 # CHECK 37 — Zone spread: replicas/voters across distinct zones (shared; see lib/verify-common.sh)
 # ─────────────────────────────────────────────────────────────────────────────
-# Placement is invisible to every check above — a zone-packed cluster reads as
-# healthy and passes them all, which is exactly how a two-replica "HA" cluster can
-# run co-located and undetected until its first reschedule wipes a replica. Assert
-# distinct-zone placement here so that state fails verification instead of sitting
-# unnoticed.
 verify_zone_spread
 
 # ─────────────────────────────────────────────────────────────────────────────
