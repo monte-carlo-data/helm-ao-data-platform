@@ -22,7 +22,7 @@ clickhouse:
   # one replica per zone — which makes it a ceiling, not just a target: it must
   # not exceed the number of availability zones with eligible nodes, or the
   # excess replicas stay Pending permanently instead of co-locating the way
-  # pre-4.2.0 releases allowed.
+  # pre-4.3.0 releases allowed.
   replicasCount: 2
   storageClass: ""
   storageSize: 100Gi
@@ -208,7 +208,7 @@ keeper:
   # availability zones with eligible nodes — it also feeds minDomains on the CHK
   # zone spread (templates/clickhouse-keeper-installation.yaml), so a count above
   # the AZ ceiling leaves the excess voters Pending permanently rather than
-  # packing an AZ the way pre-4.2.0 releases allowed. The consuming terraform
+  # packing an AZ the way pre-4.3.0 releases allowed. The consuming terraform
   # derives this from the length of its Keeper availability-zone list, so the
   # voter count cannot drift from the number of per-AZ Keeper node groups. Named
   # `replicasCount` (not the Helm-conventional `replicaCount`) to match both the
