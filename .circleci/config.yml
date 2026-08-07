@@ -47,6 +47,19 @@ jobs:
               bash -n "$f" || { echo "syntax error in $f"; exit 1; }
             done
             echo "hack/ shell syntax OK."
+      - run:
+          name: Shellcheck (hack/)
+          # bash -n only catches parse errors; shellcheck catches the runtime classes
+          # these scripts have actually shipped — e.g. a command substitution without
+          # `|| true` dying under `set -euo pipefail` before its diagnostic prints.
+          # -x follows the `# shellcheck source=` directives into lib/verify-common.sh
+          # (so variables the lib consumes aren't flagged unused in the callers), and
+          # -P SCRIPTDIR resolves those directives relative to each script.
+          command: |
+            sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+            shellcheck --version
+            shellcheck -x -P SCRIPTDIR hack/*.sh hack/lib/*.sh
+            echo "hack/ shellcheck OK."
       - install-helm
       - add-helm-repos
       - run:

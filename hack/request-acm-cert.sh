@@ -45,7 +45,7 @@ CERT_ARN=$(aws acm request-certificate \
 echo "Certificate ARN: ${CERT_ARN}"
 
 echo "Waiting for validation record to become available..."
-for i in $(seq 1 30); do
+for _ in $(seq 1 30); do
   VALIDATION=$(aws acm describe-certificate \
     --certificate-arn "$CERT_ARN" \
     --region "$REGION" \
