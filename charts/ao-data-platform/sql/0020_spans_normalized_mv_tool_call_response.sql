@@ -38,6 +38,14 @@
 -- alone: gen_ai.system_instructions is a bare [{type, content}] parts array that
 -- never carries a tool result.
 --
+-- Also folds in an is_llm_call classification fix (same MODIFY QUERY rewrite, so it
+-- rides here rather than in a second full-body copy of the view): the predicate
+-- matched gen_ai.operation.name='chat' only, missing 'generate_content' (google-genai
+-- / ADK) and 'text_completion'. Those LLM spans went unmarked whenever
+-- gen_ai.request.model was empty -- adk-go sets model from the client's Name(), which
+-- is blank behind an OpenAI-compatible gateway. is_tool_call already matched adk-go's
+-- 'execute_tool', so this restores the LLM-side parity.
+--
 -- Supersedes the SELECT defined in 0019_spans_normalized_mv_genai_semconv.sql.
 -- Shipped as a new migration (not an edit to 0019) because the schema Job re-runs
 -- every *.sql on each upgrade and 0006 — the CREATE ... IF NOT EXISTS that owns this
@@ -226,7 +234,12 @@ SELECT
 
     (coalesce(CAST(SpanAttributes.gen_ai.request.model AS Nullable(String)), '') != '')
         OR (coalesce(CAST(SpanAttributes.llm.model_name AS Nullable(String)), '') != '')
-        OR (coalesce(CAST(SpanAttributes.gen_ai.operation.name AS Nullable(String)), '') = 'chat')
+        -- gen_ai.operation.name identifies an LLM span even when request.model is
+        -- empty (adk-go / google-genai set model from the client's Name(), blank
+        -- behind an OpenAI-compatible gateway). Match every semconv LLM op, not just
+        -- 'chat' -- 'generate_content' (google-genai/ADK) and 'text_completion' are
+        -- equally LLM calls; without them such spans go unmarked when model is empty.
+        OR (coalesce(CAST(SpanAttributes.gen_ai.operation.name AS Nullable(String)), '') IN ('chat', 'generate_content', 'text_completion'))
         OR (coalesce(CAST(SpanAttributes.snow.ai.observability.agent.planning.model AS Nullable(String)), '') != '') AS is_llm_call,
 
     (coalesce(CAST(SpanAttributes.traceloop.span.kind AS Nullable(String)), '') = 'tool')
