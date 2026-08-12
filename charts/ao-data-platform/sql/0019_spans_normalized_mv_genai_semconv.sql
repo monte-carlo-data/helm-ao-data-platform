@@ -115,7 +115,10 @@ WITH
     ))) AS _completion_indices
 
 SELECT
-    ServiceName AS service_name,
+    coalesce(
+        nullIf(CAST(SpanAttributes.montecarlo.agent_name AS Nullable(String)), ''),
+        ServiceName
+    ) AS service_name,
     TraceId AS trace_id,
     SpanId AS span_id,
     ParentSpanId AS parent_span_id,
