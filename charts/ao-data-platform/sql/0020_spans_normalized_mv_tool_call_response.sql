@@ -72,6 +72,19 @@
 -- is blank behind an OpenAI-compatible gateway. is_tool_call already matched adk-go's
 -- 'execute_tool', so this restores the LLM-side parity.
 --
+-- Also folds in a service_name resolution fix, for the same reason. This copy resolved
+-- service_name from ServiceName alone, while the monolith test fixture coalesces
+-- montecarlo.agent_name over it. The coalesce is the intended behavior -- it is the
+-- ingest contract the monolith's agent-scoped queries filter on -- but it was only ever
+-- added to the fixture, and each migration since copied its predecessor, so this side
+-- never picked it up. Platform-exported spans carry montecarlo.agent_name and no
+-- service.name resource attribute, so on deployed clusters their service_name was the
+-- raw ServiceName and agent-scoped queries silently missed them. Forward-only like the
+-- rest of this rewrite: rows already ingested keep the old value, leaving a mixed
+-- population until a backfill is decided separately. This file is the last writer of
+-- the view in this chart, so fixing it here is sufficient -- 0006 is a no-op CREATE on
+-- an existing cluster and 0019's SELECT is superseded by this one on every upgrade.
+--
 -- Supersedes the SELECT defined in 0019_spans_normalized_mv_genai_semconv.sql.
 -- Shipped as a new migration (not an edit to 0019) to hold 1:1 numbering parity with
 -- the monolith test fixture, where this file is 0013 and an in-place edit is not an
@@ -183,7 +196,10 @@ WITH
     ))) AS _completion_indices
 
 SELECT
-    ServiceName AS service_name,
+    coalesce(
+        nullIf(CAST(SpanAttributes.montecarlo.agent_name AS Nullable(String)), ''),
+        ServiceName
+    ) AS service_name,
     TraceId AS trace_id,
     SpanId AS span_id,
     ParentSpanId AS parent_span_id,
