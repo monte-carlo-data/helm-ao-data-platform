@@ -6,9 +6,14 @@
 -- `response`, not `content`. The part-concatenation introduced in 0019 reads only
 -- `content`, so such a part contributed '' and the whole message normalized to an
 -- empty string: the tool result rendered BLANK in the conversation / prompt message
--- view. (The result was never lost — it also lands on the execute_tool span's
--- tool_call_output from the gcp.vertex.agent.tool_response vendor key — so this was
--- a rendering gap, not a data gap.)
+-- view.
+--
+-- For PYTHON ADK this was a rendering gap, not a data gap: the result also lands on
+-- the execute_tool span's tool_call_output. That is NOT universal — tool_call_output
+-- coalesces only traceloop.entity.output, gen_ai.tool.call.result and
+-- gcp.vertex.agent.tool_response, all Python-ADK/vendor keys. A gateway-instrumented
+-- adk-go span carries no tool namespace at all, so for that emitter the part was the
+-- only copy of the result and the blank WAS a data gap.
 --
 -- Fix: a `tool_call_response` part now contributes its serialized `response`.
 --
@@ -34,9 +39,23 @@
 -- headline invariant: a raising SELECT expression fails the source INSERT into
 -- otel_traces and silently HALTS span ingestion cluster-wide.
 --
--- Note the system-prompt concat above (_system_prompt_text) is deliberately left
--- alone: gen_ai.system_instructions is a bare [{type, content}] parts array that
--- never carries a tool result.
+-- The system-prompt concat (_system_prompt_text, further down this SELECT) is
+-- deliberately left alone: gen_ai.system_instructions is a bare [{type, content}]
+-- parts array that never carries a tool result.
+--
+-- SIZE: `response` is tool-controlled and copied verbatim, so prompts[].message is
+-- unbounded here. It amplifies — gen_ai.input.messages on a follow-up turn replays
+-- every prior tool result, so a conversation grows O(turns^2) in total prompt bytes —
+-- and before this change every one of those parts contributed '', so the whole payload
+-- class is new to this column. Left unbounded deliberately: observed tool-span I/O is
+-- p95 ~13 KB / max ~23 KB against a 6 MB DC sync-invoke ceiling, and the per-span
+-- export path already degrades by halving its batch rather than failing. Reaching the
+-- ceiling needs a single response ~250x the observed max. If a large-payload emitter
+-- ever appears, bound it HERE rather than per-consumer — every downstream derivation
+-- (first_prompt/last_prompt/full_prompt, the eval transform prompts, the export) reads
+-- this one expression, and capping here keeps the lazy-chunk body_hash self-consistent.
+-- The discriminating measurement is the length() distribution of
+-- SpanAttributes['gen_ai.input.messages'] on a production cluster.
 --
 -- Also folds in an is_llm_call classification fix (same MODIFY QUERY rewrite, so it
 -- rides here rather than in a second full-body copy of the view): the predicate
@@ -236,9 +255,18 @@ SELECT
         OR (coalesce(CAST(SpanAttributes.llm.model_name AS Nullable(String)), '') != '')
         -- gen_ai.operation.name identifies an LLM span even when request.model is
         -- empty (adk-go / google-genai set model from the client's Name(), blank
-        -- behind an OpenAI-compatible gateway). Match every semconv LLM op, not just
-        -- 'chat' -- 'generate_content' (google-genai/ADK) and 'text_completion' are
-        -- equally LLM calls; without them such spans go unmarked when model is empty.
+        -- behind an OpenAI-compatible gateway). Match the semconv TEXT-GENERATION ops,
+        -- not just 'chat' -- 'generate_content' (google-genai/ADK) and
+        -- 'text_completion' are equally LLM calls; without them such spans go
+        -- unmarked when model is empty.
+        --
+        -- Deliberately NOT every GenAI op: 'embeddings' is excluded. is_llm_call feeds
+        -- count_llm_calls (a trace sort field and a breach-event field), so admitting
+        -- embedding spans would move that metric for existing monitors -- a metrics
+        -- decision, not a rendering one. Note the FIRST arm above already admits any
+        -- span carrying gen_ai.request.model, so an embeddings span that sets a model
+        -- still classifies as an LLM call; the exclusion only governs the
+        -- classify-from-operation-name path.
         OR (coalesce(CAST(SpanAttributes.gen_ai.operation.name AS Nullable(String)), '') IN ('chat', 'generate_content', 'text_completion'))
         OR (coalesce(CAST(SpanAttributes.snow.ai.observability.agent.planning.model AS Nullable(String)), '') != '') AS is_llm_call,
 
