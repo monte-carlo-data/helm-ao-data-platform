@@ -50,9 +50,14 @@
 -- every prior tool result, so a conversation grows O(turns^2) in total prompt bytes —
 -- and before this change every one of those parts contributed '', so the whole payload
 -- class is new to this column. Left unbounded deliberately: observed tool-span I/O is
--- p95 ~13 KB / max ~23 KB against a 6 MB DC sync-invoke ceiling, and the per-span
--- export path already degrades by halving its batch rather than failing. Reaching the
--- ceiling needs a single response ~250x the observed max. If a large-payload emitter
+-- p95 ~13 KB / max ~23 KB against a 6 MB DC sync-invoke ceiling, so reaching it needs a
+-- single response ~250x the observed max. That margin is the whole argument — overflow
+-- is NOT handled gracefully downstream, so this is not safe-by-construction. The TRACE
+-- export fetches spans in batches of 5 and halves on overflow (5->3->2->1), but a span
+-- that still overflows at size 1 is DROPPED and the run aborts. The SPAN export
+-- (agent_span_export_service) does a single fetch with no batching and FAILS outright,
+-- and its MAX_SPAN_IDS = 1000 request is sized assuming bounded per-span content.
+-- If a large-payload emitter
 -- ever appears, bound it HERE rather than per-consumer — every downstream derivation
 -- (first_prompt/last_prompt/full_prompt, the eval transform prompts, the export) reads
 -- this one expression, and capping here keeps the lazy-chunk body_hash self-consistent.
@@ -68,10 +73,15 @@
 -- 'execute_tool', so this restores the LLM-side parity.
 --
 -- Supersedes the SELECT defined in 0019_spans_normalized_mv_genai_semconv.sql.
--- Shipped as a new migration (not an edit to 0019) because the schema Job re-runs
--- every *.sql on each upgrade and 0006 — the CREATE ... IF NOT EXISTS that owns this
--- view — is a no-op on existing clusters, so an in-place edit would reach only fresh
--- installs; the same reasoning as 0019 itself and the 0014 DEFINER reparent.
+-- Shipped as a new migration (not an edit to 0019) to hold 1:1 numbering parity with
+-- the monolith test fixture, where this file is 0013 and an in-place edit is not an
+-- option: clickhouse-migrations md5-checksums applied files and raises on any change to
+-- one already applied. On the helm side an edit to 0019 WOULD reach existing clusters --
+-- schema-job.yaml runs every /sql/*.sql on install and upgrade with no ledger or
+-- checksum, and 0019 is itself an ALTER ... MODIFY QUERY, so re-running it re-applies
+-- the SELECT. Only 0006, the CREATE ... IF NOT EXISTS that owns this view, is a no-op on
+-- an existing cluster. So parity with the monolith numbering is the binding constraint
+-- here, not reachability on this side.
 -- ALTER ... MODIFY QUERY swaps the SELECT in place with no view rebuild and no
 -- ingestion gap; the output column set is unchanged, so 0007 (spans view) and 0012
 -- (conversations_normalized_mv) are unaffected, and the DEFINER pinned by 0014 is
