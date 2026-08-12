@@ -8,12 +8,14 @@
 -- empty string: the tool result rendered BLANK in the conversation / prompt message
 -- view.
 --
--- For PYTHON ADK this was a rendering gap, not a data gap: the result also lands on
--- the execute_tool span's tool_call_output. That is NOT universal — tool_call_output
--- coalesces only traceloop.entity.output, gen_ai.tool.call.result and
--- gcp.vertex.agent.tool_response, all Python-ADK/vendor keys. A gateway-instrumented
--- adk-go span carries no tool namespace at all, so for that emitter the part was the
--- only copy of the result and the blank WAS a data gap.
+-- In every emitter captured so far this was a rendering gap, not a data gap: the
+-- result also lands on the execute_tool span's tool_call_output. That holds for both
+-- Python google-adk turns AND the guide-following adk-go turn — all three carry
+-- gcp.vertex.agent.tool_response there. Whether an emitter exists for which the part
+-- is the ONLY copy is UNVERIFIED: tool_call_output coalesces just
+-- traceloop.entity.output, gen_ai.tool.call.result and gcp.vertex.agent.tool_response,
+-- so one setting none of those would lose the result outright — but no such capture
+-- has been observed, so treat that as a mechanism to watch, not as history.
 --
 -- Fix: a `tool_call_response` part now contributes its serialized `response`.
 --
