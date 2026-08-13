@@ -85,16 +85,24 @@
 -- the view in this chart, so fixing it here is sufficient -- 0006 is a no-op CREATE on
 -- an existing cluster and 0019's SELECT is superseded by this one on every upgrade.
 --
--- Supersedes the SELECT defined in 0019_spans_normalized_mv_genai_semconv.sql.
--- Shipped as a new migration (not an edit to 0019) to hold 1:1 numbering parity with
+-- Supersedes the SELECT defined in 0019_spans_normalized_mv_genai_semconv.sql, and
+-- that file's ALTER has been REMOVED rather than left to re-run. schema-job.yaml
+-- applies every /sql/*.sql on install and upgrade with no ledger or checksum, so a
+-- superseded ALTER ... MODIFY QUERY is not merely redundant: re-running it restores
+-- the older SELECT until this file re-applies, and the view is insert-triggered and
+-- forward-only, so a span ingested in that window keeps a blank tool result for good.
+-- Measured on a two-replica cluster: the view lost, then regained, this handling on
+-- every upgrade pass. Hence the invariant for this directory -- exactly one file
+-- carries the current definition of a view: 0006 (CREATE ... IF NOT EXISTS, which
+-- owns it on a fresh install) plus one trailing ALTER for clusters where that CREATE
+-- is a no-op. Adding a 0021 that rewrites this SELECT means emptying THIS file's
+-- statement the same way.
+--
+-- Shipped as a new file rather than an edit to 0019 to hold 1:1 numbering parity with
 -- the monolith test fixture, where this file is 0013 and an in-place edit is not an
 -- option: clickhouse-migrations md5-checksums applied files and raises on any change to
--- one already applied. On the helm side an edit to 0019 WOULD reach existing clusters --
--- schema-job.yaml runs every /sql/*.sql on install and upgrade with no ledger or
--- checksum, and 0019 is itself an ALTER ... MODIFY QUERY, so re-running it re-applies
--- the SELECT. Only 0006, the CREATE ... IF NOT EXISTS that owns this view, is a no-op on
--- an existing cluster. So parity with the monolith numbering is the binding constraint
--- here, not reachability on this side.
+-- one already applied. That parity is preserved -- 0019 still exists and holds its
+-- ordinal; only its redundant statement is gone.
 -- ALTER ... MODIFY QUERY swaps the SELECT in place with no view rebuild and no
 -- ingestion gap; the output column set is unchanged, so 0007 (spans view) and 0012
 -- (conversations_normalized_mv) are unaffected, and the DEFINER pinned by 0014 is
