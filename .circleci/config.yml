@@ -598,7 +598,29 @@ jobs:
               echo "Explicit replication path in schema SQL (lines above) — engines must stay path-less (default_replica_path owns the layout)."
               fail=1
             fi
-            [ "$fail" -eq 0 ] && echo "Schema SQL is clustered-only: ON CLUSTER DDL, path-less Replicated engines."
+            # One live MODIFY QUERY writer per view. schema-job.yaml re-runs
+            # every /sql/*.sql on install AND upgrade with no ledger, so a
+            # superseded (non-comment) ALTER ... MODIFY QUERY re-installs its
+            # older SELECT until the newer file re-applies — and the MVs are
+            # insert-triggered and forward-only, so spans ingested in that
+            # window keep the older rendering permanently. When a new file
+            # supersedes a view's SELECT, the predecessor's statement must be
+            # emptied, keeping the file comment-only (see the 0021 header).
+            # MODIFY SQL SECURITY (0014) is deliberately not counted — it does
+            # not rewrite the SELECT.
+            writers=$(awk 'FNR == 1 { tbl = "" } /^[[:space:]]*--/ { next } /ALTER TABLE/ { tbl = $3 } /MODIFY QUERY/ { print FILENAME ": " tbl }' charts/ao-data-platform/sql/*.sql)
+            if [ -z "$writers" ]; then
+              echo "Sanity check failed: no live MODIFY QUERY found in charts/ao-data-platform/sql/ — either the awk pattern has drifted or the trailing spans_normalized_mv ALTER was emptied without a successor."
+              exit 1
+            fi
+            dups=$(echo "$writers" | awk -F': ' '{ print $2 }' | sort | uniq -d)
+            if [ -n "$dups" ]; then
+              echo "More than one live MODIFY QUERY writer per view:"
+              echo "$writers"
+              echo "Exactly one file may carry a view's current SELECT — empty the superseded predecessor's statement (keep the file comment-only; see the 0021 header)."
+              fail=1
+            fi
+            [ "$fail" -eq 0 ] && echo "Schema SQL is clustered-only: ON CLUSTER DDL, path-less Replicated engines, one live MODIFY QUERY writer per view."
             exit $fail
       - run:
           name: llm-worker foundry provider renders Foundry env, no AWS env

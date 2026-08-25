@@ -87,10 +87,13 @@
 -- same way.
 --
 -- Shipped as a new file rather than an edit to 0020: a superseded ordinal is
--- never reused, so the chart's history stays readable and numbering stays
--- aligned with the source schema set this directory mirrors, which is
--- append-only by construction. 0020 still exists and holds its ordinal; only
--- its superseded statement is gone.
+-- never reused, so the chart's history stays readable and the relative order
+-- of files mirrored from the source schema set (append-only by construction)
+-- is preserved. Correspondence with that set is by basename, not ordinal --
+-- this chart carries migrations the fixture lacks, so ordinals drift: this
+-- file is the fixture's 0014_spans_normalized_mv_planning_tool_fallbacks.sql.
+-- 0020 still exists and holds its ordinal; only its superseded statement is
+-- gone.
 --
 -- Forward-only: MODIFY QUERY affects new inserts. Rows materialized before
 -- this migration deploys keep empty completions for these spans.
