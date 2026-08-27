@@ -21,8 +21,10 @@
 -- idiom: SELECT service_name, max(watermark) ... GROUP BY service_name. The
 -- max is the same answer before and after merges, so reads need no ORDER BY /
 -- LIMIT 1 BY and no FINAL. `published_at` is liveness and provenance only —
--- read max(published_at) for "is the writer alive?"; same-watermark republish
--- ties resolve arbitrarily, which is fine at seconds scale.
+-- read max(published_at) for "is the writer alive?". A merge keeps only the
+-- highest-watermark row, so a regressed re-publish's later publish time
+-- disappears with its row; same-watermark republish ties resolve arbitrarily.
+-- Both are immaterial at run-interval scale.
 --
 -- `watermark` is an EVENT-TIME bound (comparable to turn_start / period_to)
 -- whose advancement the writer gates on arrival completeness; the arrival
