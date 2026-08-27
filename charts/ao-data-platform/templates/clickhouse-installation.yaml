@@ -119,6 +119,8 @@ spec:
         - "GRANT INSERT ON otel_traces.conversation_eval_scores"
         - "GRANT INSERT ON otel_traces.span_eval_scores"
         - "GRANT INSERT ON otel_traces.conversation_cluster_assignments"
+        - "GRANT INSERT ON otel_traces.conversations_normalized"
+        - "GRANT INSERT ON otel_traces.conversation_rollup_watermarks"
       {{- if .Values.clickhouse.admin.enabled }}
       # admin — gated break-glass superuser: full access + user management + SYSTEM. Not for
       # service-to-service. Defaults to loopback-only (admin.networksIp), so it's usable only

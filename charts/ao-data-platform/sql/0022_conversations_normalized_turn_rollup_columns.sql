@@ -9,6 +9,15 @@
 -- 0012 MV writes carry no value here, and a 0 default would make that fallback
 -- unreachable. New columns are absent from the 0012 MV's SELECT, so MV-written
 -- rows land with NULL — the intended steady state until the MV retires.
+-- Appended, deliberately: no AFTER clause. The 0012 MV inserts positionally
+-- (its header says so), so its 12-column block maps to columns 1-12; any
+-- future column on this table must likewise be appended while the MV exists,
+-- never placed with AFTER — do not copy 0016's `AFTER tool_config` idiom here.
+-- The writer must not emit a trace the 0012 gate admits:
+-- conversations_normalized is ReplacingMergeTree with no version column, so an
+-- MV row (new columns NULL) and a writer row (new columns set) for the same
+-- (service_name, minute, conversation_id, trace_id) dedup to an arbitrary
+-- winner.
 -- Idempotent (ADD COLUMN IF NOT EXISTS) so the schema job can re-run it on
 -- every upgrade.
 ALTER TABLE otel_traces.conversations_normalized ON CLUSTER '{cluster}'
