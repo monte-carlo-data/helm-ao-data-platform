@@ -106,12 +106,12 @@ spec:
       # the conversation turn rollup writer. NO readonly profile: readonly=2 would block these
       # INSERTs, so the read-mostly shape is enforced by grants alone.
       # conversations_normalized is the first grant here on a source table rather than a derived
-      # annotation, because the rollup writer materializes the turns the 0012 MV's Traceloop-only
-      # gate cannot serve (sql/0022) and publishes its cursor alongside them (sql/0023). It writes
-      # into the same table that MV feeds, and nothing here prevents the two from writing the same
-      # key: the writer itself must exclude whatever the 0012 gate admits, for the reasons sql/0022
-      # sets out. This grant cannot express that, and the reader bundle above already carries SELECT
-      # on the whole database, so the widening this adds is write access to conversation turns.
+      # annotation, and the reader bundle above already carries SELECT on the whole database, so
+      # the widening this adds is write access to conversation turns. The writer must itself
+      # exclude what the 0012 MV admits, which no grant can express (sql/0022); and the table's
+      # engine has no version column, so a stray write is not correctable by re-writing. A separate
+      # writer user was declined because the monolith reaches this cluster through one per-account
+      # connection, so a second writer credential would have to be provisioned per install.
       monte_carlo/password:
         valueFrom:
           secretKeyRef:

@@ -107,12 +107,13 @@ clickhouse:
         property: ""              # optional, for JSON secrets
         version: ""               # optional, required for Fake provider
       refreshInterval: 1h
-  # monte_carlo — the Monte Carlo read-only service account (data-source monitoring) and the
-  # agent's LLM-queue producer. Reads everything via the shared reader bundle and appends to the
-  # queue (llm_inputs/llm_batches) + conversation_eval_scores. NOT a readonly-profile user — it
-  # needs INSERT, so its read-mostly shape is enforced by grants alone. Created by the
-  # ExternalSecret below. (The agent's credential is configured in the consuming application, not
-  # here — the chart only provisions the user + password.)
+  # monte_carlo — the Monte Carlo service account (data-source monitoring, the agent's LLM-queue
+  # producer, and the conversation turn rollup writer). Reads everything via the shared reader
+  # bundle and appends to the tables listed in the README's user model — including
+  # conversations_normalized, its first write to a source table rather than a derived annotation.
+  # NOT a readonly-profile user — it needs INSERT, so its read-mostly shape is enforced by
+  # grants alone. Created by the ExternalSecret below. (The agent's credential is configured in the
+  # consuming application, not here — the chart only provisions the user + password.)
   monteCarlo:
     secret: ao-clickhouse-monte-carlo-credentials
     # CIDR list allowed to authenticate as monte_carlo (external callers: the agent + monitoring).

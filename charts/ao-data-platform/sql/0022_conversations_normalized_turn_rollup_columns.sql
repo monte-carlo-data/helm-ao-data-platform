@@ -8,7 +8,11 @@
 -- Nullable so the eventual read switch can coalesce(stored, joined): rows the
 -- 0012 MV writes carry no value here, and a 0 default would make that fallback
 -- unreachable. New columns are absent from the 0012 MV's SELECT, so MV-written
--- rows land with NULL — the intended steady state until the MV retires.
+-- rows land with NULL — the intended steady state until the MV retires. Once
+-- that read switch lands, NULL also means "the 0012 MV wrote this row", so the
+-- writer must emit a value in all three columns; a writer-written NULL would
+-- silently read as the join's value, a different measurement. The written_by
+-- column below is the enforcement point for that rule.
 -- Appended, though position does not bind: the 0012 MV's insert matches the
 -- target by output-alias NAME (verified on 26.2 — an alias the table lacks
 -- is rejected at the MV's CREATE, and an AFTER-placed column does not shift
@@ -20,11 +24,11 @@
 -- winner. Nothing in the schema enforces that split, and the case it turns on
 -- is a dual-instrumented trace: an SDK emitting the gen_ai keys AND a
 -- traceloop.entity.input|output key satisfies the 0012 gate and the writer's
--- own shape at once. The two shapes are disjoint today — measured on prod-us1
--- 2026-08-28, 0 of 81,003 root spans carrying a conversation_id over 3 days had
--- both, against 80,694 the gate admits and 100 with gen_ai keys — but that is a
--- property of today's instrumentation, not of this schema, so the writer still
--- owes an explicit exclusion of what 0012 admits.
+-- own shape at once. The two shapes are disjoint in every trace measured so
+-- far — the measurement lives in the monolith's
+-- conversation_materialization/readme.md ("Schema gap") — but that is a
+-- property of today's instrumentation, not of this schema, so the writer
+-- still owes an explicit exclusion of what 0012 admits.
 -- turn_tokens is UInt64 where spans_normalized's token columns are UInt32: it
 -- sums the per-span total_tokens over a trace, and summing UInt32 promotes to
 -- UInt64. It is not a sum of prompt_tokens and completion_tokens — those
@@ -37,4 +41,12 @@
 ALTER TABLE otel_traces.conversations_normalized ON CLUSTER '{cluster}'
     ADD COLUMN IF NOT EXISTS turn_duration_seconds Nullable(Float64),
     ADD COLUMN IF NOT EXISTS turn_tokens Nullable(UInt64),
-    ADD COLUMN IF NOT EXISTS turn_errors_count Nullable(UInt32);
+    ADD COLUMN IF NOT EXISTS turn_errors_count Nullable(UInt32),
+    -- Written-by provenance for the three above, so a reader can tell a
+    -- writer-written NULL from an MV-written NULL instead of relying on NULL
+    -- alone. '' for the MV's rows and every pre-existing row; the writer sets
+    -- its marker at insert. Added with the turn columns because the
+    -- alternative — a later standalone ADD COLUMN — re-incurs the
+    -- release-skew the monolith readme's preflight section is written against,
+    -- while the ALTER itself is metadata-only at any time.
+    ADD COLUMN IF NOT EXISTS written_by LowCardinality(String) DEFAULT '';

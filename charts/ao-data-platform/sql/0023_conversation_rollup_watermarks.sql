@@ -1,4 +1,4 @@
--- Per-agent completeness watermark for the conversation turn rollup writer
+-- Per-service completeness watermark for the conversation turn rollup writer
 -- (the job that loads ADK/gen_ai conversations into conversations_normalized,
 -- which the 0012 MV's Traceloop-only gate cannot serve). After each run's
 -- INSERT lands, the writer publishes one row per scanned service_name: every
@@ -6,10 +6,9 @@
 -- cursor cannot be derived from the target table — it is arrival-ordered, so
 -- max(turn_start) over written rows is not a completeness bound — which is
 -- why it is published rather than computed. Keyed by service_name, the
--- writer's scan unit; spans_normalized has no account column and no agent
--- identifier (0 of 5.6M prod-us1 spans over 7 days carry
--- montecarlo.agent_mcon, measured 2026-08-28), so nothing finer exists to
--- key on, and two agents sharing one service_name share one cursor.
+-- writer's scan unit; spans_normalized has no account column and carries no
+-- agent identifier, so nothing finer exists to key on, and two agents sharing
+-- one service_name share one cursor.
 --
 -- Current-state metadata, not time-series (the 0017 llm_worker_info shape):
 -- no TTL and no PARTITION BY. A watermark must survive ANY pause — a writer
@@ -26,24 +25,21 @@
 -- read max(published_at) for "is the writer alive?". A merge keeps only the
 -- highest-watermark row, so a regressed re-publish's later publish time
 -- disappears with its row; same-watermark republish ties resolve last-wins,
--- so an idle writer's fresh published_at survives a merge (pinned by test
--- on the monolith mirror). Both are immaterial at run-interval scale. The
--- same rule makes an
--- over-advanced cursor unfixable by re-publish: a lower watermark loses
--- both the max() read and the merge by design, so correcting one is an
--- operator action (delete the service_name's rows), not a writer action. A
--- service_name retired and later reused inherits the retired agent's cursor,
--- which over-asserts the new agent's completeness; until corrected, every
--- publish regresses, so max(published_at) reads stale while the writer is
--- healthy.
+-- so an idle writer's fresh published_at survives a merge. Both are
+-- immaterial at run-interval scale. The
+-- same rule makes an over-advanced cursor unfixable by re-publish: a lower
+-- watermark loses both the max() read and the merge by design. Correcting one
+-- is an operator action; the README's note on operating this table has the
+-- steps.
 --
 -- `published_at` defaults to now64(9) because it carries a liveness read: a
 -- writer that omitted the column would otherwise record the epoch, which reads
 -- as a writer that has never run rather than as one that just ran. The default
 -- is evaluated once per inserted block, so one batched publish shares one
--- timestamp. It binds at CREATE: an install already holding this table keeps
--- the old column, and only an explicit MODIFY COLUMN would add the default
--- there.
+-- timestamp. It arrives with the CREATE, not retroactively: this statement is
+-- CREATE TABLE IF NOT EXISTS, so the schema job re-applying it is a no-op
+-- against an install that already holds the table. Such an install keeps the
+-- old column, and only an explicit MODIFY COLUMN would add the default there.
 -- `watermark` takes no default by design — it is an event-time bound the
 -- writer is expected to state, and no wall-clock fallback could be correct,
 -- because it would assert completeness the run never earned. Nothing enforces
@@ -58,15 +54,9 @@
 -- row on a high-frequency job. Async replica lag can only under-assert
 -- completeness (a replica that has not seen the latest row answers with a
 -- lower watermark), which is the fail-safe direction; reads of this table need
--- no select_sequential_consistency.
---
--- That covers the cursor read alone. A consumer reads the cursor here and then
--- reads turns from conversations_normalized — two independently replicated
--- tables, each with its own queue, so the writer ordering its own inserts binds
--- only the replica it wrote to. On a follower the watermark can be current
--- while the turns it covers are not yet visible, which over-asserts
--- completeness. A consumer joining the two owes that read a pinned replica or
--- select_sequential_consistency on the data side.
+-- no select_sequential_consistency. That covers the cursor read alone; a
+-- consumer joining this cursor to conversations_normalized owes more, stated
+-- as an operator fact in the README's note on operating this table.
 --
 -- The writer runs as `monte_carlo`; the INSERT grant ships in this release
 -- (templates/clickhouse-installation.yaml). Files correspond to the monolith
