@@ -26,6 +26,19 @@
 -- disappears with its row; same-watermark republish ties resolve arbitrarily.
 -- Both are immaterial at run-interval scale.
 --
+-- `published_at` defaults to now64(9) because it carries a liveness read: a
+-- writer that omitted the column would otherwise record the epoch, which reads
+-- as a writer that has never run rather than as one that just ran. The default
+-- is evaluated once per inserted block, so one batched publish shares one
+-- timestamp. It binds at CREATE: an install already holding this table keeps
+-- the old column, and only an explicit MODIFY COLUMN would add the default
+-- there.
+-- `watermark` takes no default by design — it is an event-time bound the
+-- writer is expected to state, and no wall-clock fallback could be correct,
+-- because it would assert completeness the run never earned. Nothing enforces
+-- that: an INSERT naming only service_name stores the epoch. That direction is
+-- fail-safe, since an epoch cursor loses every merge and every max().
+--
 -- `watermark` is an EVENT-TIME bound (comparable to turn_start / period_to)
 -- whose advancement the writer gates on arrival completeness; the arrival
 -- signal itself is the writer's choice (a MATERIALIZED now() column vs
@@ -33,8 +46,16 @@
 -- every scanned service_name — per-service inserts would create a part per
 -- row on a high-frequency job. Async replica lag can only under-assert
 -- completeness (a replica that has not seen the latest row answers with a
--- lower watermark), which is the fail-safe direction; reads need no
--- select_sequential_consistency.
+-- lower watermark), which is the fail-safe direction; reads of this table need
+-- no select_sequential_consistency.
+--
+-- That covers the cursor read alone. A consumer reads the cursor here and then
+-- reads turns from conversations_normalized — two independently replicated
+-- tables, each with its own queue, so the writer ordering its own inserts binds
+-- only the replica it wrote to. On a follower the watermark can be current
+-- while the turns it covers are not yet visible, which over-asserts
+-- completeness. A consumer joining the two owes that read a pinned replica or
+-- select_sequential_consistency on the data side.
 --
 -- The writer runs as `monte_carlo`; the INSERT grant ships in this release
 -- (templates/clickhouse-installation.yaml). Files correspond to the monolith
@@ -45,7 +66,7 @@ CREATE TABLE IF NOT EXISTS otel_traces.conversation_rollup_watermarks ON CLUSTER
 (
     `service_name` LowCardinality(String),
     `watermark` DateTime64(9),
-    `published_at` DateTime64(9)
+    `published_at` DateTime64(9) DEFAULT now64(9)
 )
 ENGINE = ReplicatedReplacingMergeTree(watermark)
 ORDER BY service_name;

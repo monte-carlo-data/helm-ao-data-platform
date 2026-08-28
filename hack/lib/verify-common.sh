@@ -183,13 +183,17 @@ verify_clickhouse_user_model() {
   expect_denied  "llm_worker cannot read telemetry"          llm_worker "$WK_PW" "SELECT count() FROM otel_traces.spans_normalized"
   expect_denied  "llm_worker cannot write telemetry"         llm_worker "$WK_PW" "INSERT INTO otel_traces.otel_traces (Timestamp) VALUES (now())"
 
-  # monte_carlo — reads everything + produces to the queue, but must NOT write telemetry.
+  # monte_carlo — reads everything, produces to the queue, and writes the conversation turn rollup
+  # (sql/0022 columns, sql/0023 cursor). It must still not write raw telemetry or metrics: the
+  # rollup grants are per-table, so the denials below are what keep the ingest path out of reach.
   expect_ok      "monte_carlo reads telemetry"               monte_carlo "$MC_PW" "SELECT count() FROM otel_traces.spans_normalized"
   # system.numbers backs time-bucket / gap-fill queries (e.g. getTraceTimeSeries); reader bundle grant.
   expect_ok      "monte_carlo can read system.numbers"       monte_carlo "$MC_PW" "SELECT number FROM system.numbers LIMIT 1"
   expect_grant   "monte_carlo can produce to the queue"      monte_carlo "$MC_PW" "INSERT ON otel_traces.llm_inputs"
   expect_grant   "monte_carlo can produce to llm_batches"    monte_carlo "$MC_PW" "INSERT ON otel_traces.llm_batches"
-  expect_denied  "monte_carlo cannot write telemetry"        monte_carlo "$MC_PW" "INSERT INTO otel_traces.otel_traces (Timestamp) VALUES (now())"
+  expect_grant   "monte_carlo writes conversation turns"     monte_carlo "$MC_PW" "INSERT ON otel_traces.conversations_normalized"
+  expect_grant   "monte_carlo publishes the rollup cursor"   monte_carlo "$MC_PW" "INSERT ON otel_traces.conversation_rollup_watermarks"
+  expect_denied  "monte_carlo cannot write raw telemetry"    monte_carlo "$MC_PW" "INSERT INTO otel_traces.otel_traces (Timestamp) VALUES (now())"
   forbid_grant   "monte_carlo cannot write otel_metrics"     monte_carlo "$MC_PW" "GRANT INSERT ON otel_traces.otel_metrics"
 
   # readonly_user — SELECT-only; readonly=2 profile blocks writes even without an explicit deny grant.

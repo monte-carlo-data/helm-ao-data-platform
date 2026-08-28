@@ -17,7 +17,18 @@
 -- conversations_normalized is ReplacingMergeTree with no version column, so an
 -- MV row (new columns NULL) and a writer row (new columns set) for the same
 -- (service_name, minute, conversation_id, trace_id) dedup to an arbitrary
--- winner.
+-- winner. Nothing in the schema enforces that split, and the case it turns on
+-- is a dual-instrumented trace: an SDK emitting the gen_ai keys AND a
+-- traceloop.entity.input|output key satisfies the 0012 gate and the writer's
+-- own shape at once. The two shapes are disjoint today — measured on prod-us1
+-- 2026-08-28, 0 of 81,003 root spans carrying a conversation_id over 3 days had
+-- both, against 80,694 the gate admits and 100 with gen_ai keys — but that is a
+-- property of today's instrumentation, not of this schema, so the writer still
+-- owes an explicit exclusion of what 0012 admits.
+-- turn_tokens is UInt64 where spans_normalized's token columns are UInt32: it
+-- sums the per-span total_tokens over a trace, and summing UInt32 promotes to
+-- UInt64. It is not a sum of prompt_tokens and completion_tokens — those
+-- re-count context carried into each LLM step.
 -- Idempotent (ADD COLUMN IF NOT EXISTS) so the schema job can re-run it on
 -- every upgrade.
 ALTER TABLE otel_traces.conversations_normalized ON CLUSTER '{cluster}'
