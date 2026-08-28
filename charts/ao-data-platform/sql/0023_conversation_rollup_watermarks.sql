@@ -25,8 +25,10 @@
 -- LIMIT 1 BY and no FINAL. `published_at` is liveness and provenance only —
 -- read max(published_at) for "is the writer alive?". A merge keeps only the
 -- highest-watermark row, so a regressed re-publish's later publish time
--- disappears with its row; same-watermark republish ties resolve arbitrarily.
--- Both are immaterial at run-interval scale. The same rule makes an
+-- disappears with its row; same-watermark republish ties resolve last-wins,
+-- so an idle writer's fresh published_at survives a merge (pinned by test
+-- on the monolith mirror). Both are immaterial at run-interval scale. The
+-- same rule makes an
 -- over-advanced cursor unfixable by re-publish: a lower watermark loses
 -- both the max() read and the merge by design, so correcting one is an
 -- operator action (delete the service_name's rows), not a writer action. A
