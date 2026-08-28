@@ -9,10 +9,10 @@
 -- 0012 MV writes carry no value here, and a 0 default would make that fallback
 -- unreachable. New columns are absent from the 0012 MV's SELECT, so MV-written
 -- rows land with NULL — the intended steady state until the MV retires.
--- Appended, deliberately: no AFTER clause. The 0012 MV inserts positionally
--- (its header says so), so its 12-column block maps to columns 1-12; any
--- future column on this table must likewise be appended while the MV exists,
--- never placed with AFTER — do not copy 0016's `AFTER tool_config` idiom here.
+-- Appended, though position does not bind: the 0012 MV's insert matches the
+-- target by output-alias NAME (verified on 26.2 — an alias the table lacks
+-- is rejected at the MV's CREATE, and an AFTER-placed column does not shift
+-- the mapping). The hazard is a renamed alias or target column, not order.
 -- The writer must not emit a trace the 0012 gate admits:
 -- conversations_normalized is ReplacingMergeTree with no version column, so an
 -- MV row (new columns NULL) and a writer row (new columns set) for the same
@@ -29,6 +29,9 @@
 -- sums the per-span total_tokens over a trace, and summing UInt32 promotes to
 -- UInt64. It is not a sum of prompt_tokens and completion_tokens — those
 -- re-count context carried into each LLM step.
+-- turn_errors_count narrows the rollup's countIf() (UInt64) to UInt32 at
+-- insert; reaching 2^32 would need that many errored spans in one trace —
+-- not a real input.
 -- Idempotent (ADD COLUMN IF NOT EXISTS) so the schema job can re-run it on
 -- every upgrade.
 ALTER TABLE otel_traces.conversations_normalized ON CLUSTER '{cluster}'

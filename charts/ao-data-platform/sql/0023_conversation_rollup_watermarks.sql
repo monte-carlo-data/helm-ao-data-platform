@@ -6,8 +6,10 @@
 -- cursor cannot be derived from the target table — it is arrival-ordered, so
 -- max(turn_start) over written rows is not a completeness bound — which is
 -- why it is published rather than computed. Keyed by service_name, the
--- writer's scan unit; spans_normalized has no account column, so nothing
--- finer exists to key on.
+-- writer's scan unit; spans_normalized has no account column and no agent
+-- identifier (0 of 5.6M prod-us1 spans over 7 days carry
+-- montecarlo.agent_mcon, measured 2026-08-28), so nothing finer exists to
+-- key on, and two agents sharing one service_name share one cursor.
 --
 -- Current-state metadata, not time-series (the 0017 llm_worker_info shape):
 -- no TTL and no PARTITION BY. A watermark must survive ANY pause — a writer
@@ -24,7 +26,14 @@
 -- read max(published_at) for "is the writer alive?". A merge keeps only the
 -- highest-watermark row, so a regressed re-publish's later publish time
 -- disappears with its row; same-watermark republish ties resolve arbitrarily.
--- Both are immaterial at run-interval scale.
+-- Both are immaterial at run-interval scale. The same rule makes an
+-- over-advanced cursor unfixable by re-publish: a lower watermark loses
+-- both the max() read and the merge by design, so correcting one is an
+-- operator action (delete the service_name's rows), not a writer action. A
+-- service_name retired and later reused inherits the retired agent's cursor,
+-- which over-asserts the new agent's completeness; until corrected, every
+-- publish regresses, so max(published_at) reads stale while the writer is
+-- healthy.
 --
 -- `published_at` defaults to now64(9) because it carries a liveness read: a
 -- writer that omitted the column would otherwise record the epoch, which reads
