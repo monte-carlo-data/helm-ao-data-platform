@@ -5,14 +5,17 @@
 -- spans_normalized up per trace and INSERT into conversations_normalized;
 -- these three columns hold what the read path supplies today by LEFT JOINing
 -- a per-trace rollup of spans_normalized.
--- Nullable so the eventual read switch can coalesce(stored, joined): rows the
--- 0012 MV writes carry no value here, and a 0 default would make that fallback
--- unreachable. New columns are absent from the 0012 MV's SELECT, so MV-written
--- rows land with NULL — the intended steady state until the MV retires. Once
--- that read switch lands, NULL also means "the 0012 MV wrote this row", so the
--- writer must emit a value in all three columns; a writer-written NULL would
--- silently read as the join's value, a different measurement. The written_by
--- column below is the enforcement point for that rule.
+-- Nullable so a writer bug reads as NULL, not as a plausible 0. The read
+-- switch keys on written_by, not on NULL: it reads the stored value only
+-- where the marker is set, and a 0 default would be indistinguishable from a
+-- measured 0. New columns are absent from the 0012 MV's SELECT, so MV-written
+-- rows land with NULL — the intended steady state until the MV retires.
+-- Under the gate NULL carries no provenance — written_by does. The writer
+-- must still emit a value in all three columns: the read contract declares
+-- them non-null, so a writer-written NULL surfaces as NULL on a marked row —
+-- visibly wrong — where the superseded coalesce(stored, joined) shape would
+-- have silently read it as the join's value, a different measurement. The
+-- written_by column below is the enforcement point for that rule.
 -- Appended, though position does not bind: the 0012 MV's insert matches the
 -- target by output-alias NAME (verified on 26.2 — an alias the table lacks
 -- is rejected at the MV's CREATE, and an AFTER-placed column does not shift

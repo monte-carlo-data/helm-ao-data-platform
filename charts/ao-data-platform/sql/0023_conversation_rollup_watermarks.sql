@@ -16,9 +16,10 @@
 -- and no row then unambiguously means never published.
 --
 -- ReplicatedReplacingMergeTree(watermark): the watermark VALUE is the version,
--- so a merge keeps the highest watermark per service_name and a regressed
--- re-publish (a retry or backfill carrying a lower cursor) is discarded by
--- the engine — monotonicity is structural, not a read-side convention. Read
+-- so a merge keeps the highest watermark per service_name and discards a
+-- regressed re-publish (a retry or backfill carrying a lower cursor). The
+-- discard happens AT MERGE: until one runs, the regressed row stays queryable
+-- in its own part, so monotonicity comes from the read, not the engine. Read
 -- idiom: SELECT service_name, max(watermark) ... GROUP BY service_name. The
 -- max is the same answer before and after merges, so reads need no ORDER BY /
 -- LIMIT 1 BY and no FINAL. `published_at` is liveness and provenance only —
