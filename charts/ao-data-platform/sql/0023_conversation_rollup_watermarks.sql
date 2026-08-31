@@ -27,28 +27,26 @@
 -- highest-watermark row, so a regressed re-publish's later publish time
 -- disappears with its row; same-watermark republish ties resolve last-wins,
 -- so an idle writer's fresh published_at survives a merge. Both are
--- immaterial at run-interval scale. The
--- same rule makes an over-advanced cursor unfixable by re-publish: a lower
--- watermark loses both the max() read and the merge by design. Correcting one
--- is an operator action; the README's note on operating this table has the
--- steps.
+-- immaterial at run-interval scale. The same rule makes an over-advanced
+-- cursor unfixable by re-publish: a lower watermark loses both the max() read
+-- and the merge by design. Correcting one is an operator action; the README's
+-- note on operating this table has the steps.
 --
 -- `published_at` defaults to now64(9) because it carries a liveness read: a
 -- writer that omitted the column would otherwise record the epoch, which reads
 -- as a writer that has never run rather than as one that just ran. The default
 -- is evaluated once per inserted block, so one batched publish shares one
--- timestamp. It arrives with the CREATE, not retroactively: this statement is
--- CREATE TABLE IF NOT EXISTS, so the schema job re-applying it is a no-op
--- against an install that already holds the table. Such an install keeps the
--- old column, and only an explicit MODIFY COLUMN would add the default there.
+-- timestamp. This release creates the table, so every install gets the column
+-- with its default; a later edit to this file would apply to fresh installs
+-- only (0019's note).
 -- `watermark` takes no default by design — it is an event-time bound the
 -- writer is expected to state, and no wall-clock fallback could be correct,
 -- because it would assert completeness the run never earned. Nothing enforces
--- that: an INSERT naming only service_name stores the epoch. That direction is
--- fail-safe, since an epoch cursor loses every merge and every max().
+-- that: an INSERT naming only service_name stores the epoch, which loses
+-- every merge and every max().
 --
--- `watermark` is an EVENT-TIME bound (comparable to turn_start / period_to)
--- whose advancement the writer gates on arrival completeness; the arrival
+-- `watermark` is an EVENT-TIME bound (comparable to turn_start) whose
+-- advancement the writer gates on arrival completeness; the arrival
 -- signal itself is the writer's choice (a MATERIALIZED now() column vs
 -- system.parts), not this table's concern. One BATCHED INSERT per run covers
 -- every scanned service_name — per-service inserts would create a part per
@@ -60,10 +58,10 @@
 -- as an operator fact in the README's note on operating this table.
 --
 -- The writer runs as `monte_carlo`; the INSERT grant ships in this release
--- (templates/clickhouse-installation.yaml). Files correspond to the monolith
--- test fixture by basename, not ordinal (see 0019's note); the fixture's
--- version of this table is a plain ReplacingMergeTree with no ON CLUSTER —
--- intentional, it runs on a single-node test container.
+-- (templates/clickhouse-installation.yaml). Files correspond to that fixture
+-- by basename, not ordinal (0019's note); its version of this table is a
+-- plain ReplacingMergeTree with no ON CLUSTER — intentional, it runs on a
+-- single-node test container.
 CREATE TABLE IF NOT EXISTS otel_traces.conversation_rollup_watermarks ON CLUSTER '{cluster}'
 (
     `service_name` LowCardinality(String),

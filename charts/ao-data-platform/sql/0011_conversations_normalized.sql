@@ -1,8 +1,9 @@
 -- Turn-grained conversation source: one row per root-span trace (= one turn).
--- Mirrors the spans_normalized engine/TTL convention. The MV in 0009 does the
--- stateless per-root-span projection; `turn` is derived at read time (a window
--- function over turn_start) rather than stored, so this stays a streaming MV
--- target. span_attributes / span_attributes_keys are carried from the root span
+-- Mirrors the spans_normalized engine/TTL convention. The MV in 0012 does the
+-- stateless per-root-span projection, and the scheduled rollup writer (0022)
+-- is a second writer for the turn-rollup columns; `turn` is derived at read
+-- time (a window function over turn_start) rather than stored, so this stays
+-- a streaming-MV-shaped target. span_attributes / span_attributes_keys are carried from the root span
 -- to power turn-level attribute filtering downstream — minus the two heaviest
 -- content paths (see the span_attributes column below).
 CREATE TABLE IF NOT EXISTS otel_traces.conversations_normalized ON CLUSTER '{cluster}'

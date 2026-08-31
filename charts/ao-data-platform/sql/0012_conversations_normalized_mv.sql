@@ -17,8 +17,13 @@
 -- LangChain constructor-wrapped (kwargs.*). Agent content may be a plain string
 -- or a block array ([{type:text, text:...}]).
 --
--- SELECT column order matches conversations_normalized (0011) — MV-to-table
--- inserts position-wise, not by name.
+-- The MV's output aliases match conversations_normalized (0011) by NAME, not
+-- position (verified on 26.2 and 26.4.3): an alias the table lacks fails this
+-- CREATE, and column order is free. The maintenance hazard is a renamed alias
+-- or target column, not a reorder. Note the CREATE applies once per install:
+-- IF NOT EXISTS makes re-runs no-ops, so a later edit to this file changes
+-- fresh installs only, and existing installs keep the original MV — the two
+-- drift.
 CREATE MATERIALIZED VIEW IF NOT EXISTS otel_traces.conversations_normalized_mv ON CLUSTER '{cluster}'
 TO otel_traces.conversations_normalized
 AS WITH

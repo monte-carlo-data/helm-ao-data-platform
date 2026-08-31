@@ -27,16 +27,20 @@ clickhouse:
   storageClass: ""
   storageSize: 100Gi
   # Data retention, in days, for the telemetry tables — the raw traces, the
-  # trace-id timestamp index, and the normalized spans. The schema job re-applies
-  # this on every install and upgrade via `ALTER TABLE … MODIFY TTL`, so changing
-  # it here takes effect on existing tables (unlike the system-log TTLs); the SQL
-  # files carry the same value as their create-time default. A consuming terraform
-  # module's `clickhouse_ttl_days` variable maps onto this key.
+  # trace-id timestamp index, the normalized spans, the conversation turns
+  # (conversations_normalized), and the derived annotations
+  # (conversation_eval_scores, span_eval_scores, conversation_cluster_assignments).
+  # The schema job re-applies this on every install and upgrade via
+  # `ALTER TABLE … MODIFY TTL`, so changing it here takes effect on existing
+  # tables (unlike the system-log TTLs); the SQL files carry the same value as
+  # their create-time default. A consuming terraform module's
+  # `clickhouse_ttl_days` variable maps onto this key.
   #
   # Scope: telemetry only. The llm_* tables are the LLM worker's job-queue state
   # (batches/inputs/results), not customer telemetry, and keep their own fixed
   # TTL in SQL (see sql/0008–0010) — their retention is an operational concern
-  # tracked separately from this knob.
+  # tracked separately from this knob. The current-state control tables
+  # (llm_worker_info, conversation_rollup_watermarks) carry no TTL at all.
   #
   # Note: shrinking the value purges already-expired data lazily on the next
   # background merge, not immediately — see README for the manual-purge escape hatch.
@@ -109,8 +113,7 @@ clickhouse:
       refreshInterval: 1h
   # monte_carlo — the Monte Carlo service account (data-source monitoring, the agent's LLM-queue
   # producer, and the conversation turn rollup writer). Reads everything via the shared reader
-  # bundle and appends to the tables listed in the README's user model — including
-  # conversations_normalized, its first write to a source table rather than a derived annotation.
+  # bundle and appends to the tables listed in the README's user model.
   # NOT a readonly-profile user — it needs INSERT, so its read-mostly shape is enforced by
   # grants alone. Created by the ExternalSecret below. (The agent's credential is configured in the
   # consuming application, not here — the chart only provisions the user + password.)

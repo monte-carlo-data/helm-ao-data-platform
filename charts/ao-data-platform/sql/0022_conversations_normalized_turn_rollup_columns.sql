@@ -5,21 +5,23 @@
 -- spans_normalized up per trace and INSERT into conversations_normalized;
 -- these three columns hold what the read path supplies today by LEFT JOINing
 -- a per-trace rollup of spans_normalized.
--- Nullable so a writer bug reads as NULL, not as a plausible 0. The read
--- switch keys on written_by, not on NULL: it reads the stored value only
--- where the marker is set, and a 0 default would be indistinguishable from a
--- measured 0. New columns are absent from the 0012 MV's SELECT, so MV-written
--- rows land with NULL — the intended steady state until the MV retires.
--- Under the gate NULL carries no provenance — written_by does. The writer
--- must still emit a value in all three columns: the read contract declares
--- them non-null, so a writer-written NULL surfaces as NULL on a marked row —
--- visibly wrong — where the superseded coalesce(stored, joined) shape would
--- have silently read it as the join's value, a different measurement. The
--- written_by column below is the enforcement point for that rule.
+-- Nullable so a writer bug reads as NULL, not as a plausible 0 — a 0 default
+-- would be indistinguishable from a measured 0. New columns are absent from
+-- the 0012 MV's SELECT, so MV-written rows land with NULL — the intended
+-- steady state until the MV retires.
+-- The read contract keys on written_by, not on NULL: stored values are read
+-- only where the marker is set, so the superseded coalesce(stored, joined)
+-- shape cannot silently substitute the join's number for a writer's NULL.
+-- written_by enforces nothing by itself; it makes violations visible. The one
+-- silent direction is an UNMARKED writer row, which falls back to the join
+-- indistinguishable from an MV row. The marker vocabulary: '' = written by
+-- the 0012 MV or pre-existing; 'turn_rollup_writer' = the scheduled rollup
+-- writer. The writer owns the value; extend here as producers are added.
 -- Appended, though position does not bind: the 0012 MV's insert matches the
--- target by output-alias NAME (verified on 26.2 — an alias the table lacks
--- is rejected at the MV's CREATE, and an AFTER-placed column does not shift
--- the mapping). The hazard is a renamed alias or target column, not order.
+-- target by output-alias NAME (verified on 26.2 and 26.4.3 — an alias the
+-- table lacks is rejected at the MV's CREATE, and an AFTER-placed column does
+-- not shift the mapping). The hazard is a renamed alias or target column, not
+-- order.
 -- The writer must not emit a trace the 0012 gate admits:
 -- conversations_normalized is ReplacingMergeTree with no version column, so an
 -- MV row (new columns NULL) and a writer row (new columns set) for the same
@@ -28,10 +30,16 @@
 -- is a dual-instrumented trace: an SDK emitting the gen_ai keys AND a
 -- traceloop.entity.input|output key satisfies the 0012 gate and the writer's
 -- own shape at once. The two shapes are disjoint in every trace measured so
--- far — the measurement lives in the monolith's
--- conversation_materialization/readme.md ("Schema gap") — but that is a
--- property of today's instrumentation, not of this schema, so the writer
--- still owes an explicit exclusion of what 0012 admits.
+-- far, but that is a property of today's instrumentation, not of this schema,
+-- so the writer still owes an explicit exclusion of what 0012 admits.
+-- Writer-vs-writer is the likelier collision, and the contract is exactly-once
+-- per (service_name, minute, conversation_id, trace_id): a retry or backfill
+-- that re-emitted a written key would double-count the turn until a merge and
+-- lose arbitrarily at it. The writer holds the contract by construction —
+-- single-flight scheduling plus an exclusion of already-written traces — so
+-- readers need no FINAL or argMax while it holds. A span that arrives after
+-- its trace was written never re-emits the key: the stored turn freezes at
+-- first write, and late spans are invisible to the stored rollup.
 -- turn_tokens is UInt64 where spans_normalized's token columns are UInt32: it
 -- sums the per-span total_tokens over a trace, and summing UInt32 promotes to
 -- UInt64. It is not a sum of prompt_tokens and completion_tokens — those
@@ -45,11 +53,9 @@ ALTER TABLE otel_traces.conversations_normalized ON CLUSTER '{cluster}'
     ADD COLUMN IF NOT EXISTS turn_duration_seconds Nullable(Float64),
     ADD COLUMN IF NOT EXISTS turn_tokens Nullable(UInt64),
     ADD COLUMN IF NOT EXISTS turn_errors_count Nullable(UInt32),
-    -- Written-by provenance for the three above, so a reader can tell a
-    -- writer-written NULL from an MV-written NULL instead of relying on NULL
-    -- alone. '' for the MV's rows and every pre-existing row; the writer sets
-    -- its marker at insert. Added with the turn columns because the
-    -- alternative — a later standalone ADD COLUMN — re-incurs the
-    -- release-skew the monolith readme's preflight section is written against,
-    -- while the ALTER itself is metadata-only at any time.
+    -- Written-by provenance for the three above: the read switch trusts
+    -- stored values only where this marker is set. '' for the MV's rows and
+    -- every pre-existing row; the scheduled writer sets 'turn_rollup_writer'
+    -- at insert. Bundled with the turn columns so no install can hold the
+    -- columns without the marker; the ALTER is metadata-only at any time.
     ADD COLUMN IF NOT EXISTS written_by LowCardinality(String) DEFAULT '';

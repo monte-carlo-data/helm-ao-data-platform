@@ -420,7 +420,7 @@ if [[ "$DB_EXISTS" != "otel_traces" ]]; then
   fail "Database 'otel_traces' does not exist in ClickHouse."
 fi
 
-for TABLE in otel_traces otel_traces_trace_id_ts llm_worker_info; do
+for TABLE in otel_traces otel_traces_trace_id_ts llm_worker_info conversation_rollup_watermarks; do
   TABLE_EXISTS=$(ch_query "$CH_READ_USER" "$CH_READ_PW" "SELECT name FROM system.tables WHERE database='otel_traces' AND name='${TABLE}'")
   if [[ "$TABLE_EXISTS" != "$TABLE" ]]; then
     fail "Table 'otel_traces.${TABLE}' does not exist."
