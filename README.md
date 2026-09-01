@@ -43,7 +43,21 @@ The ClickHouse instance ships with production hardening: a capped memory ceiling
 > WHERE service_name = '<svc>';
 > ```
 >
-> Resuming early lets the writer re-read the stale cursor on a replica where the delete has not landed and re-publish it — the correction silently undone. A second way to reach that state without a writer bug is a `service_name` retired and later reused: the new agent inherits the retired one's cursor, and until corrected every publish regresses, so `max(published_at)` reads stale while the writer is healthy. Finally, the cursor and the turns are separate tables with independent replication queues, and a follower fetches parts concurrently — the small cursor part routinely lands ahead of a run's turns part — so on any replica the cursor can transiently assert completeness over turns not yet visible there. The design absorbs that skew by margin, not by pinning: the cursor trails ingest by the writer's settle window, which dwarfs normal replica fetch time. Reading the cursor alone still cannot over-assert what the writer published. The writer-side rationale is documented with the writer.
+> Resuming early lets the writer re-read the stale cursor on a replica where the delete has not landed and re-publish it — the correction silently undone. A second way to reach that state without a writer bug is a `service_name` retired and later reused: the new agent inherits the retired one's cursor, and until corrected every publish regresses, so `max(published_at)` reads stale while the writer is healthy. Finally, the cursor and the turns are separate tables with independent replication queues, and a follower fetches parts concurrently — the small cursor part routinely lands ahead of a run's turns part — so on any replica the cursor can transiently assert completeness over turns not yet visible there. The margin that covers it is wall-clock, not the settle window: settle moves the cursor's value in event time but delays nothing about when parts replicate. Trust a cursor row only once `now() − published_at` exceeds a fetch margin Δ — `published_at` is the run's wall-clock birth time, evaluated once at insert and replicated with the row. The turns part is born in the same run, seconds before the cursor row, so a Δ-old cursor means the turns part has had Δ to reach the same replica: either it is there, or the replica is more than Δ behind on fetches, which is a loud, alarmable state instead of a silent partial read. Δ covers the turns part's fetch, not the cursor's — after a held cursor the writer's overlap can put a day of turns in one part — plus inter-node clock skew, since the comparison runs on the reader's clock against a value stamped on the writer's. No constant Δ covers a replica rejoining with a historical backlog (see Writer-safe readiness); the margin bounds normal fetch skew only. The rule is reader-side only — no `insert_quorum`, no `SYSTEM SYNC REPLICA`, no pinned replica — and Δ is the reader's constant, not a chart value, so it moves with the reader's release cadence rather than the install's upgrade cadence. "No row" keeps its meaning under this read — never published — but a service whose rows are all younger than Δ is held, not absent, and a reader must not collapse the two:
+>
+> ```sql
+> SELECT service_name,
+>        max(watermark) AS newest,
+>        maxIf(watermark, published_at <= now64(9) - INTERVAL 60 SECOND) AS trusted
+> FROM otel_traces.conversation_rollup_watermarks
+> GROUP BY service_name
+> -- newest IS NULL  -> never published: the reader's default floor applies
+> -- trusted IS NULL -> published but younger than the margin: hold and re-read after it
+> -- else            -> trusted is the cursor to use
+> -- (60s stands in for Δ, which the reader sizes from measured turns-part fetch times)
+> ```
+>
+> Reading the cursor alone still cannot over-assert what the writer published. The writer-side rationale is documented with the writer.
 
 ## ClickHouse replication and Keeper
 

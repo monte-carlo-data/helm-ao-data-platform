@@ -15,8 +15,9 @@
 -- written_by enforces nothing by itself; it makes violations visible. The one
 -- silent direction is an UNMARKED writer row, which falls back to the join
 -- indistinguishable from an MV row. The marker vocabulary: '' = written by
--- the 0012 MV or pre-existing; 'turn_rollup_writer' = the scheduled rollup
--- writer. The writer owns the value; extend here as producers are added.
+-- the 0012 MV or pre-existing; 'conversation_rollup_writer' = the scheduled
+-- rollup writer (one name, matching its lambda, config key and log prefix).
+-- The writer owns the value; extend here as producers are added.
 -- Appended, though position does not bind: the 0012 MV's insert matches the
 -- target by output-alias NAME (verified on 26.2 and 26.4.3 — an alias the
 -- table lacks is rejected at the MV's CREATE, and an AFTER-placed column does
@@ -44,18 +45,23 @@
 -- sums the per-span total_tokens over a trace, and summing UInt32 promotes to
 -- UInt64. It is not a sum of prompt_tokens and completion_tokens — those
 -- re-count context carried into each LLM step.
--- turn_errors_count narrows the rollup's countIf() (UInt64) to UInt32 at
--- insert; reaching 2^32 would need that many errored spans in one trace —
--- not a real input.
+-- turn_errors_count stays UInt64 like the sum: countIf() returns UInt64
+-- natively, and narrowing it to UInt32 at insert would WRAP silently on
+-- overflow — implicit numeric narrowing is modulo 2^32, no error — so an
+-- overflowing count would store a plausible small number over the real one,
+-- the misread this file's Nullable + written_by design exists to expose.
+-- The measured populations behind keeping both wide live in the monolith's
+-- conversation_materialization readme, which this chart does not ship.
 -- Idempotent (ADD COLUMN IF NOT EXISTS) so the schema job can re-run it on
 -- every upgrade.
 ALTER TABLE otel_traces.conversations_normalized ON CLUSTER '{cluster}'
     ADD COLUMN IF NOT EXISTS turn_duration_seconds Nullable(Float64),
     ADD COLUMN IF NOT EXISTS turn_tokens Nullable(UInt64),
-    ADD COLUMN IF NOT EXISTS turn_errors_count Nullable(UInt32),
+    ADD COLUMN IF NOT EXISTS turn_errors_count Nullable(UInt64),
     -- Written-by provenance for the three above: the read switch trusts
     -- stored values only where this marker is set. '' for the MV's rows and
-    -- every pre-existing row; the scheduled writer sets 'turn_rollup_writer'
-    -- at insert. Bundled with the turn columns so no install can hold the
-    -- columns without the marker; the ALTER is metadata-only at any time.
+    -- every pre-existing row; the scheduled writer sets
+    -- 'conversation_rollup_writer' at insert. Bundled with the turn columns
+    -- so no install can hold the columns without the marker; the ALTER is
+    -- metadata-only at any time.
     ADD COLUMN IF NOT EXISTS written_by LowCardinality(String) DEFAULT '';
