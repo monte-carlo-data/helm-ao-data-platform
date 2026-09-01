@@ -19,11 +19,13 @@
 -- on every read, reading as "just arrived" (verified 26.2.15.4), and once
 -- the row's part is merged the value freezes at merge time (verified
 -- 26.2.15.4) — a more durable lie, but the same lie. The writer therefore
--- trusts the stamp only for spans whose start_time is at or after the
--- deploy-date floor it ships with; spans older than the floor stay on the
--- existing join read until the 30-day TTL ages them out. This file cannot
--- encode that floor — it is a per-install deploy instant, so the writer owns
--- it as a constant set at release time.
+-- trusts the stamp only for spans whose start_time is at or after a
+-- per-install floor, derived live as min(ingested_at) over the table: the
+-- lies only ever INFLATE a stamp (read-time now(), or a merge-time freeze
+-- that is also at or after the ALTER), so the minimum is at or after the
+-- ALTER instant on every install without any state to persist. Spans older
+-- than the floor stay on the existing join read until the 30-day TTL ages
+-- them out.
 --
 -- Idempotent (ADD COLUMN IF NOT EXISTS) so the schema job can re-run it on
 -- every upgrade; the ALTER is metadata-only and does not rewrite existing
