@@ -36,11 +36,10 @@
 -- records a real publish time rather than the epoch, which would read as a
 -- writer that has never run. The default is evaluated once per inserted block,
 -- so one batched publish shares one timestamp. It cannot make the column a
--- liveness read: replicated block dedup computes the block id over only the
--- columns the INSERT names, so a DEFAULT never differentiates two identical
--- blocks — an idle run republishing the same watermark is dropped as a
--- duplicate and published_at does not restamp. Liveness comes from the
--- writer's run telemetry, not from this column.
+-- liveness read: whether an identical re-send restamps the column is engine
+-- dedup behavior this file does not assert — treat the stamp as free to
+-- freeze for the full duration of a hold, the deliberate-pause case included.
+-- Liveness comes from the writer's run telemetry, not from this column.
 -- This release creates the table, so every install gets the column
 -- with its default; a later edit to this file would apply to fresh installs
 -- only (0019's note).
@@ -53,9 +52,9 @@
 -- `watermark` is an EVENT-TIME bound (comparable to turn_start) whose
 -- advancement the writer gates on arrival completeness; the arrival
 -- signal itself is the writer's choice (a MATERIALIZED now() column vs
--- system.parts), not this table's concern. One BATCHED INSERT per run covers
--- every scanned service_name — per-service inserts would create a part per
--- row on a high-frequency job. Async replica lag can only under-assert
+-- system.parts), not this table's concern. One BATCHED INSERT per install per
+-- tick covers every service whose rollup completed and verified — per-service
+-- inserts would create a part per row on a high-frequency job. Async replica lag can only under-assert
 -- completeness (a replica that has not seen the latest row answers with a
 -- lower watermark), which is the fail-safe direction; reads of this table need
 -- no select_sequential_consistency. That covers the cursor read alone; a
