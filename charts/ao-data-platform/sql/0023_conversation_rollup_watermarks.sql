@@ -22,21 +22,26 @@
 -- in its own part, so monotonicity comes from the read, not the engine. Read
 -- idiom: SELECT service_name, max(watermark) ... GROUP BY service_name. The
 -- max is the same answer before and after merges, so reads need no ORDER BY /
--- LIMIT 1 BY and no FINAL. `published_at` is liveness and provenance only —
--- read max(published_at) for "is the writer alive?". A merge keeps only the
--- highest-watermark row, so a regressed re-publish's later publish time
--- disappears with its row; same-watermark republish ties resolve last-wins,
--- so an idle writer's fresh published_at survives a merge. Both are
--- immaterial at run-interval scale. The same rule makes an over-advanced
--- cursor unfixable by re-publish: a lower watermark loses both the max() read
--- and the merge by design. Correcting one is an operator action; the README's
--- note on operating this table has the steps.
+-- LIMIT 1 BY and no FINAL. `published_at` is provenance. A merge keeps only
+-- the highest-watermark row, so a regressed re-publish's later publish time
+-- disappears with its row — which is the signal that a regressing publisher
+-- leaves behind: max(published_at) reads stale while the writer is healthy.
+-- Same-watermark republish ties resolve last-wins at merge. The same version
+-- rule makes an over-advanced cursor unfixable by re-publish: a lower
+-- watermark loses both the max() read and the merge by design. Correcting one
+-- is an operator action; the README's note on operating this table has the
+-- steps.
 --
--- `published_at` defaults to now64(9) because it carries a liveness read: a
--- writer that omitted the column would otherwise record the epoch, which reads
--- as a writer that has never run rather than as one that just ran. The default
--- is evaluated once per inserted block, so one batched publish shares one
--- timestamp. This release creates the table, so every install gets the column
+-- `published_at` defaults to now64(9) so a writer that omits the column still
+-- records a real publish time rather than the epoch, which would read as a
+-- writer that has never run. The default is evaluated once per inserted block,
+-- so one batched publish shares one timestamp. It cannot make the column a
+-- liveness read: replicated block dedup computes the block id over only the
+-- columns the INSERT names, so a DEFAULT never differentiates two identical
+-- blocks — an idle run republishing the same watermark is dropped as a
+-- duplicate and published_at does not restamp. Liveness comes from the
+-- writer's run telemetry, not from this column.
+-- This release creates the table, so every install gets the column
 -- with its default; a later edit to this file would apply to fresh installs
 -- only (0019's note).
 -- `watermark` takes no default by design — it is an event-time bound the
