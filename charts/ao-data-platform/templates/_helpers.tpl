@@ -249,3 +249,101 @@ templates/clickhouse-installation.yaml. Call with the root context (`.`).
 - "GRANT SELECT ON system.numbers"
 - "GRANT SELECT ON information_schema.*"
 {{- end }}
+
+{{/*
+The enabled ClickHouse users that carry a password, as a JSON array of
+{ch: <ClickHouse user name>, cfg: <values block>}. The single source of truth for
+the user list shared by the auth-methods ExternalSecret and the CHI's incl
+fragment — the two must never drift, or a user gets an `incl` with no matching
+substitution and ClickHouse rejects an empty <auth_methods>.
+Adding a ClickHouse user? Add it here, in values.yaml, and in
+templates/clickhouse-installation.yaml.
+Callers: {{ range $u := fromJsonArray (include "ao-data-platform.authMethodsUsers" .) }}
+*/}}
+{{- define "ao-data-platform.authMethodsUsers" -}}
+{{- $users := list
+      (dict "ch" "otel"         "cfg" .Values.clickhouse.otel)
+      (dict "ch" "schema_owner" "cfg" .Values.clickhouse.schemaOwner)
+      (dict "ch" "llm_worker"   "cfg" .Values.clickhouse.llmWorker)
+      (dict "ch" "monte_carlo"  "cfg" .Values.clickhouse.monteCarlo)
+-}}
+{{- if .Values.clickhouse.admin.enabled -}}
+{{- $users = append $users (dict "ch" "admin" "cfg" .Values.clickhouse.admin) -}}
+{{- end -}}
+{{- if .Values.clickhouse.readonlyUser.enabled -}}
+{{- $users = append $users (dict "ch" "readonly_user" "cfg" .Values.clickhouse.readonlyUser) -}}
+{{- end -}}
+{{- toJson $users -}}
+{{- end }}
+
+{{/*
+Absolute path of the mounted auth-methods substitution file. The Altinity
+operator mounts a secret-backed `files:` entry as its own volume at
+/etc/clickhouse-server/secrets.d/<files-key>/<secret-name>/<secret-key> — NOT in
+the directory the key names. Both the CHI `files:` key and this path must stay in
+lockstep; they are derived from the same values here so they cannot drift.
+*/}}
+{{- define "ao-data-platform.authMethodsSecretPath" -}}
+{{- printf "/etc/clickhouse-server/secrets.d/auth-methods.xml/%s/auth.xml" .Values.clickhouse.authMethods.secret -}}
+{{- end }}
+
+{{/*
+The auth-methods bundle ExternalSecret: assembles every enabled user's current
+(and, during a rotation, previous) password into one substitution file.
+The guard around the previous method is ESO-side and load-bearing: the previous
+secret holds the sentinel "-" in steady state (Secrets Manager rejects empty
+strings), and a bare `if` is truthy for it — a rendered sentinel <password>-</password>
+would be a valid, matchable one-character auth method, i.e. a login bypass.
+Helm cannot see the value, so only ESO can gate it. Validated live on dev-us1
+(Spike Finding 10).
+The whole previous block is additionally gated Helm-side on previousKey, so a
+user without one renders no reference to a `_previous` key ESO was never asked
+to fetch — the steady state stays byte-identical to pre-5.0.0 auth.
+*/}}
+{{- define "ao-data-platform.authMethodsExternalSecret" -}}
+{{- $users := fromJsonArray (include "ao-data-platform.authMethodsUsers" .) -}}
+{{- $am := .Values.clickhouse.authMethods -}}
+{{- $storeName := $am.externalSecret.secretStoreRef.name | default .Values.clickhouse.otel.externalSecret.secretStoreRef.name -}}
+{{- $storeKind := $am.externalSecret.secretStoreRef.kind | default .Values.clickhouse.otel.externalSecret.secretStoreRef.kind -}}
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: {{ $am.secret }}
+  labels:
+    {{- include "ao-data-platform.labels" . | nindent 4 }}
+spec:
+  refreshInterval: {{ $am.externalSecret.refreshInterval }}
+  secretStoreRef:
+    name: {{ required "clickhouse.authMethods.externalSecret.secretStoreRef.name (or clickhouse.otel.externalSecret.secretStoreRef.name) is required — the ClickHouse server reads its auth methods from this store" $storeName }}
+    kind: {{ $storeKind }}
+  target:
+    name: {{ $am.secret }}
+    creationPolicy: Owner
+    template:
+      data:
+        auth.xml: |
+          <clickhouse>
+          {{- range $u := $users }}
+            <{{ $u.ch }}_auth_methods>
+              <current><password>{{ printf "{{ .%s_password }}" $u.ch }}</password></current>
+              {{- if $u.cfg.externalSecret.previousKey }}
+              {{ printf "{{- if and .%s_previous (ne .%s_previous \"-\") }}" $u.ch $u.ch }}
+              <previous><password>{{ printf "{{ .%s_previous }}" $u.ch }}</password></previous>
+              {{ "{{- end }}" }}
+              {{- end }}
+            </{{ $u.ch }}_auth_methods>
+          {{- end }}
+          </clickhouse>
+  data:
+  {{- range $u := $users }}
+    - secretKey: {{ $u.ch }}_password
+      remoteRef:
+        key: {{ required (printf "externalSecret.remoteRef.key is required for ClickHouse user %s" $u.ch) $u.cfg.externalSecret.remoteRef.key }}
+    {{- if $u.cfg.externalSecret.previousKey }}
+    - secretKey: {{ $u.ch }}_previous
+      remoteRef:
+        key: {{ $u.cfg.externalSecret.previousKey }}
+    {{- end }}
+  {{- end }}
+{{- end }}

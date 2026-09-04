@@ -69,6 +69,13 @@ clickhouse:
         key: ""                   # user must provide
         property: ""              # optional, for JSON secrets
         version: ""               # optional, required for Fake provider
+      # Secrets Manager key holding this user's PREVIOUS password, kept valid
+      # alongside the current one for the duration of a rotation (YET-2680).
+      # Empty (the default) means single-method auth — exactly today's behavior.
+      # The referenced secret holds the sentinel "-" in steady state; ESO's
+      # template treats the sentinel as absent and drops the previous method.
+      # Set by the consuming Terraform module.
+      previousKey: ""
       refreshInterval: 1h
   # schema_owner — owns the schema and is the materialized-view DEFINER. Used by the
   # schema-migration Job for all DDL (CREATE DATABASE/TABLE/VIEW/MV), the telemetry-table
@@ -89,6 +96,7 @@ clickhouse:
         key: ""                   # user must provide
         property: ""              # optional, for JSON secrets
         version: ""               # optional, required for Fake provider
+      previousKey: ""             # see clickhouse.otel.externalSecret.previousKey
       refreshInterval: 1h
   # llm_worker — identity for the llm-worker Deployment. Reads the LLM job queue and appends
   # results back (no mutations): SELECT on llm_batches/llm_inputs/llm_results, INSERT on
@@ -106,6 +114,7 @@ clickhouse:
         key: ""                   # user must provide
         property: ""              # optional, for JSON secrets
         version: ""               # optional, required for Fake provider
+      previousKey: ""             # see clickhouse.otel.externalSecret.previousKey
       refreshInterval: 1h
   # monte_carlo — the Monte Carlo read-only service account (data-source monitoring) and the
   # agent's LLM-queue producer. Reads everything via the shared reader bundle and appends to the
@@ -127,6 +136,7 @@ clickhouse:
         key: ""                   # user must provide
         property: ""              # optional, for JSON secrets
         version: ""               # optional, required for Fake provider
+      previousKey: ""             # see clickhouse.otel.externalSecret.previousKey
       refreshInterval: 1h
   # admin — gated break-glass superuser: full access + user management + SYSTEM. OFF by default.
   # By default it is reachable only over loopback (see networksIp), so using it requires exec-ing
@@ -152,6 +162,7 @@ clickhouse:
         key: ""                   # user must provide
         property: ""              # optional, for JSON secrets
         version: ""               # optional, required for Fake provider
+      previousKey: ""             # see clickhouse.otel.externalSecret.previousKey
       refreshInterval: 1h
   readonlyUser:
     enabled: false
@@ -170,6 +181,23 @@ clickhouse:
         key: ""                   # user must provide
         property: ""              # optional, for JSON secrets
         version: ""               # optional, required for Fake provider
+      previousKey: ""             # see clickhouse.otel.externalSecret.previousKey
+      refreshInterval: 1h
+  # Server-side auth assembly (YET-2680). ClickHouse cannot take two passwords
+  # for one user through the operator's flat `users:` spec, so the chart renders
+  # every enabled user's auth methods into ONE substitution file, delivered as a
+  # secret-backed volume and reached from the users config via include_from/incl.
+  # This secret is read by the ClickHouse server only — the six per-user secrets
+  # keep their `password` key and remain what every client consumes.
+  authMethods:
+    secret: ao-clickhouse-auth-methods
+    externalSecret:
+      # Defaults to the otel user's store when left empty, so a consumer that
+      # only configures the per-user blocks (an older Terraform module) still
+      # gets a working bundle.
+      secretStoreRef:
+        name: ""
+        kind: ""
       refreshInterval: 1h
   hostname: ""    # if set, adds external-dns.alpha.kubernetes.io/hostname annotation
   service:

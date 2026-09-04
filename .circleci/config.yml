@@ -114,6 +114,36 @@ jobs:
             fi
             echo "Operator label.include allowlist rendered correctly."
       - run:
+          name: Auth-methods bundle renders both template branches
+          # The bundle is what gives the ClickHouse server two valid passwords
+          # during a rotation (YET-2680). Two things can silently break it: a
+          # user present in the CHI's incl fragment but missing from the bundle
+          # (ClickHouse rejects an empty <auth_methods>), and a lost ESO-side
+          # `if` around the previous method (the steady-state sentinel "-" would
+          # render a matchable one-character auth method — a login bypass).
+          command: |
+            helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --kube-version 1.30.0 \
+              --show-only templates/external-secret.yaml > es.yaml
+            for u in otel schema_owner llm_worker monte_carlo; do
+              grep -q "<${u}_auth_methods>" es.yaml || {
+                echo "auth.xml is missing the ${u} element"; exit 1; }
+              grep -q "secretKey: ${u}_password" es.yaml || {
+                echo "bundle is missing the ${u}_password data entry"; exit 1; }
+            done
+            grep -q 'secretKey: otel_previous' es.yaml || {
+              echo "previousKey set on otel but no otel_previous data entry rendered"; exit 1; }
+            grep -q '{{- if and .otel_previous (ne .otel_previous "-") }}' es.yaml || {
+              echo "the ESO-side sentinel guard on the previous password is missing — the steady-state sentinel would render a matchable one-character auth method"; exit 1; }
+            if grep -q 'secretKey: monte_carlo_previous' es.yaml; then
+              echo "monte_carlo has no previousKey but a previous data entry rendered"; exit 1
+            fi
+            if grep -q 'monte_carlo_previous' es.yaml; then
+              echo "monte_carlo has no previousKey but auth.xml references monte_carlo_previous — ESO was never asked to fetch that key"; exit 1
+            fi
+            echo "Auth-methods bundle rendered both branches correctly."
+      - run:
           name: Gateway disabled renders no gateway resources
           # The default posture is gateway.enabled=false. Assert none of the
           # gateway-only kinds leak into a non-gateway render.
