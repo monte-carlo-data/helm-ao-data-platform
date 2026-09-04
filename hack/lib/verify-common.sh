@@ -88,17 +88,32 @@ svc_annotation() {  # svc key
 expect_grant() {  # label user pw needle
   if ch_as "$2" "$3" "SHOW GRANTS" | grep -qiF "$4"; then pass "$1"; else fail "$1 — expected grant missing: $4"; fi
 }
-forbid_grant() {  # label user pw needle
-  # Positively confirm SHOW GRANTS actually ran before trusting "needle absent" = grant absent:
-  # a transient exec/auth failure also yields output without the needle, which would false-PASS.
-  local o; o=$(ch_as "$2" "$3" "SHOW GRANTS")
-  if echo "$o" | grep -qiE "exception|access_denied|not enough priv" || ! echo "$o" | grep -qiF "GRANT"; then
-    fail "$1 — could not read grants (SHOW GRANTS failed or returned no grant lines): $o"
-  elif echo "$o" | grep -qiF "$4"; then
-    fail "$1 — unexpected grant present: $4"
-  else
-    pass "$1"
-  fi
+# expect_privilege / forbid_privilege use CHECK GRANT, not a SHOW GRANTS string match: ClickHouse
+# collapses privileges on one object into a single line, so a per-table needle misses a
+# db-wide grant (GRANT SELECT, INSERT ON otel_traces.*) even though the user HAS the privilege.
+# Two caveats shape the call sites. The privilege string needs its ON clause — the bare form
+# (CHECK GRANT ACCESS MANAGEMENT) is a SYNTAX_ERROR, and ch_as folds stderr into stdout, so a
+# malformed call fails the run at the grep below rather than asserting anything. And CHECK GRANT
+# has containment semantics: checking a wider object than the grant covers answers 0, so a
+# database-wide check cannot see a per-table grant (verified on 26.4.3).
+expect_privilege() {  # label user pw privilege — asserts CHECK GRANT <privilege> = 1
+  local o; o=$(ch_as "$2" "$3" "CHECK GRANT $4")
+  if echo "$o" | grep -qiE "exception|access_denied"; then fail "$1 — CHECK GRANT failed: $o"
+  elif [ "$(echo "$o" | tr -d '[:space:]')" = "1" ]; then pass "$1"
+  else fail "$1 — expected privilege held, got: $o"; fi
+}
+forbid_privilege() {  # label user pw privilege — asserts CHECK GRANT <privilege> = 0
+  local o; o=$(ch_as "$2" "$3" "CHECK GRANT $4")
+  if echo "$o" | grep -qiE "exception|access_denied"; then fail "$1 — CHECK GRANT failed: $o"
+  elif [ "$(echo "$o" | tr -d '[:space:]')" = "0" ]; then pass "$1"
+  else fail "$1 — unexpected privilege held: $4 (got: $o)"; fi
+}
+# forbid_grant is the complement for absence-of-a-privilege-at-any-scope: a bare token needle
+# ("INSERT") survives collapsing, because every render of the privilege contains it, and it sees
+# per-table grants that a db-wide CHECK GRANT cannot. Its blind spot is a privilege arriving via
+# a role, which SHOW GRANTS does not expand — pair it with a CHECK GRANT line where that matters.
+forbid_grant() {  # label user pw needle — asserts the needle is absent from SHOW GRANTS
+  if ch_as "$2" "$3" "SHOW GRANTS" | grep -qiF "$4"; then fail "$1 — unexpected grant: $4"; else pass "$1"; fi
 }
 expect_ok() {     # label user pw sql
   local o; o=$(ch_as "$2" "$3" "$4")
@@ -161,7 +176,7 @@ verify_clickhouse_user_model() {
 
   # schema_owner — owns the schema (DDL); deliberately has no access management rights.
   expect_grant   "schema_owner holds DDL on otel_traces"     schema_owner "$SO_PW" "CREATE TABLE"
-  forbid_grant   "schema_owner has no access management"     schema_owner "$SO_PW" "ACCESS MANAGEMENT"
+  forbid_privilege "schema_owner has no access management"   schema_owner "$SO_PW" "ACCESS MANAGEMENT ON *.*"
   # SHOW USERS is an access-management-gated op that creates no entity, so it stays correct on
   # re-runs. A CREATE USER probe could false-FAIL on a leftover user (ALREADY_EXISTS, not denied),
   # and schema_owner lacks the privilege to drop it for cleanup.
@@ -183,19 +198,47 @@ verify_clickhouse_user_model() {
   expect_denied  "llm_worker cannot read telemetry"          llm_worker "$WK_PW" "SELECT count() FROM otel_traces.spans_normalized"
   expect_denied  "llm_worker cannot write telemetry"         llm_worker "$WK_PW" "INSERT INTO otel_traces.otel_traces (Timestamp) VALUES (now())"
 
-  # monte_carlo — reads everything + produces to the queue, but must NOT write telemetry.
+  # monte_carlo — reads everything, produces to the queue, and writes the conversation turn rollup
+  # (sql/0022 columns, sql/0023 cursor). It must still not write raw telemetry or metrics: the
+  # rollup grants are per-table, so the denials below are what keep the ingest path out of reach.
   expect_ok      "monte_carlo reads telemetry"               monte_carlo "$MC_PW" "SELECT count() FROM otel_traces.spans_normalized"
   # system.numbers backs time-bucket / gap-fill queries (e.g. getTraceTimeSeries); reader bundle grant.
   expect_ok      "monte_carlo can read system.numbers"       monte_carlo "$MC_PW" "SELECT number FROM system.numbers LIMIT 1"
   expect_grant   "monte_carlo can produce to the queue"      monte_carlo "$MC_PW" "INSERT ON otel_traces.llm_inputs"
   expect_grant   "monte_carlo can produce to llm_batches"    monte_carlo "$MC_PW" "INSERT ON otel_traces.llm_batches"
-  expect_denied  "monte_carlo cannot write telemetry"        monte_carlo "$MC_PW" "INSERT INTO otel_traces.otel_traces (Timestamp) VALUES (now())"
-  forbid_grant   "monte_carlo cannot write otel_metrics"     monte_carlo "$MC_PW" "GRANT INSERT ON otel_traces.otel_metrics"
+  # CHECK GRANT (expect_privilege) rather than expect_grant's string match: if the grants are
+  # later consolidated (GRANT SELECT, INSERT ON one table) the needles false-FAIL, while the
+  # privilege check follows the consolidation.
+  expect_privilege "monte_carlo writes conversation turns"     monte_carlo "$MC_PW" "INSERT ON otel_traces.conversations_normalized"
+  expect_privilege "monte_carlo publishes the rollup cursor"   monte_carlo "$MC_PW" "INSERT ON otel_traces.conversation_rollup_watermarks"
+  # The writer's ledger anti-join, cursor read, and duplicate assertion all read through
+  # clusterAllReplicas, which READ ON REMOTE gates — not CLUSTER (verified on 26.2.15.4).
+  # Unlike the other checks here, READ ON REMOTE takes NO ON clause — the bare form is the
+  # only one that parses (an ON *.* form syntax-errors on 26.2.15.4 and 26.4.3).
+  expect_privilege "monte_carlo can cluster-read"            monte_carlo "$MC_PW" "READ ON REMOTE"
+  # The capability itself, probed the way the writer's own preflight probes it; WHERE 0 keeps it free.
+  expect_ok      "monte_carlo cluster-reads the watermark table" monte_carlo "$MC_PW" "SELECT count() FROM clusterAllReplicas('otel', otel_traces.conversation_rollup_watermarks) WHERE 0"
+  # The exact-guarantee read (the README's watermark note) syncs the turns table before reading
+  # it. Privilege check plus the statement itself — on a caught-up replica the sync returns at once.
+  expect_privilege "monte_carlo can sync the turns table"      monte_carlo "$MC_PW" "SYSTEM SYNC REPLICA ON otel_traces.conversations_normalized"
+  expect_ok      "monte_carlo syncs the turns table"           monte_carlo "$MC_PW" "SYSTEM SYNC REPLICA otel_traces.conversations_normalized LIGHTWEIGHT"
+  expect_denied  "monte_carlo cannot write raw telemetry"    monte_carlo "$MC_PW" "INSERT INTO otel_traces.otel_traces (Timestamp) VALUES (now())"
+  # Canary for a database-wide INSERT grant: otel_metrics does not exist, and CHECK GRANT does no
+  # object-existence short-circuit, so this answers 1 only if monte_carlo holds INSERT on
+  # otel_traces.* (verified on 26.4.3). Per-table grants it cannot see get their own lines.
+  forbid_privilege "monte_carlo holds no database-wide INSERT" monte_carlo "$MC_PW" "INSERT ON otel_traces.otel_metrics"
+  # The rollup grants are per-table, so the normalized spans the rollup READS must stay unwritable.
+  forbid_privilege "monte_carlo cannot write normalized spans" monte_carlo "$MC_PW" "INSERT ON otel_traces.spans_normalized"
+  forbid_privilege "monte_carlo cannot write the trace-id index" monte_carlo "$MC_PW" "INSERT ON otel_traces.otel_traces_trace_id_ts"
 
   # readonly_user — SELECT-only; readonly=2 profile blocks writes even without an explicit deny grant.
   expect_ok      "readonly_user reads telemetry"             readonly_user "$CH_READ_PW" "SELECT count() FROM otel_traces.spans_normalized"
   expect_ok      "readonly_user can read system.numbers"     readonly_user "$CH_READ_PW" "SELECT number FROM system.numbers LIMIT 1"
-  forbid_grant   "readonly_user is SELECT-only"              readonly_user "$CH_READ_PW" "GRANT INSERT"
+  # Two halves of the SELECT-only invariant, because neither check covers the other's blind
+  # spot: the db-wide CHECK GRANT misses a per-table INSERT grant (containment), and the token
+  # scan misses a privilege arriving via a role.
+  forbid_privilege "readonly_user holds no database-wide INSERT" readonly_user "$CH_READ_PW" "INSERT ON otel_traces.*"
+  forbid_grant   "readonly_user holds no INSERT grant at any scope" readonly_user "$CH_READ_PW" "INSERT"
   expect_denied  "readonly_user cannot write (runtime)"      readonly_user "$CH_READ_PW" "INSERT INTO otel_traces.otel_traces (Timestamp) VALUES (now())"
 
   # otel — always an ingester; its grant shape varies by restrictGrants state.
