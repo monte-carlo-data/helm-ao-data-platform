@@ -213,7 +213,9 @@ verify_clickhouse_user_model() {
   expect_privilege "monte_carlo publishes the rollup cursor"   monte_carlo "$MC_PW" "INSERT ON otel_traces.conversation_rollup_watermarks"
   # The writer's ledger anti-join, cursor read, and duplicate assertion all read through
   # clusterAllReplicas, which READ ON REMOTE gates — not CLUSTER (verified on 26.2.15.4).
-  expect_privilege "monte_carlo can cluster-read"            monte_carlo "$MC_PW" "READ ON REMOTE ON *.*"
+  # Unlike the other checks here, READ ON REMOTE takes NO ON clause — the bare form is the
+  # only one that parses (an ON *.* form syntax-errors on 26.2.15.4 and 26.4.3).
+  expect_privilege "monte_carlo can cluster-read"            monte_carlo "$MC_PW" "READ ON REMOTE"
   # The capability itself, probed the way the writer's own preflight probes it; WHERE 0 keeps it free.
   expect_ok      "monte_carlo cluster-reads the watermark table" monte_carlo "$MC_PW" "SELECT count() FROM clusterAllReplicas('otel', otel_traces.conversation_rollup_watermarks) WHERE 0"
   # The exact-guarantee read (the README's watermark note) syncs the turns table before reading

@@ -132,8 +132,9 @@ spec:
         # The writer's correctness-bearing reads (ledger anti-join, cursor read, duplicate
         # assertion) go through clusterAllReplicas, which is gated by READ ON REMOTE — not by
         # CLUSTER (verified on 26.2.15.4: a SELECT-only user gets code 497 until granted).
-        # The privilege is irreducibly global; it cannot be scoped below *.*.
-        - "GRANT READ ON REMOTE ON *.*"
+        # READ ON REMOTE takes no object clause — the ON *.* form is a syntax error
+        # (verified on 26.2.15.4 and 26.4.3) — it is global by construction.
+        - "GRANT READ ON REMOTE"
         # The README's watermark note prescribes the exact-guarantee read as a
         # SYSTEM SYNC REPLICA on the turns table followed by local reads, and
         # monte_carlo is the only user that recipe exists for — without this
