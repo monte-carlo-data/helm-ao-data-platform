@@ -144,6 +144,55 @@ jobs:
             fi
             echo "Auth-methods bundle rendered both branches correctly."
       - run:
+          name: CHI users live wholly in the fragment, one incl per enabled user
+          # Three invariants: (1) none of the six users may keep ANY key in the
+          # operator users: spec — the operator injects a password hash for a
+          # password-less entry, which ClickHouse rejects alongside <auth_methods>
+          # (Spike Finding 7); (2) every incl name must have a matching element in
+          # the bundle — an unresolved incl leaves an empty <auth_methods>, also
+          # rejected; (3) the gated users appear in both files or neither.
+          command: |
+            helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --kube-version 1.30.0 \
+              --show-only templates/clickhouse-installation.yaml > chi.yaml
+            if grep -Eq '^      (otel|schema_owner|llm_worker|monte_carlo|admin|readonly_user)/(password|networks|grants|profile)' chi.yaml; then
+              echo "A rotation-managed user kept a key in the operator users: spec — the operator would inject a password hash that cannot coexist with <auth_methods>."
+              grep -nE '^      (otel|schema_owner|llm_worker|monte_carlo|admin|readonly_user)/' chi.yaml
+              exit 1
+            fi
+            for u in otel schema_owner llm_worker monte_carlo; do
+              grep -q "incl=\"${u}_auth_methods\"" chi.yaml || {
+                echo "no incl for ${u}"; exit 1; }
+              grep -q "<${u}>" chi.yaml || {
+                echo "no <${u}> element in the fragment — the user lost its definition"; exit 1; }
+            done
+            grep -q '<grants>' chi.yaml || {
+              echo "fragment has no grants — users would be useless even if auth worked"; exit 1; }
+            grep -q 'include_from>/etc/clickhouse-server/secrets.d/auth-methods.xml/ao-clickhouse-auth-methods/auth.xml<' chi.yaml || {
+              echo "include_from does not match the operator's secret mount path"; exit 1; }
+            # Gated users: absent by default, present in BOTH files when enabled.
+            if grep -q 'incl="admin_auth_methods"' chi.yaml; then
+              echo "admin is disabled in lint-values but rendered into the fragment"; exit 1
+            fi
+            helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml --kube-version 1.30.0 \
+              --set clickhouse.admin.enabled=true \
+              --set clickhouse.admin.externalSecret.secretStoreRef.name=ci-placeholder \
+              --set clickhouse.admin.externalSecret.remoteRef.key=ci-placeholder \
+              --show-only templates/clickhouse-installation.yaml > chi-admin.yaml
+            grep -q 'incl="admin_auth_methods"' chi-admin.yaml || {
+              echo "admin enabled but no element in the fragment"; exit 1; }
+            helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml --kube-version 1.30.0 \
+              --set clickhouse.admin.enabled=true \
+              --set clickhouse.admin.externalSecret.secretStoreRef.name=ci-placeholder \
+              --set clickhouse.admin.externalSecret.remoteRef.key=ci-placeholder \
+              --show-only templates/external-secret.yaml > es-admin.yaml
+            grep -q '<admin_auth_methods>' es-admin.yaml || {
+              echo "admin enabled but the bundle has no admin element — the incl would not resolve"; exit 1; }
+            echo "CHI auth-methods wiring rendered correctly."
+      - run:
           name: Gateway disabled renders no gateway resources
           # The default posture is gateway.enabled=false. Assert none of the
           # gateway-only kinds leak into a non-gateway render.
@@ -540,7 +589,7 @@ jobs:
             assert_rendered 'config.d/readiness_handler.xml: |'
             assert_rendered '<query>GRANT SELECT ON system.replicas</query>'
             assert_rendered '<query>GRANT SHOW TABLES ON otel_traces.*</query>'
-            assert_rendered '- "GRANT CLUSTER ON *.*"'
+            assert_rendered '<query>GRANT CLUSTER ON *.*</query>'
             assert_rendered 'clickhouse.altinity.com/chi: otel'
             assert_rendered 'clickhouse-keeper.altinity.com/chk: otel'
             # The auto cluster secret must sit under the cluster's `secret:` key —

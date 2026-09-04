@@ -235,19 +235,20 @@ Shared read-only grant bundle (the "reader bundle").
 Granted to both monte_carlo (reader + queue producer) and readonly_user (human/MCP/JDBC). Covers the
 telemetry DB plus the metadata reads DataGrip/MCP and Monte Carlo data-source monitoring need. Keep
 this as the single source of truth — adding a read target means editing it here once.
-Emits YAML list items (`- "GRANT …"`) intended for inclusion under a CHI `<user>/grants/query`
-sequence. Must be called with `| nindent 8` to align with the surrounding 8-space indent used in
-templates/clickhouse-installation.yaml. Call with the root context (`.`).
+Emits `<query>GRANT …</query>` elements for inclusion under a `<grants>` element in the
+users.d/auth-methods.xml fragment (templates/clickhouse-installation.yaml), where every SQL user
+is now defined (YET-2680). Must be called with `| nindent 14` to align with that fragment's
+grants indent. Call with the root context (`.`).
 */}}
 {{- define "ao-data-platform.readerGrants" -}}
-- "GRANT SELECT ON otel_traces.*"
-- "GRANT SELECT ON system.tables"
-- "GRANT SELECT ON system.parts"
-- "GRANT SELECT ON system.query_log"
-# system.numbers is the generator table for time-bucket / gap-fill queries (e.g. the
-# getTraceTimeSeries time series), not a metadata read — but reader clients need it.
-- "GRANT SELECT ON system.numbers"
-- "GRANT SELECT ON information_schema.*"
+<query>GRANT SELECT ON otel_traces.*</query>
+<query>GRANT SELECT ON system.tables</query>
+<query>GRANT SELECT ON system.parts</query>
+<query>GRANT SELECT ON system.query_log</query>
+<!-- system.numbers is the generator table for time-bucket / gap-fill queries (e.g. the
+     getTraceTimeSeries time series), not a metadata read — but reader clients need it. -->
+<query>GRANT SELECT ON system.numbers</query>
+<query>GRANT SELECT ON information_schema.*</query>
 {{- end }}
 
 {{/*
