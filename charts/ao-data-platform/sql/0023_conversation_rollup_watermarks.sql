@@ -26,7 +26,8 @@
 -- the highest-watermark row, so a regressed re-publish's later publish time
 -- disappears with its row — which is the signal that a regressing publisher
 -- leaves behind: max(published_at) reads stale while the writer is healthy.
--- Same-watermark republish ties resolve last-wins at merge. The same version
+-- Same-watermark republish ties resolve last-wins at merge (reachable when a
+-- republish escapes block dedup, e.g. outside the dedup window). The same version
 -- rule makes an over-advanced cursor unfixable by re-publish: a lower
 -- watermark loses both the max() read and the merge by design. Correcting one
 -- is an operator action; the README's note on operating this table has the
@@ -36,10 +37,19 @@
 -- records a real publish time rather than the epoch, which would read as a
 -- writer that has never run. The default is evaluated once per inserted block,
 -- so one batched publish shares one timestamp. It cannot make the column a
--- liveness read: whether an identical re-send restamps the column is engine
--- dedup behavior this file does not assert — treat the stamp as free to
--- freeze for the full duration of a hold, the deliberate-pause case included.
--- Liveness comes from the writer's run telemetry, not from this column.
+-- liveness read: replicated block dedup keys the block id on only the columns
+-- the INSERT names, so a DEFAULT never differentiates two identical idle
+-- publishes — the re-send is dropped as a duplicate and the stamp does not
+-- restamp (verified on a replicated 26.2 cluster: identical idle publishes
+-- land as one row). Two reachable exits restamp it with nothing advanced: the
+-- writer naming `published_at` in its INSERT column list (every block then
+-- differs by the wall-clock value, so nothing dedupes), and the dedup window
+-- expiring (`replicated_deduplication_window` /
+-- `replicated_deduplication_window_seconds`; a deduped block does not refresh
+-- the window), so a service idle longer than the window restamps on its next
+-- run. A paused writer publishes nothing, so the stamp also freezes for the
+-- full duration of a hold. Liveness comes from the writer's run telemetry,
+-- not from this column.
 -- This release creates the table, so every install gets the column
 -- with its default; a later edit to this file would apply to fresh installs
 -- only (0019's note).

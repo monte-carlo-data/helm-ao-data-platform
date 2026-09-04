@@ -129,6 +129,17 @@ spec:
         - "GRANT INSERT ON otel_traces.conversation_cluster_assignments"
         - "GRANT INSERT ON otel_traces.conversations_normalized"
         - "GRANT INSERT ON otel_traces.conversation_rollup_watermarks"
+        # The writer's correctness-bearing reads (ledger anti-join, cursor read, duplicate
+        # assertion) go through clusterAllReplicas, which is gated by READ ON REMOTE — not by
+        # CLUSTER (verified on 26.2.15.4: a SELECT-only user gets code 497 until granted).
+        # The privilege is irreducibly global; it cannot be scoped below *.*.
+        - "GRANT READ ON REMOTE ON *.*"
+        # The README's watermark note prescribes the exact-guarantee read as a
+        # SYSTEM SYNC REPLICA on the turns table followed by local reads, and
+        # monte_carlo is the only user that recipe exists for — without this
+        # grant it fails closed on every call. Table-level; LIGHTWEIGHT needs
+        # no separate grant.
+        - "GRANT SYSTEM SYNC REPLICA ON otel_traces.conversations_normalized"
       {{- if .Values.clickhouse.admin.enabled }}
       # admin — gated break-glass superuser: full access + user management + SYSTEM. Not for
       # service-to-service. Defaults to loopback-only (admin.networksIp), so it's usable only

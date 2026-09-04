@@ -211,6 +211,15 @@ verify_clickhouse_user_model() {
   # privilege check follows the consolidation.
   expect_privilege "monte_carlo writes conversation turns"     monte_carlo "$MC_PW" "INSERT ON otel_traces.conversations_normalized"
   expect_privilege "monte_carlo publishes the rollup cursor"   monte_carlo "$MC_PW" "INSERT ON otel_traces.conversation_rollup_watermarks"
+  # The writer's ledger anti-join, cursor read, and duplicate assertion all read through
+  # clusterAllReplicas, which READ ON REMOTE gates — not CLUSTER (verified on 26.2.15.4).
+  expect_privilege "monte_carlo can cluster-read"            monte_carlo "$MC_PW" "READ ON REMOTE ON *.*"
+  # The capability itself, probed the way the writer's own preflight probes it; WHERE 0 keeps it free.
+  expect_ok      "monte_carlo cluster-reads the watermark table" monte_carlo "$MC_PW" "SELECT count() FROM clusterAllReplicas('otel', otel_traces.conversation_rollup_watermarks) WHERE 0"
+  # The exact-guarantee read (the README's watermark note) syncs the turns table before reading
+  # it. Privilege check plus the statement itself — on a caught-up replica the sync returns at once.
+  expect_privilege "monte_carlo can sync the turns table"      monte_carlo "$MC_PW" "SYSTEM SYNC REPLICA ON otel_traces.conversations_normalized"
+  expect_ok      "monte_carlo syncs the turns table"           monte_carlo "$MC_PW" "SYSTEM SYNC REPLICA otel_traces.conversations_normalized LIGHTWEIGHT"
   expect_denied  "monte_carlo cannot write raw telemetry"    monte_carlo "$MC_PW" "INSERT INTO otel_traces.otel_traces (Timestamp) VALUES (now())"
   # Canary for a database-wide INSERT grant: otel_metrics does not exist, and CHECK GRANT does no
   # object-existence short-circuit, so this answers 1 only if monte_carlo holds INSERT on
