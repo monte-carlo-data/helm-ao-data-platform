@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS otel_traces.conversations_normalized ON CLUSTER '{clu
     -- targets other attributes, not conversation content. SKIP them on the target
     -- column to avoid re-storing them; every other attribute is still shredded
     -- into sub-columns for attribute search. span_attributes_keys still lists
-    -- both keys, so the 0009 has() root-span guard is unaffected.
+    -- both keys, so the 0012 has() root-span guard is unaffected.
     `span_attributes` JSON(
         SKIP `traceloop.entity.input`,
         SKIP `traceloop.entity.output`

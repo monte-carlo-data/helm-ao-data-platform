@@ -2,7 +2,7 @@
 -- (the job that loads ADK/gen_ai conversations into conversations_normalized,
 -- which the 0012 MV's Traceloop-only gate cannot serve). After each run's
 -- INSERT lands, the writer publishes one row per scanned service_name: every
--- turn whose spans arrived at or before `watermark` has been written. The
+-- turn with `turn_start` at or before `watermark` has been written. The
 -- cursor cannot be derived from the target table — it is arrival-ordered, so
 -- max(turn_start) over written rows is not a completeness bound — which is
 -- why it is published rather than computed. Keyed by service_name, the
@@ -60,9 +60,9 @@
 -- every merge and every max().
 --
 -- `watermark` is an EVENT-TIME bound (comparable to turn_start) whose
--- advancement the writer gates on arrival completeness; the arrival
--- signal itself is the writer's choice (a MATERIALIZED now() column vs
--- system.parts), not this table's concern. One BATCHED INSERT per install per
+-- advancement the writer gates on arrival completeness, read off the
+-- arrival stamp this release adds (0024's spans_normalized.ingested_at,
+-- MATERIALIZED now64(9)). One BATCHED INSERT per install per
 -- tick covers every service whose rollup completed and verified — per-service
 -- inserts would create a part per row on a high-frequency job. Async replica lag can only under-assert
 -- completeness (a replica that has not seen the latest row answers with a
@@ -72,8 +72,9 @@
 -- as an operator fact in the README's note on operating this table.
 --
 -- The writer runs as `monte_carlo`; the INSERT grant ships in this release
--- (templates/clickhouse-installation.yaml). Files correspond to that fixture
--- by basename, not ordinal (0019's note); its version of this table is a
+-- (templates/clickhouse-installation.yaml). Files correspond to the
+-- monolith's test-fixture mirror of this chart's SQL by basename, not
+-- ordinal (0019's note); its version of this table is a
 -- plain ReplacingMergeTree with no ON CLUSTER — intentional, it runs on a
 -- single-node test container.
 CREATE TABLE IF NOT EXISTS otel_traces.conversation_rollup_watermarks ON CLUSTER '{cluster}'

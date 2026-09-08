@@ -113,7 +113,18 @@ forbid_privilege() {  # label user pw privilege — asserts CHECK GRANT <privile
 # per-table grants that a db-wide CHECK GRANT cannot. Its blind spot is a privilege arriving via
 # a role, which SHOW GRANTS does not expand — pair it with a CHECK GRANT line where that matters.
 forbid_grant() {  # label user pw needle — asserts the needle is absent from SHOW GRANTS
-  if ch_as "$2" "$3" "SHOW GRANTS" | grep -qiF "$4"; then fail "$1 — unexpected grant: $4"; else pass "$1"; fi
+  # Fail closed: positively confirm SHOW GRANTS ran before trusting "needle absent" = grant
+  # absent. ch_as swallows the exit status and folds stderr into stdout, so a transient failure
+  # (pod restart, apiserver blip) yields error text without the needle — which a bare needle
+  # grep would read as PASS.
+  local o; o=$(ch_as "$2" "$3" "SHOW GRANTS")
+  if echo "$o" | grep -qiE "exception|access_denied|not enough priv" || ! echo "$o" | grep -qiF "GRANT"; then
+    fail "$1 — could not read grants (SHOW GRANTS failed or returned no grant lines): $o"
+  elif echo "$o" | grep -qiF "$4"; then
+    fail "$1 — unexpected grant: $4"
+  else
+    pass "$1"
+  fi
 }
 expect_ok() {     # label user pw sql
   local o; o=$(ch_as "$2" "$3" "$4")
@@ -122,6 +133,12 @@ expect_ok() {     # label user pw sql
 expect_denied() { # label user pw sql
   local o; o=$(ch_as "$2" "$3" "$4")
   if echo "$o" | grep -qiE "access_denied|not enough priv"; then pass "$1"; else fail "$1 — expected ACCESS_DENIED, got: $o"; fi
+}
+expect_match() {  # label user pw sql needle — asserts the query runs AND its output contains the needle
+  local o; o=$(ch_as "$2" "$3" "$4")
+  if echo "$o" | grep -qiE "exception|access_denied|not enough priv"; then fail "$1 — $o"
+  elif echo "$o" | grep -qiF "$5"; then pass "$1"
+  else fail "$1 — expected output missing: $5 (got: $o)"; fi
 }
 expect_rows() {   # label user pw sql — polls a scalar count() query, asserting the result is >= 1
   # Retries a few times before failing: a count() against a Replicated* table can read 0 on the
@@ -211,6 +228,18 @@ verify_clickhouse_user_model() {
   # privilege check follows the consolidation.
   expect_privilege "monte_carlo writes conversation turns"     monte_carlo "$MC_PW" "INSERT ON otel_traces.conversations_normalized"
   expect_privilege "monte_carlo publishes the rollup cursor"   monte_carlo "$MC_PW" "INSERT ON otel_traces.conversation_rollup_watermarks"
+  # ADD COLUMN IF NOT EXISTS matches by name only, so the table loop's existence check cannot
+  # see a wrong-shaped column: a cluster where a draft 0022/0024 was hand-applied during
+  # development keeps it forever and the schema job exits 0. Assert the shape the writer relies
+  # on — the UInt64 widths (a UInt32 turn_errors_count wraps countIf() at 2^32, silently, and the
+  # row arrives writer-marked and non-NULL so no marker catches it) and ingested_at's
+  # MATERIALIZED kind (a DEFAULT would let a writer forge the stamp). DESCRIBE runs under the
+  # reader bundle's SELECT; no system.columns grant needed.
+  expect_match "turn_duration_seconds landed Nullable(Float64)"  monte_carlo "$MC_PW" "DESCRIBE TABLE otel_traces.conversations_normalized" $'turn_duration_seconds\tNullable(Float64)'
+  expect_match "turn_tokens landed Nullable(UInt64)"             monte_carlo "$MC_PW" "DESCRIBE TABLE otel_traces.conversations_normalized" $'turn_tokens\tNullable(UInt64)'
+  expect_match "turn_errors_count landed Nullable(UInt64)"       monte_carlo "$MC_PW" "DESCRIBE TABLE otel_traces.conversations_normalized" $'turn_errors_count\tNullable(UInt64)'
+  expect_match "written_by marker landed"                        monte_carlo "$MC_PW" "DESCRIBE TABLE otel_traces.conversations_normalized" $'written_by\tLowCardinality(String)'
+  expect_match "ingested_at landed MATERIALIZED, not DEFAULT"    monte_carlo "$MC_PW" "DESCRIBE TABLE otel_traces.spans_normalized" $'ingested_at\tDateTime64(9)\tMATERIALIZED'
   # The writer's ledger anti-join, cursor read, and duplicate assertion all read through
   # clusterAllReplicas, which READ ON REMOTE gates — not CLUSTER (verified on 26.2.15.4).
   # Unlike the other checks here, READ ON REMOTE takes NO ON clause — the bare form is the
@@ -219,9 +248,11 @@ verify_clickhouse_user_model() {
   # The capability itself, probed the way the writer's own preflight probes it; WHERE 0 keeps it free.
   expect_ok      "monte_carlo cluster-reads the watermark table" monte_carlo "$MC_PW" "SELECT count() FROM clusterAllReplicas('otel', otel_traces.conversation_rollup_watermarks) WHERE 0"
   # The exact-guarantee read (the README's watermark note) syncs the turns table before reading
-  # it. Privilege check plus the statement itself — on a caught-up replica the sync returns at once.
+  # it. Privilege check only, no live probe: a real SYSTEM SYNC REPLICA waits out the replication
+  # backlog on a lagging replica (minutes-to-hours after a restart, per the README's watermark
+  # note), the statement takes no SETTINGS clause on this ClickHouse line (verified 26.2.15.4),
+  # so a live probe would hang the whole run on replication state rather than misconfiguration.
   expect_privilege "monte_carlo can sync the turns table"      monte_carlo "$MC_PW" "SYSTEM SYNC REPLICA ON otel_traces.conversations_normalized"
-  expect_ok      "monte_carlo syncs the turns table"           monte_carlo "$MC_PW" "SYSTEM SYNC REPLICA otel_traces.conversations_normalized LIGHTWEIGHT"
   expect_denied  "monte_carlo cannot write raw telemetry"    monte_carlo "$MC_PW" "INSERT INTO otel_traces.otel_traces (Timestamp) VALUES (now())"
   # Canary for a database-wide INSERT grant: otel_metrics does not exist, and CHECK GRANT does no
   # object-existence short-circuit, so this answers 1 only if monte_carlo holds INSERT on
@@ -230,6 +261,13 @@ verify_clickhouse_user_model() {
   # The rollup grants are per-table, so the normalized spans the rollup READS must stay unwritable.
   forbid_privilege "monte_carlo cannot write normalized spans" monte_carlo "$MC_PW" "INSERT ON otel_traces.spans_normalized"
   forbid_privilege "monte_carlo cannot write the trace-id index" monte_carlo "$MC_PW" "INSERT ON otel_traces.otel_traces_trace_id_ts"
+  # The widening is INSERT-only by design (the template's grant comment: a stray write is not
+  # correctable by re-writing, and an over-advanced cursor is correctable only by an operator
+  # with ALTER). Pin that half too, so a future consolidation into GRANT ALL fails here.
+  forbid_privilege "monte_carlo cannot alter the turns table"  monte_carlo "$MC_PW" "ALTER ON otel_traces.conversations_normalized"
+  forbid_privilege "monte_carlo cannot drop the turns table"   monte_carlo "$MC_PW" "DROP ON otel_traces.conversations_normalized"
+  forbid_privilege "monte_carlo cannot alter the cursor table" monte_carlo "$MC_PW" "ALTER ON otel_traces.conversation_rollup_watermarks"
+  forbid_privilege "monte_carlo cannot drop the cursor table"  monte_carlo "$MC_PW" "DROP ON otel_traces.conversation_rollup_watermarks"
 
   # readonly_user — SELECT-only; readonly=2 profile blocks writes even without an explicit deny grant.
   expect_ok      "readonly_user reads telemetry"             readonly_user "$CH_READ_PW" "SELECT count() FROM otel_traces.spans_normalized"
