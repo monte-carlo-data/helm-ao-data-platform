@@ -598,6 +598,72 @@ The `hack/verify-deployment-aws.sh`, `hack/verify-deployment-azure.sh`, and
 `hack/verify-deployment-gcp.sh` scripts run their ClickHouse data checks as `readonly_user`, so
 set `clickhouse.readonlyUser.enabled=true` to use them.
 
+### ClickHouse credential rotation (chart 5.0.0+)
+
+The chart renders each password-backed user's auth as an `<auth_methods>` element substituted
+from a single ESO-assembled Secret (`ao-clickhouse-auth-methods`, mounted at
+`/etc/clickhouse-server/secrets.d/auth-methods.xml/<secret>/auth.xml`). That element can hold
+**two** valid passwords for a user at once, which is what makes rotation downtime-free: add the
+new password while the old one still works, then retire the old one after every client has
+re-read its credentials.
+
+The secret-store layout is two secrets per user:
+
+- **A** — the current password, at `clickhouse.<user>.externalSecret.remoteRef.key` (unchanged
+  from earlier chart versions).
+- **B** — the *previous* password, at `clickhouse.<user>.externalSecret.previousKey`. In steady
+  state B holds the sentinel value `-` (a literal one-character dash — Secrets Manager rejects
+  empty values), and the bundle template drops the `<previous>` method, leaving the user with
+  exactly one password. `previousKey` unset (the default) is identical: single-method auth,
+  byte-for-byte the same behavior as pre-5.0.0.
+
+A rotation is five steps, driven by the consuming Terraform module's rotation tooling:
+
+1. Write the current A value into B (the old password stays valid).
+2. Write the new password into A.
+3. Wait for ESO to sync and for the kubelet to refresh the mounted Secret.
+4. Issue `SYSTEM RELOAD CONFIG` on every ClickHouse pod — this applies the new passwords
+   instantly and restartlessly.
+5. After all clients have re-read their credentials (their connection cycle — restart or
+   re-fetch), write the sentinel `-` into B and reload again; the old password is now rejected.
+
+Two mechanics the spike established, worth internalizing:
+
+- **A secret change alone does not reload the users config.** ClickHouse watches its
+  substitution *sources*, and a Kubernetes Secret volume update swaps a symlink rather than the
+  watched file — the server never notices. Step 4's explicit `SYSTEM RELOAD CONFIG` is what
+  applies a rotated password (it is instant and drops no connections).
+- **The first chart upgrade to 5.0.0 rolls ClickHouse pods once** (the pod template gains the
+  auth-methods Secret mount). Every rotation after that is restartless.
+
+Guardrails:
+
+- **Never roll the chart back between rotation start and cleanup.** A rollback re-mounts the
+  pre-rotation state, where the old password is already gone — any client that has not yet
+  re-read its credentials loses access instantly.
+- **Never edit the fragment's `include_from` path on a running cluster.** A missing
+  `include_from` file at container start is fatal to ClickHouse (crash loop). Real chart
+  upgrades are safe — pod template and ConfigMap change together — but hand-editing the mounted
+  fragment's include target on a live cluster is not.
+
+The bundle's store defaults to the `otel` user's store when
+`clickhouse.authMethods.externalSecret.secretStoreRef` is unset, so consumers that configure
+only the per-user blocks still get a working bundle.
+
+### Upgrading to 5.0.0 — users leave the CHI `users:` spec
+
+5.0.0 moves the ClickHouse SQL users out of the operator's `users:` spec entirely: networks,
+grants, profile, and auth now live in the static `users.d` fragment described above. The
+operator injects a `password_sha256_hex` for any password-less `users:` spec entry, which
+ClickHouse rejects alongside `<auth_methods>` — defining the users wholly in the fragment is
+the only shape that supports dual auth.
+
+For direct chart consumers there are **no new required values** — the same
+`clickhouse.<user>.externalSecret` blocks source the same passwords, and the new
+`ao-clickhouse-auth-methods` ExternalSecret is rendered from them. The upgrade does add the
+auth-methods Secret mount, which rolls ClickHouse once. Consumers who patched the CHI `users:`
+spec or relied on the operator rendering these users must move their changes into the fragment.
+
 ### Upgrading an existing install (1.x → 2.0.0)
 
 Chart `2.0.0` is a **breaking major release**. Running `helm upgrade` from a 1.x single-user
@@ -689,6 +755,7 @@ helm upgrade ao-data-platform oci://registry-1.docker.io/montecarlodata/ao-data-
 | `clickhouse.otel.externalSecret.remoteRef.property` | `""` | Property within a JSON secret (optional) |
 | `clickhouse.otel.externalSecret.remoteRef.version` | `""` | Version of the secret (required for Fake provider) |
 | `clickhouse.otel.externalSecret.refreshInterval` | `1h` | How often ESO syncs the secret |
+| `clickhouse.otel.externalSecret.previousKey` | `""` | Key holding this user's **previous** password, kept valid alongside the current one for the duration of a rotation (see [ClickHouse credential rotation](#clickhouse-credential-rotation-chart-500)). Empty (default) means single-method auth — exactly pre-5.0.0 behavior. The referenced secret holds the sentinel `-` in steady state. |
 | `clickhouse.schemaOwner.secret` | `ao-clickhouse-schema-owner-credentials` | K8s Secret (ESO) for the always-provisioned `schema_owner` user. |
 | `clickhouse.schemaOwner.networksIp` | `["0.0.0.0/0"]` | CIDRs allowed to authenticate as `schema_owner`. |
 | `clickhouse.schemaOwner.externalSecret.*` | — | ExternalSecret config for `schema_owner` (same shape as `clickhouse.otel.externalSecret.*`). |
@@ -711,6 +778,11 @@ helm upgrade ao-data-platform oci://registry-1.docker.io/montecarlodata/ao-data-
 | `clickhouse.readonlyUser.externalSecret.remoteRef.property` | `""` | Property within a JSON secret (optional) |
 | `clickhouse.readonlyUser.externalSecret.remoteRef.version` | `""` | Version of the readonly_user secret (required for Fake provider) |
 | `clickhouse.readonlyUser.externalSecret.refreshInterval` | `1h` | How often ESO syncs the readonly_user secret |
+| `clickhouse.readonlyUser.externalSecret.previousKey` | `""` | Previous-password key for `readonly_user` — same semantics as `clickhouse.otel.externalSecret.previousKey`. |
+| `clickhouse.authMethods.secret` | `ao-clickhouse-auth-methods` | Name of the K8s Secret (created by ESO) holding the assembled auth-methods substitution file. |
+| `clickhouse.authMethods.externalSecret.secretStoreRef.name` | `""` (→ `otel`'s) | Store for the bundle ExternalSecret; defaults to the `otel` user's store when empty. |
+| `clickhouse.authMethods.externalSecret.secretStoreRef.kind` | `ClusterSecretStore` | Kind of the bundle's secret store reference. |
+| `clickhouse.authMethods.externalSecret.refreshInterval` | `1h` | How often ESO re-syncs the bundle. |
 | `clickhouse.hostname` | `""` | If set, adds `external-dns.alpha.kubernetes.io/hostname` annotation to the ClickHouse Service |
 | `clickhouse.service.type` | `ClusterIP` | ClickHouse Service type (`ClusterIP`, `LoadBalancer`) |
 | `clickhouse.service.annotations` | `{}` | Annotations on the ClickHouse Service (e.g. AWS NLB annotations) |
