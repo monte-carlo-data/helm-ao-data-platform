@@ -102,9 +102,17 @@ spec:
         - "GRANT INSERT ON otel_traces.llm_batches"
         - "GRANT INSERT ON otel_traces.llm_results"
         - "GRANT INSERT ON otel_traces.llm_worker_info"
-      # monte_carlo — Monte Carlo read-only service account + agent queue producer. Shared reader
-      # bundle plus the queue/eval-score INSERTs. NO readonly profile: readonly=2 would block these
+      # monte_carlo — Monte Carlo service account: shared reader bundle, agent queue producer, and
+      # the conversation turn rollup writer. NO readonly profile: readonly=2 would block these
       # INSERTs, so the read-mostly shape is enforced by grants alone.
+      # conversations_normalized is the first grant here on a source table rather than a derived
+      # annotation, and the reader bundle above already carries SELECT on the whole database, so
+      # the widening this adds is write access to conversation turns. The writer must itself
+      # exclude what the 0012 MV admits, which no grant can express (sql/0022); and the table's
+      # engine has no version column, so a stray write is not correctable by re-writing. A separate
+      # writer user was declined because the Monte Carlo side reaches this cluster through one
+      # per-account connection, so a second writer credential would have to be provisioned per
+      # install.
       monte_carlo/password:
         valueFrom:
           secretKeyRef:
@@ -119,6 +127,20 @@ spec:
         - "GRANT INSERT ON otel_traces.conversation_eval_scores"
         - "GRANT INSERT ON otel_traces.span_eval_scores"
         - "GRANT INSERT ON otel_traces.conversation_cluster_assignments"
+        - "GRANT INSERT ON otel_traces.conversations_normalized"
+        - "GRANT INSERT ON otel_traces.conversation_rollup_watermarks"
+        # The writer's correctness-bearing reads (ledger anti-join, cursor read, duplicate
+        # assertion) go through clusterAllReplicas, which is gated by READ ON REMOTE — not by
+        # CLUSTER (verified on 26.2.15.4: a SELECT-only user gets code 497 until granted).
+        # READ ON REMOTE takes no object clause — the ON *.* form is a syntax error
+        # (verified on 26.2.15.4 and 26.4.3) — it is global by construction.
+        - "GRANT READ ON REMOTE"
+        # The README's watermark note prescribes the exact-guarantee read as a
+        # SYSTEM SYNC REPLICA on the turns table followed by local reads, and
+        # monte_carlo is the only user that recipe exists for — without this
+        # grant it fails closed on every call. Table-level; LIGHTWEIGHT needs
+        # no separate grant.
+        - "GRANT SYSTEM SYNC REPLICA ON otel_traces.conversations_normalized"
       {{- if .Values.clickhouse.admin.enabled }}
       # admin — gated break-glass superuser: full access + user management + SYSTEM. Not for
       # service-to-service. Defaults to loopback-only (admin.networksIp), so it's usable only
