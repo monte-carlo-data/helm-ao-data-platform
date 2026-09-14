@@ -1,0 +1,69 @@
+-- Turn rollup storage for the ADK/gen_ai conversation writer. The 0012 MV's
+-- admission gate (parent_span_id = '' AND conversation_id != '' AND a
+-- traceloop.entity.input|output key) only matches Traceloop/LangGraph-shaped
+-- traces, so ADK turns never materialize. A scheduled writer job will roll
+-- spans_normalized up per trace and INSERT into conversations_normalized;
+-- these three columns hold what the read path supplies today by LEFT JOINing
+-- a per-trace rollup of spans_normalized.
+-- Nullable so a writer bug reads as NULL, not as a plausible 0 — a 0 default
+-- would be indistinguishable from a measured 0. New columns are absent from
+-- the 0012 MV's SELECT, so MV-written rows land with NULL — the intended
+-- steady state until the MV retires.
+-- The read contract keys on written_by, not on NULL: stored values are read
+-- only where the marker is set, so the superseded coalesce(stored, joined)
+-- shape cannot silently substitute the join's number for a writer's NULL.
+-- written_by enforces nothing by itself; it makes violations visible. The one
+-- silent direction is an UNMARKED writer row, which falls back to the join
+-- indistinguishable from an MV row. The marker vocabulary: '' = written by
+-- the 0012 MV or pre-existing; 'conversation_rollup_writer' = the scheduled
+-- rollup writer (one name across the writer's lambda, config key and log
+-- prefix — see the monolith's `conversation_materialization` readme).
+-- The writer owns the value; extend here as producers are added.
+-- Appended, though position does not bind: the 0012 MV's insert matches the
+-- target by output-alias NAME (verified on 26.2 and 26.4.3 — an alias the
+-- table lacks is rejected at the MV's CREATE, and an AFTER-placed column does
+-- not shift the mapping). The hazard is a renamed alias or target column, not
+-- order.
+-- The writer must not emit a trace the 0012 gate admits:
+-- conversations_normalized is ReplacingMergeTree with no version column, so an
+-- MV row (new columns NULL) and a writer row (new columns set) for the same
+-- (service_name, minute, conversation_id, trace_id) dedup to an arbitrary
+-- winner. Nothing in the schema enforces that split, and the case it turns on
+-- is a dual-instrumented trace: an SDK emitting the gen_ai keys AND a
+-- traceloop.entity.input|output key satisfies the 0012 gate and the writer's
+-- own shape at once. The two shapes are disjoint in every trace measured so
+-- far, but that is a property of today's instrumentation, not of this schema,
+-- so the writer still owes an explicit exclusion of what 0012 admits.
+-- Writer-vs-writer is the likelier collision, and the contract is exactly-once
+-- per (service_name, minute, conversation_id, trace_id): a retry or backfill
+-- that re-emitted a written key would double-count the turn until a merge and
+-- lose arbitrarily at it. The writer holds the contract by construction —
+-- single-flight scheduling plus an exclusion of already-written traces — so
+-- readers need no FINAL or argMax while it holds. A span that arrives after
+-- its trace was written never re-emits the key: the stored turn freezes at
+-- first write, and late spans are invisible to the stored rollup.
+-- turn_tokens is UInt64 where spans_normalized's token columns are UInt32: it
+-- sums the per-span total_tokens over a trace, and summing UInt32 promotes to
+-- UInt64. It is not a sum of prompt_tokens and completion_tokens — those
+-- re-count context carried into each LLM step.
+-- turn_errors_count stays UInt64 like the sum: countIf() returns UInt64
+-- natively, and narrowing it to UInt32 at insert would WRAP silently on
+-- overflow — implicit numeric narrowing is modulo 2^32, no error — so an
+-- overflowing count would store a plausible small number over the real one:
+-- a wrong value no marker or NULL would catch, since the row is writer-marked
+-- and non-NULL. Keeping the native width removes the case outright.
+-- The measured populations behind keeping both wide live in the monolith's
+-- conversation_materialization readme, which this chart does not ship.
+-- Idempotent (ADD COLUMN IF NOT EXISTS) so the schema job can re-run it on
+-- every upgrade.
+ALTER TABLE otel_traces.conversations_normalized ON CLUSTER '{cluster}'
+    ADD COLUMN IF NOT EXISTS turn_duration_seconds Nullable(Float64),
+    ADD COLUMN IF NOT EXISTS turn_tokens Nullable(UInt64),
+    ADD COLUMN IF NOT EXISTS turn_errors_count Nullable(UInt64),
+    -- Written-by provenance for the three above: the read switch trusts
+    -- stored values only where this marker is set. '' for the MV's rows and
+    -- every pre-existing row; the scheduled writer sets
+    -- 'conversation_rollup_writer' at insert. Bundled with the turn columns
+    -- so no install can hold the columns without the marker; the ALTER is
+    -- metadata-only at any time.
+    ADD COLUMN IF NOT EXISTS written_by LowCardinality(String) DEFAULT '';

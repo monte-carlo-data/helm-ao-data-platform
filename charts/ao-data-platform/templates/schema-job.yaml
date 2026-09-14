@@ -100,7 +100,9 @@ spec:
               # and span eval scores, and the cluster assignments — all designed
               # to age out in lockstep with the telemetry they annotate.
               # Excluded: the llm_* tables are LLM-worker queue state, not telemetry,
-              # and keep their own fixed TTL (sql/0008–0010).
+              # and keep their own fixed TTL (sql/0008–0010). llm_worker_info and
+              # conversation_rollup_watermarks are current-state control metadata
+              # and carry no TTL at all (sql/0017, sql/0023).
               echo "Applying {{ .Values.clickhouse.ttlDays }}-day TTL to telemetry tables..."
               modify_ttl otel_traces.otel_traces "toDate(Timestamp) + toIntervalDay({{ .Values.clickhouse.ttlDays }})"
               modify_ttl otel_traces.otel_traces_trace_id_ts "toDate(Start) + toIntervalDay({{ .Values.clickhouse.ttlDays }})"
