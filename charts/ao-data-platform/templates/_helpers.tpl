@@ -193,6 +193,23 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
+One ESO remoteRef entry (key + optional property + optional version), shared by the
+per-user ExternalSecret and the auth-methods bundle so the two fetch paths cannot
+drift apart. Call with a dict: {key: <Secrets Manager key>, remoteRef: <the user's
+externalSecret.remoteRef cfg>, errorContext: <string for the required-key message>}.
+Renders unindented — the caller indents via nindent.
+*/}}
+{{- define "ao-data-platform.externalSecretRemoteRef" -}}
+key: {{ required (printf "externalSecret.remoteRef.key is required %s" .errorContext) .key }}
+{{- if .remoteRef.property }}
+property: {{ .remoteRef.property }}
+{{- end }}
+{{- if .remoteRef.version }}
+version: {{ .remoteRef.version }}
+{{- end }}
+{{- end }}
+
+{{/*
 ExternalSecret for a ClickHouse user password.
 One ExternalSecret per CH user that has a Secrets-Manager-backed password, factored here so the
 otel / schema_owner / llm_worker / monte_carlo / admin / readonly_user blocks don't each repeat it.
@@ -221,13 +238,7 @@ spec:
   data:
     - secretKey: password
       remoteRef:
-        key: {{ required (printf "externalSecret.remoteRef.key is required for secret %s — set via clickhouse.<user>.externalSecret.remoteRef.key" $name) $es.remoteRef.key }}
-        {{- if $es.remoteRef.property }}
-        property: {{ $es.remoteRef.property }}
-        {{- end }}
-        {{- if $es.remoteRef.version }}
-        version: {{ $es.remoteRef.version }}
-        {{- end }}
+        {{- include "ao-data-platform.externalSecretRemoteRef" (dict "key" $es.remoteRef.key "remoteRef" $es.remoteRef "errorContext" (printf "for secret %s — set via clickhouse.<user>.externalSecret.remoteRef.key" $name)) | nindent 8 }}
 {{- end }}
 
 {{/*
@@ -237,7 +248,7 @@ telemetry DB plus the metadata reads DataGrip/MCP and Monte Carlo data-source mo
 this as the single source of truth — adding a read target means editing it here once.
 Emits `<query>GRANT …</query>` elements for inclusion under a `<grants>` element in the
 users.d/auth-methods.xml fragment (templates/clickhouse-installation.yaml), where every SQL user
-is now defined (YET-2680). Must be called with `| nindent 14` to align with that fragment's
+is now defined (YET-2680). Must be called with `| nindent 16` to align with that fragment's
 grants indent. Call with the root context (`.`).
 */}}
 {{- define "ao-data-platform.readerGrants" -}}
@@ -253,13 +264,15 @@ grants indent. Call with the root context (`.`).
 
 {{/*
 The enabled ClickHouse users that carry a password, as a JSON array of
-{ch: <ClickHouse user name>, cfg: <values block>}. The single source of truth for
-the user list shared by the auth-methods ExternalSecret and the CHI's incl
-fragment — the two must never drift, or a user gets an `incl` with no matching
-substitution and ClickHouse rejects an empty <auth_methods>.
-Adding a ClickHouse user? Add it here, in values.yaml, and in
-templates/clickhouse-installation.yaml.
-Callers: {{ range $u := fromJsonArray (include "ao-data-platform.authMethodsUsers" .) }}
+{ch: <ClickHouse user name>, cfg: <values block>}. Consumed only by
+authMethodsExternalSecret below; the CHI's users.d fragment
+(templates/clickhouse-installation.yaml) hardcodes its own user elements and never
+reads this helper — the CI lint job (.circleci/config.yml) is what holds the two in
+sync. A drift means a user gets an `incl` with no matching substitution and
+ClickHouse rejects an empty <auth_methods>.
+Adding a ClickHouse user? Add it in all of: this helper, values.yaml, the
+$extSecrets list in templates/external-secret.yaml, the users.d fragment in
+templates/clickhouse-installation.yaml, and the user lists in .circleci/config.yml.
 */}}
 {{- define "ao-data-platform.authMethodsUsers" -}}
 {{- $users := list
@@ -281,8 +294,11 @@ Callers: {{ range $u := fromJsonArray (include "ao-data-platform.authMethodsUser
 Absolute path of the mounted auth-methods substitution file. The Altinity
 operator mounts a secret-backed `files:` entry as its own volume at
 /etc/clickhouse-server/secrets.d/<files-key>/<secret-name>/<secret-key> — NOT in
-the directory the key names. Both the CHI `files:` key and this path must stay in
-lockstep; they are derived from the same values here so they cannot drift.
+the directory the key names. Only the secret-name segment is values-derived; the
+literals `auth-methods.xml` (here and in clickhouse-installation.yaml's `files:` key)
+and `auth.xml` (here and in the bundle ExternalSecret's data key) are each hardcoded
+in two places and must stay in lockstep — a drift is a missing `include_from` file
+and a ClickHouse crash loop.
 */}}
 {{- define "ao-data-platform.authMethodsSecretPath" -}}
 {{- printf "/etc/clickhouse-server/secrets.d/auth-methods.xml/%s/auth.xml" .Values.clickhouse.authMethods.secret -}}
@@ -340,11 +356,12 @@ spec:
   {{- range $u := $users }}
     - secretKey: {{ $u.ch }}_password
       remoteRef:
-        key: {{ required (printf "externalSecret.remoteRef.key is required for ClickHouse user %s" $u.ch) $u.cfg.externalSecret.remoteRef.key }}
+        {{- include "ao-data-platform.externalSecretRemoteRef" (dict "key" $u.cfg.externalSecret.remoteRef.key "remoteRef" $u.cfg.externalSecret.remoteRef "errorContext" (printf "for ClickHouse user %s" $u.ch)) | nindent 8 }}
     {{- if $u.cfg.externalSecret.previousKey }}
     - secretKey: {{ $u.ch }}_previous
       remoteRef:
-        key: {{ $u.cfg.externalSecret.previousKey }}
+        {{- /* The previous (B) secret is written by the rotation tooling in the same format as the current secret, so it shares the property/version extraction shape; on the Fake provider every remoteRef needs version or the bundle's all-or-nothing sync stalls for all users. */}}
+        {{- include "ao-data-platform.externalSecretRemoteRef" (dict "key" $u.cfg.externalSecret.previousKey "remoteRef" $u.cfg.externalSecret.remoteRef "errorContext" (printf "for ClickHouse user %s (previous password)" $u.ch)) | nindent 8 }}
     {{- end }}
   {{- end }}
 {{- end }}

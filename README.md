@@ -18,6 +18,8 @@ The ClickHouse instance ships with production hardening: a capped memory ceiling
 
 > **Chart-version bumps no longer recreate ClickHouse:** the ClickHouse operator propagates only a fixed allowlist of stable labels onto the resources it generates. A chart-version bump changes the volatile `helm.sh/chart` label, but that label is no longer stamped onto the StatefulSet's immutable `volumeClaimTemplates`, so the bump no longer forces a delete/recreate of the ClickHouse StatefulSet.
 
+> **Upgrading to 5.0.0:** a breaking major release — the ClickHouse SQL users leave the CHI `users:` spec for a static `users.d` fragment whose auth is substituted from an ESO-assembled secret, so each user can hold two valid passwords during a rotation. The upgrade rolls ClickHouse **once** (the pod template gains the auth-methods secret mount); every rotation after that is restartless. Direct consumers who set `clickhouse.<user>.externalSecret` need **no value changes**; consumers who patched the CHI `users:` spec must move their changes into the fragment — see [Upgrading to 5.0.0](#upgrading-to-500--users-leave-the-chi-users-spec).
+>
 > **Upgrading to 4.6.0:** adds the conversation turn rollup schema — the turn columns on `conversations_normalized`, the `conversation_rollup_watermarks` cursor table, and the `spans_normalized.ingested_at` arrival stamp — and grants the `monte_carlo` user INSERT on the two new-write tables (`conversations_normalized` and `conversation_rollup_watermarks`), plus `READ ON REMOTE` and `SYSTEM SYNC REPLICA` on `conversations_normalized`, for the Monte Carlo-side rollup writer, which requires this version or later. Mind the rollback direction: the schema is applied state and survives a rollback, but the grants are release state, re-rendered from the deployed chart. A `helm rollback` below 4.6.0 revokes that whole grant set — the INSERTs, the cluster reads (the writer's ledger anti-join, cursor read and duplicate assertion all go through `clusterAllReplicas`), and the exact-guarantee sync — while the tables and any written turns remain: the writer starts failing ACCESS_DENIED against a cluster whose schema is intact, and only the verify scripts' grant assertions see it.
 >
 > **Upgrading to 4.3.0:** the ClickHouse and Keeper zone topology spreads now set `minDomains` (equal to `replicasCount`), which makes the one-replica/voter-per-zone guarantee real. Previously `maxSkew: 1` alone did not enforce it: when only one zone had an eligible node at scheduling time, every replica/voter packed into that zone and a bound zonal PV then pinned them there for the StatefulSet's life — a cluster that reads as healthy while it has already lost the single-AZ-failure tolerance HA exists for. Before upgrading, check current placement — `kubectl get pods -o wide` against your nodes' zones — because the upgrade does not rebalance a cluster that's already packed this way. A fresh, under-zoned install still leaves the excess replicas/voters `Pending` until a node in the missing zone appears, same as before. A correctly-provisioned cluster (nodes already present in every zone) lands its pods back in the same zones they already occupy — but the upgrade still rolls every ClickHouse replica and Keeper voter one at a time, since the podTemplate changed; it is not a no-op. A cluster that was already co-located, though, hits the constraint on that same rolling restart: the recreated pod now fails it and sticks `Pending` — and adding a node in the missing zone will **not** fix it, because the pod's PVC is already bound to a zonal PV in the old zone whose `nodeAffinity` excludes the new one. The fix is to make sure the missing zone's node group exists, then delete the co-located pod **and its PVC** so it re-binds to a fresh PV in the empty zone — a Keeper voter re-syncs from the Raft quorum and a ClickHouse replica re-replicates from a surviving replica, both safe by design. `minDomains` is GA in Kubernetes 1.30, so the chart now declares `kubeVersion: ">=1.30.0-0"` — an install against an older cluster fails render rather than silently dropping the field — and it is valid only with `DoNotSchedule`, which is already set.
@@ -667,7 +669,13 @@ The secret-store layout is two secrets per user:
   exactly one password. `previousKey` unset (the default) is identical: single-method auth,
   byte-for-byte the same behavior as pre-5.0.0.
 
-A rotation is five steps, driven by the consuming Terraform module's rotation tooling:
+Password values are interpolated raw into the users XML the bundle carries, so they must not
+contain `<`, `>`, `&`, or XML entity sequences — the rotation tooling generates 32-character
+alphanumeric passwords.
+
+A rotation is five steps, driven by the consuming Terraform module's rotation tooling.
+Precondition: the B secret must already exist in Secrets Manager holding the sentinel `-`
+*before* `previousKey` is set — one unresolved remoteRef fails the whole bundle sync.
 
 1. Write the current A value into B (the old password stays valid).
 2. Write the new password into A.
@@ -713,6 +721,11 @@ For direct chart consumers there are **no new required values** — the same
 `ao-clickhouse-auth-methods` ExternalSecret is rendered from them. The upgrade does add the
 auth-methods Secret mount, which rolls ClickHouse once. Consumers who patched the CHI `users:`
 spec or relied on the operator rendering these users must move their changes into the fragment.
+
+Two bundle couplings: the bundle ExternalSecret has a single `secretStoreRef` (defaulting to
+`otel`'s), so every user's remoteRef key must be reachable from that one store — consumers who
+split users across stores break at upgrade. And ESO syncs the bundle's `data:` entries as a
+unit, so one unresolved remoteRef stalls the bundle for ALL users.
 
 ### Upgrading an existing install (1.x → 2.0.0)
 

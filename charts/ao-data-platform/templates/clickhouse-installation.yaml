@@ -69,16 +69,15 @@ spec:
           secretKeyRef:
             name: {{ .Values.clickhouse.authMethods.secret }}
             key: auth.xml
-      # The complete definitions of every ClickHouse SQL user (YET-2680). They
-      # live here rather than in the operator users: spec because auth_methods
-      # cannot be expressed there and cannot coexist with the password hash the
-      # operator injects — see the comment above the profiles section. Networks and
-      # grants are exactly what the users spec carried before; auth comes from the
-      # mounted file via incl. include_from is read per separately-loaded config
-      # file, so it must be declared here in the users config, not in config.d.
-      # A secret-only change does NOT auto-reload users (the secret volume's
-      # symlink swap defeats the watcher); rotations issue SYSTEM RELOAD CONFIG
-      # via hack/rotation-check.sh, which is instant and restartless.
+      # The complete definitions of every ClickHouse SQL user (YET-2680) — why
+      # here and not the operator users: spec: see the comment above the profiles
+      # section. Networks and grants are exactly what the users spec carried
+      # before; auth comes from the mounted file via incl. include_from is read
+      # per separately-loaded config file, so it must be declared here in the
+      # users config, not in config.d. A secret-only change does NOT auto-reload
+      # users (the secret volume's symlink swap defeats the watcher); rotations
+      # issue SYSTEM RELOAD CONFIG via the consuming Terraform module's rotation
+      # tooling — instant and restartless.
       users.d/auth-methods.xml: |
         <clickhouse>
           <include_from>{{ include "ao-data-platform.authMethodsSecretPath" . }}</include_from>

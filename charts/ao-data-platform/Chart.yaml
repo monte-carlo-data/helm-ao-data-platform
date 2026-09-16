@@ -1,15 +1,7 @@
 apiVersion: v2
 name: ao-data-platform
 description: Monte Carlo data platform — ClickHouse, OTel collector, and schema management
-# 5.0.0 — breaking. The ClickHouse SQL users moved out of the operator `users:`
-# spec into a static users.d fragment whose auth is substituted from an
-# ESO-assembled secret, so each user can hold two valid passwords during a
-# rotation (YET-2680). Upgrading rolls ClickHouse ONCE (the pod template gains
-# the secret mount); every rotation after that is restartless (rotations issue
-# SYSTEM RELOAD CONFIG via the consuming module's rotation tooling). Direct
-# chart consumers who set clickhouse.<user>.externalSecret need no change;
-# consumers who patched the CHI users spec or rely on the operator rendering
-# these users must review the fragment.
+# 5.0.0 — breaking: ClickHouse users moved out of the operator users: spec; see README "Upgrading to 5.0.0".
 version: 5.0.0
 type: application
 # minDomains on the ClickHouse/Keeper zone topologySpreadConstraints is GA in
