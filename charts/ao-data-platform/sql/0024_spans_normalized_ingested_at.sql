@@ -1,0 +1,34 @@
+-- Arrival stamp for the conversation rollup writer's completeness gate. The
+-- writer (monolith conversation_materialization) may advance a service's
+-- watermark past event time T only once every span with start_time < T has
+-- arrived, and spans_normalized carries only event-time columns (start_time,
+-- end_time, duration_ns) — so the arrival signal has to be added here. One
+-- MATERIALIZED expression answers all three gate inputs per row and per
+-- service: completeness (max stamp over an event-time window), incident
+-- pause (stamps stop advancing), and single-agent gap (per-service stamps).
+--
+-- MATERIALIZED, not DEFAULT: the value is stamped by the server at insert
+-- and cannot be forged by a writer — an INSERT naming the column fails with
+-- ILLEGAL_COLUMN (verified 26.2.15.4). The column is excluded from SELECT *
+-- (verified 26.2.15.4), and the 0006 MV writes through TO + an aliased
+-- SELECT whose output it does not name, so neither insert path changes
+-- shape.
+--
+-- The stamp is honest only for rows INSERTED after this ALTER has applied.
+-- A pre-ALTER row has no stored value: the expression evaluates at read time
+-- on every read, reading as "just arrived" (verified 26.2.15.4), and once
+-- the row's part is merged the value freezes at merge time (verified
+-- 26.2.15.4) — a more durable lie, but the same lie. The writer therefore
+-- trusts the stamp only for spans whose start_time is at or after a
+-- per-install floor, derived live as min(ingested_at) over the table: the
+-- lies only ever INFLATE a stamp (read-time now(), or a merge-time freeze
+-- that is also at or after the ALTER), so the minimum is at or after the
+-- ALTER instant on every install without any state to persist. Spans older
+-- than the floor stay on the existing join read until the 30-day TTL ages
+-- them out.
+--
+-- Idempotent (ADD COLUMN IF NOT EXISTS) so the schema job can re-run it on
+-- every upgrade; the ALTER is metadata-only and does not rewrite existing
+-- parts.
+ALTER TABLE otel_traces.spans_normalized ON CLUSTER '{cluster}'
+    ADD COLUMN IF NOT EXISTS ingested_at DateTime64(9) MATERIALIZED now64(9);
