@@ -114,6 +114,150 @@ jobs:
             fi
             echo "Operator label.include allowlist rendered correctly."
       - run:
+          name: Auth-methods bundle renders both template branches
+          # The bundle is what gives the ClickHouse server two valid passwords
+          # during a rotation (YET-2680). Two things can silently break it: a
+          # user present in the CHI's incl fragment but missing from the bundle
+          # (ClickHouse rejects an empty <auth_methods>), and a lost ESO-side
+          # `if` around the previous method (the steady-state sentinel "-" would
+          # render a matchable one-character auth method — a login bypass).
+          command: |
+            helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --kube-version 1.30.0 \
+              --show-only templates/external-secret.yaml > es.yaml
+            for u in otel schema_owner llm_worker monte_carlo; do
+              grep -q "<${u}_auth_methods>" es.yaml || {
+                echo "auth.xml is missing the ${u} element"; exit 1; }
+              grep -q "secretKey: ${u}_password" es.yaml || {
+                echo "bundle is missing the ${u}_password data entry"; exit 1; }
+              grep -qF -- "<current><password>{{ .${u}_password }}</password></current>" es.yaml || {
+                echo "bundle ${u} auth method lost the {{ .${u}_password }} substitution — the user's only current auth method would render an empty password"; exit 1; }
+            done
+            # The bundle's auth.xml: data key and the helper's printf'd include_from
+            # path hardcode the same `auth.xml` literal (asserted on the CHI side
+            # below) — pin this side too so a rename on either fails the build.
+            grep -q 'auth.xml: |' es.yaml || {
+              echo "bundle lost its auth.xml: data key — the helper's include_from path hardcodes auth.xml, so the two must stay in lockstep"; exit 1; }
+            grep -q 'secretKey: otel_previous' es.yaml || {
+              echo "previousKey set on otel but no otel_previous data entry rendered"; exit 1; }
+            grep -q '{{- if and .otel_previous (ne .otel_previous "-") }}' es.yaml || {
+              echo "the ESO-side sentinel guard on the previous password is missing — the steady-state sentinel would render a matchable one-character auth method"; exit 1; }
+            if grep -q 'secretKey: monte_carlo_previous' es.yaml; then
+              echo "monte_carlo has no previousKey but a previous data entry rendered"; exit 1
+            fi
+            if grep -q 'monte_carlo_previous' es.yaml; then
+              echo "monte_carlo has no previousKey but auth.xml references monte_carlo_previous — ESO was never asked to fetch that key"; exit 1
+            fi
+            echo "Auth-methods bundle rendered both branches correctly."
+      - run:
+          name: Auth-methods bundle passes remoteRef property/version through
+          # The bundle must forward remoteRef.property and remoteRef.version the way
+          # the per-user helper (ao-data-platform.externalSecret) does: with property
+          # set (JSON secrets) a bundle that emits only remoteRef.key stores the raw
+          # JSON as the password, and on the Fake provider — where version is
+          # required — the bundle never syncs. Both secrets render from the same
+          # template file, so the grep must be scoped to the bundle document: the
+          # per-user otel ExternalSecret DOES render property/version and a
+          # whole-file grep would false-pass.
+          command: |
+            helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --kube-version 1.30.0 \
+              --set clickhouse.otel.externalSecret.remoteRef.property=ci-property \
+              --set clickhouse.otel.externalSecret.remoteRef.version=ci-version \
+              --show-only templates/external-secret.yaml > es-remoteref.yaml
+            # Slice out the bundle document (the last in external-secret.yaml), then
+            # its otel_password data entry (up to the next secretKey), so property
+            # and version are asserted on the bundle's remoteRef and nothing else.
+            entry=$(awk '/^  name: ao-clickhouse-auth-methods$/{b=1} b && /secretKey: otel_password$/{f=1} f && /secretKey: / && !/otel_password/{f=0} f' es-remoteref.yaml)
+            if [ -z "$entry" ]; then
+              echo "Sanity check failed: no otel_password entry found in the bundle document — the awk slice has drifted."
+              exit 1
+            fi
+            echo "$entry" | grep -qF 'property: ci-property' || {
+              echo "bundle otel_password remoteRef dropped remoteRef.property — with a JSON secret the bundle would store the raw JSON as the password"; exit 1; }
+            echo "$entry" | grep -qF 'version: ci-version' || {
+              echo "bundle otel_password remoteRef dropped remoteRef.version — on the Fake provider (version required) the bundle never syncs"; exit 1; }
+            echo "Auth-methods bundle passes remoteRef property/version through."
+      - run:
+          name: CHI users live wholly in the fragment, one incl per enabled user
+          # Three invariants: (1) none of the six users may keep ANY key in the
+          # operator users: spec — the operator injects a password hash for a
+          # password-less entry, which ClickHouse rejects alongside <auth_methods>
+          # (Spike Finding 7); (2) every incl name must have a matching element in
+          # the bundle — an unresolved incl leaves an empty <auth_methods>, also
+          # rejected; (3) the gated users appear in both files or neither.
+          command: |
+            helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --kube-version 1.30.0 \
+              --show-only templates/clickhouse-installation.yaml > chi.yaml
+            if grep -Eq '^      (otel|schema_owner|llm_worker|monte_carlo|admin|readonly_user)/(password|networks|grants|profile)' chi.yaml; then
+              echo "A rotation-managed user kept a key in the operator users: spec — the operator would inject a password hash that cannot coexist with <auth_methods>."
+              grep -nE '^      (otel|schema_owner|llm_worker|monte_carlo|admin|readonly_user)/' chi.yaml
+              exit 1
+            fi
+            for u in otel schema_owner llm_worker monte_carlo; do
+              grep -q "incl=\"${u}_auth_methods\"" chi.yaml || {
+                echo "no incl for ${u}"; exit 1; }
+              grep -q "<${u}>" chi.yaml || {
+                echo "no <${u}> element in the fragment — the user lost its definition"; exit 1; }
+            done
+            grep -q '<grants>' chi.yaml || {
+              echo "fragment has no grants — users would be useless even if auth worked"; exit 1; }
+            grep -q 'include_from>/etc/clickhouse-server/secrets.d/auth-methods.xml/ao-clickhouse-auth-methods/auth.xml<' chi.yaml || {
+              echo "include_from does not match the operator's secret mount path"; exit 1; }
+            # Gated users: absent by default, present in BOTH files when enabled.
+            if grep -q 'incl="admin_auth_methods"' chi.yaml; then
+              echo "admin is disabled in lint-values but rendered into the fragment"; exit 1
+            fi
+            if grep -q 'incl="readonly_user_auth_methods"' chi.yaml; then
+              echo "readonly_user is disabled in lint-values but rendered into the fragment"; exit 1
+            fi
+            helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml --kube-version 1.30.0 \
+              --set clickhouse.admin.enabled=true \
+              --set clickhouse.admin.externalSecret.secretStoreRef.name=ci-placeholder \
+              --set clickhouse.admin.externalSecret.remoteRef.key=ci-placeholder \
+              --show-only templates/clickhouse-installation.yaml > chi-admin.yaml
+            grep -q 'incl="admin_auth_methods"' chi-admin.yaml || {
+              echo "admin enabled but no element in the fragment"; exit 1; }
+            helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml --kube-version 1.30.0 \
+              --set clickhouse.admin.enabled=true \
+              --set clickhouse.admin.externalSecret.secretStoreRef.name=ci-placeholder \
+              --set clickhouse.admin.externalSecret.remoteRef.key=ci-placeholder \
+              --show-only templates/external-secret.yaml > es-admin.yaml
+            grep -q '<admin_auth_methods>' es-admin.yaml || {
+              echo "admin enabled but the bundle has no admin element — the incl would not resolve"; exit 1; }
+            grep -q 'secretKey: admin_password' es-admin.yaml || {
+              echo "admin enabled but the bundle has no admin_password data entry — the admin auth method would render an empty password"; exit 1; }
+            helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml --kube-version 1.30.0 \
+              --set clickhouse.readonlyUser.enabled=true \
+              --set clickhouse.readonlyUser.externalSecret.secretStoreRef.name=ci-placeholder \
+              --set clickhouse.readonlyUser.externalSecret.remoteRef.key=ci-placeholder \
+              --show-only templates/clickhouse-installation.yaml > chi-readonly.yaml
+            grep -q 'incl="readonly_user_auth_methods"' chi-readonly.yaml || {
+              echo "readonly_user enabled but no element in the fragment"; exit 1; }
+            # The gated profiles: section and the user's <profile> reference are the
+            # same `if` branch in values and template — assert both so a dropped
+            # profile definition would fail here instead of at server config load.
+            grep -q '<profile>readonly_settings</profile>' chi-readonly.yaml || {
+              echo "readonly_user enabled but its <profile>readonly_settings</profile> reference is missing — the user loses the readonly=2 gate"; exit 1; }
+            grep -q 'readonly_settings/readonly: "2"' chi-readonly.yaml || {
+              echo "readonly_user enabled but the gated profiles: section did not render — the readonly_settings profile reference would not resolve"; exit 1; }
+            helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml --kube-version 1.30.0 \
+              --set clickhouse.readonlyUser.enabled=true \
+              --set clickhouse.readonlyUser.externalSecret.secretStoreRef.name=ci-placeholder \
+              --set clickhouse.readonlyUser.externalSecret.remoteRef.key=ci-placeholder \
+              --show-only templates/external-secret.yaml > es-readonly.yaml
+            grep -q '<readonly_user_auth_methods>' es-readonly.yaml || {
+              echo "readonly_user enabled but the bundle has no readonly_user element — the incl would not resolve"; exit 1; }
+            echo "CHI auth-methods wiring rendered correctly."
+      - run:
           name: Gateway disabled renders no gateway resources
           # The default posture is gateway.enabled=false. Assert none of the
           # gateway-only kinds leak into a non-gateway render.
@@ -510,7 +654,7 @@ jobs:
             assert_rendered 'config.d/readiness_handler.xml: |'
             assert_rendered '<query>GRANT SELECT ON system.replicas</query>'
             assert_rendered '<query>GRANT SHOW TABLES ON otel_traces.*</query>'
-            assert_rendered '- "GRANT CLUSTER ON *.*"'
+            assert_rendered '<query>GRANT CLUSTER ON *.*</query>'
             assert_rendered 'clickhouse.altinity.com/chi: otel'
             assert_rendered 'clickhouse-keeper.altinity.com/chk: otel'
             # The auto cluster secret must sit under the cluster's `secret:` key —
@@ -598,7 +742,29 @@ jobs:
               echo "Explicit replication path in schema SQL (lines above) — engines must stay path-less (default_replica_path owns the layout)."
               fail=1
             fi
-            [ "$fail" -eq 0 ] && echo "Schema SQL is clustered-only: ON CLUSTER DDL, path-less Replicated engines."
+            # One live MODIFY QUERY writer per view. schema-job.yaml re-runs
+            # every /sql/*.sql on install AND upgrade with no ledger, so a
+            # superseded (non-comment) ALTER ... MODIFY QUERY re-installs its
+            # older SELECT until the newer file re-applies — and the MVs are
+            # insert-triggered and forward-only, so spans ingested in that
+            # window keep the older rendering permanently. When a new file
+            # supersedes a view's SELECT, the predecessor's statement must be
+            # emptied, keeping the file comment-only (see the 0021 header).
+            # MODIFY SQL SECURITY (0014) is deliberately not counted — it does
+            # not rewrite the SELECT.
+            writers=$(awk 'FNR == 1 { tbl = "" } /^[[:space:]]*--/ { next } /ALTER TABLE/ { tbl = $3 } /MODIFY QUERY/ { print FILENAME ": " tbl }' charts/ao-data-platform/sql/*.sql)
+            if [ -z "$writers" ]; then
+              echo "Sanity check failed: no live MODIFY QUERY found in charts/ao-data-platform/sql/ — either the awk pattern has drifted or the trailing spans_normalized_mv ALTER was emptied without a successor."
+              exit 1
+            fi
+            dups=$(echo "$writers" | awk -F': ' '{ print $2 }' | sort | uniq -d)
+            if [ -n "$dups" ]; then
+              echo "More than one live MODIFY QUERY writer per view:"
+              echo "$writers"
+              echo "Exactly one file may carry a view's current SELECT — empty the superseded predecessor's statement (keep the file comment-only; see the 0021 header)."
+              fail=1
+            fi
+            [ "$fail" -eq 0 ] && echo "Schema SQL is clustered-only: ON CLUSTER DDL, path-less Replicated engines, one live MODIFY QUERY writer per view."
             exit $fail
       - run:
           name: llm-worker foundry provider renders Foundry env, no AWS env

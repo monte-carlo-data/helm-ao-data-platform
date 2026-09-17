@@ -1,8 +1,9 @@
 -- Turn-grained conversation source: one row per root-span trace (= one turn).
--- Mirrors the spans_normalized engine/TTL convention. The MV in 0009 does the
--- stateless per-root-span projection; `turn` is derived at read time (a window
--- function over turn_start) rather than stored, so this stays a streaming MV
--- target. span_attributes / span_attributes_keys are carried from the root span
+-- Mirrors the spans_normalized engine/TTL convention. The MV in 0012 does the
+-- stateless per-root-span projection, and the scheduled rollup writer (0022)
+-- is a second writer for the turn-rollup columns; `turn` is derived at read
+-- time (a window function over turn_start) rather than stored, so this stays
+-- a streaming-MV-shaped target. span_attributes / span_attributes_keys are carried from the root span
 -- to power turn-level attribute filtering downstream — minus the two heaviest
 -- content paths (see the span_attributes column below).
 CREATE TABLE IF NOT EXISTS otel_traces.conversations_normalized ON CLUSTER '{cluster}'
@@ -19,7 +20,7 @@ CREATE TABLE IF NOT EXISTS otel_traces.conversations_normalized ON CLUSTER '{clu
     -- targets other attributes, not conversation content. SKIP them on the target
     -- column to avoid re-storing them; every other attribute is still shredded
     -- into sub-columns for attribute search. span_attributes_keys still lists
-    -- both keys, so the 0009 has() root-span guard is unaffected.
+    -- both keys, so the 0012 has() root-span guard is unaffected.
     `span_attributes` JSON(
         SKIP `traceloop.entity.input`,
         SKIP `traceloop.entity.output`

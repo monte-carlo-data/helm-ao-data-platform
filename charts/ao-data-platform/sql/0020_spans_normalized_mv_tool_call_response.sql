@@ -1,0 +1,85 @@
+-- Render gen_ai-semconv tool results in the message view.
+--
+-- SUPERSEDED, AND DELIBERATELY INERT. The SELECT this file used to install now
+-- lives in 0021_spans_normalized_mv_planning_tool_fallbacks.sql, which is the
+-- last writer of this view. The statement was removed from here rather than
+-- left in place because schema-job.yaml re-runs every /sql/*.sql on install AND
+-- upgrade with no ledger or checksum: a superseded ALTER ... MODIFY QUERY is
+-- not merely redundant, it is a transient REGRESSION. Left in place, this file
+-- would restore the pre-planning-tool-fallback SELECT for the window between it
+-- and 0021, and because the view is insert-triggered and forward-only, a Cortex
+-- planning tool-use span ingested in that window keeps an empty completion
+-- permanently -- the exact defect 0021 fixes. The mechanism is measured, not
+-- theoretical: when 0020 superseded 0019, a two-replica cluster lost, then
+-- regained, the newer handling on every upgrade pass.
+--
+-- The file is retained (not deleted) to hold the numbering, so this ordinal is
+-- never reused, the relative order of files mirrored from the source schema
+-- set is preserved (correspondence with that set is by basename, not ordinal --
+-- this chart carries migrations the fixture lacks, so ordinals drift: this
+-- file is the fixture's 0013), and the chart's history stays readable.
+-- Retaining it costs nothing: the schema Job pipes a comment-only file to
+-- clickhouse-client, which is a no-op.
+--
+-- Under this chart's execution model sql/ is a DESIRED-STATE script set, not a
+-- migration history -- so exactly one file may carry the current definition of a
+-- given view. That is 0006 (CREATE ... IF NOT EXISTS, which owns the view on a
+-- fresh install) plus one trailing ALTER for clusters where the CREATE is a
+-- no-op -- now 0021.
+--
+-- What that superseded SELECT added, kept here as the record of why the change
+-- was made (all of it now carried by 0021):
+--   1. Tool results: a gen_ai.input.messages / gen_ai.output.messages part of
+--      type 'tool_call_response' carries its payload under `response`, not
+--      `content`, so 0019's content-only part-concatenation rendered tool
+--      results BLANK. The part now contributes its faithfully serialized
+--      `response`, with one exception: a JSON *string* payload is unwrapped so
+--      it renders as its text rather than with surrounding quotes. The string
+--      case is detected from the RAW form starting with a quote, NOT from
+--      JSONExtractString(...) != '' -- an emptiness sentinel would send
+--      `"response": ""` down the raw path and render it as the literal
+--      two-character text `""`. Keyed on the part `type`, NOT the message
+--      `role` (the wrapper role is emitter-dependent: Python google-adk emits
+--      'user', ADK-for-Go 'tool'), and applied symmetrically to the prompts
+--      and completions sides. The system-instructions concat is deliberately
+--      untouched: a bare [{type, content}] parts array never carries a tool
+--      result. In every emitter captured so far the blank was a rendering
+--      gap, not a data gap -- the result also lands on the execute_tool
+--      span's tool_call_output -- but whether an emitter exists for which the
+--      part is the ONLY copy is UNVERIFIED: tool_call_output coalesces just
+--      traceloop.entity.output, gen_ai.tool.call.result and
+--      gcp.vertex.agent.tool_response, so one setting none of those would
+--      lose the result outright. No such capture has been observed; treat it
+--      as a mechanism to watch, not as history.
+--   2. is_llm_call: also match gen_ai.operation.name 'generate_content' and
+--      'text_completion' (not just 'chat'), so those LLM spans classify even
+--      when gen_ai.request.model is empty. 'embeddings' stays excluded --
+--      is_llm_call feeds count_llm_calls, a trace sort field and a
+--      breach-event field, so admitting embedding spans is a metrics decision,
+--      not a rendering one.
+--   3. service_name: coalesce montecarlo.agent_name over ServiceName -- the
+--      ingest contract that agent-scoped reads of this data filter on.
+--      Without it, platform-exported spans (which carry montecarlo.agent_name
+--      and no service.name resource attribute) kept the raw ServiceName and
+--      agent-scoped reads silently missed them.
+--
+-- SIZE, kept because 0021's header builds on it: `response` is tool-controlled
+-- and copied verbatim, so prompts[].message is unbounded here. It amplifies --
+-- gen_ai.input.messages on a follow-up turn replays every prior tool result,
+-- so a conversation grows O(turns^2) in total prompt bytes. Left unbounded
+-- deliberately: observed tool-span I/O is p95 ~13 KB / max ~23 KB, orders of
+-- magnitude below the payload limits of the consumers that read this column.
+-- That margin is the whole argument -- overflow is NOT handled gracefully
+-- downstream: an oversized span can be dropped outright or fail its whole
+-- export, and downstream request sizing assumes bounded per-span content. If
+-- a large-payload emitter ever appears, bound it in the MV rather than
+-- per-consumer -- every downstream derivation reads this one expression, so a
+-- cap here stays consistent everywhere. The discriminating measurement is the
+-- length() distribution of CAST(SpanAttributes.gen_ai.input.messages AS
+-- Nullable(String)) on a production cluster (SpanAttributes is a JSON column:
+-- dotted path access, not map brackets).
+--
+-- Every expression it added was total (never raises), preserving this view's
+-- headline invariant: a raising SELECT expression fails the source INSERT into
+-- otel_traces and silently HALTS span ingestion cluster-wide. 0021 preserves
+-- that property.
