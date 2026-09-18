@@ -30,7 +30,7 @@
 -- All expressions are total (CAST to String / JSONExtract* degrade to '' on
 -- missing or malformed JSON, never raise), so the MV's never-raise invariant
 -- holds. Output column set and order unchanged -- the MV's SELECT matches
--- conversations_normalized (0008, columns extended by 0022) by output-alias
+-- conversations_normalized (0011, columns extended by 0022) by output-alias
 -- name, so aliases must not be renamed.
 --
 -- Under this chart's execution model sql/ is a DESIRED-STATE script set: the
