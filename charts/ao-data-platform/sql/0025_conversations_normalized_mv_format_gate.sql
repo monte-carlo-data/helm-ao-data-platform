@@ -15,9 +15,9 @@
 --
 -- Changes the admission gate only, expression by expression:
 --   * The has(span_attributes_keys, 'traceloop.entity.input'/'.output')
---     disjunction stays, demoted from gate to ANDed short-circuit prefilter:
---     it skips the JSON extraction for roots carrying neither key and admits
---     nothing on its own.
+--     disjunction stays, demoted from gate to ANDed prefilter: it narrows the
+--     row set ahead of the JSON extraction (a best-effort skip, not a
+--     guarantee) and admits nothing on its own.
 --   * A new conjunct requires the extraction to produce content:
 --     (_user_input != '' OR _agent_response != ''). The user_input and
 --     agent_response extraction expressions are lifted into the WITH clause
@@ -99,7 +99,10 @@ SELECT
 FROM otel_traces.spans_normalized
 WHERE parent_span_id = ''
   AND conversation_id != ''
-  -- Short-circuit prefilter, not the gate: skips the extraction for roots carrying neither entity key.
+  -- Prefilter, not the gate: narrows the row set ahead of the extraction and
+  -- admits nothing on its own. Whether the extraction is actually skipped is
+  -- best-effort (short-circuit evaluation), not a guarantee; the gate does
+  -- not depend on it.
   AND (
     has(span_attributes_keys, 'traceloop.entity.input')
     OR has(span_attributes_keys, 'traceloop.entity.output')
