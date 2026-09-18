@@ -193,6 +193,23 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
+One ESO remoteRef entry (key + optional property + optional version), shared by the
+per-user ExternalSecret and the auth-methods bundle so the two fetch paths cannot
+drift apart. Call with a dict: {key: <Secrets Manager key>, remoteRef: <the user's
+externalSecret.remoteRef cfg>, errorContext: <string for the required-key message>}.
+Renders unindented — the caller indents via nindent.
+*/}}
+{{- define "ao-data-platform.externalSecretRemoteRef" -}}
+key: {{ required (printf "externalSecret.remoteRef.key is required %s" .errorContext) .key }}
+{{- if .remoteRef.property }}
+property: {{ .remoteRef.property }}
+{{- end }}
+{{- if .remoteRef.version }}
+version: {{ .remoteRef.version }}
+{{- end }}
+{{- end }}
+
+{{/*
 ExternalSecret for a ClickHouse user password.
 One ExternalSecret per CH user that has a Secrets-Manager-backed password, factored here so the
 otel / schema_owner / llm_worker / monte_carlo / admin / readonly_user blocks don't each repeat it.
@@ -221,13 +238,7 @@ spec:
   data:
     - secretKey: password
       remoteRef:
-        key: {{ required (printf "externalSecret.remoteRef.key is required for secret %s — set via clickhouse.<user>.externalSecret.remoteRef.key" $name) $es.remoteRef.key }}
-        {{- if $es.remoteRef.property }}
-        property: {{ $es.remoteRef.property }}
-        {{- end }}
-        {{- if $es.remoteRef.version }}
-        version: {{ $es.remoteRef.version }}
-        {{- end }}
+        {{- include "ao-data-platform.externalSecretRemoteRef" (dict "key" $es.remoteRef.key "remoteRef" $es.remoteRef "errorContext" (printf "for secret %s — set via clickhouse.<user>.externalSecret.remoteRef.key" $name)) | nindent 8 }}
 {{- end }}
 
 {{/*
@@ -235,17 +246,122 @@ Shared read-only grant bundle (the "reader bundle").
 Granted to both monte_carlo (reader + queue producer) and readonly_user (human/MCP/JDBC). Covers the
 telemetry DB plus the metadata reads DataGrip/MCP and Monte Carlo data-source monitoring need. Keep
 this as the single source of truth — adding a read target means editing it here once.
-Emits YAML list items (`- "GRANT …"`) intended for inclusion under a CHI `<user>/grants/query`
-sequence. Must be called with `| nindent 8` to align with the surrounding 8-space indent used in
-templates/clickhouse-installation.yaml. Call with the root context (`.`).
+Emits `<query>GRANT …</query>` elements for inclusion under a `<grants>` element in the
+users.d/auth-methods.xml fragment (templates/clickhouse-installation.yaml), where every SQL user
+is now defined (YET-2680). Must be called with `| nindent 16` to align with that fragment's
+grants indent. Call with the root context (`.`).
 */}}
 {{- define "ao-data-platform.readerGrants" -}}
-- "GRANT SELECT ON otel_traces.*"
-- "GRANT SELECT ON system.tables"
-- "GRANT SELECT ON system.parts"
-- "GRANT SELECT ON system.query_log"
-# system.numbers is the generator table for time-bucket / gap-fill queries (e.g. the
-# getTraceTimeSeries time series), not a metadata read — but reader clients need it.
-- "GRANT SELECT ON system.numbers"
-- "GRANT SELECT ON information_schema.*"
+<query>GRANT SELECT ON otel_traces.*</query>
+<query>GRANT SELECT ON system.tables</query>
+<query>GRANT SELECT ON system.parts</query>
+<query>GRANT SELECT ON system.query_log</query>
+<!-- system.numbers is the generator table for time-bucket / gap-fill queries (e.g. the
+     getTraceTimeSeries time series), not a metadata read — but reader clients need it. -->
+<query>GRANT SELECT ON system.numbers</query>
+<query>GRANT SELECT ON information_schema.*</query>
+{{- end }}
+
+{{/*
+The enabled ClickHouse users that carry a password, as a JSON array of
+{ch: <ClickHouse user name>, cfg: <values block>}. Consumed only by
+authMethodsExternalSecret below; the CHI's users.d fragment
+(templates/clickhouse-installation.yaml) hardcodes its own user elements and never
+reads this helper — the CI lint job (.circleci/config.yml) is what holds the two in
+sync. A drift means a user gets an `incl` with no matching substitution and
+ClickHouse rejects an empty <auth_methods>.
+Adding a ClickHouse user? Add it in all of: this helper, values.yaml, the
+$extSecrets list in templates/external-secret.yaml, the users.d fragment in
+templates/clickhouse-installation.yaml, and the user lists in .circleci/config.yml.
+*/}}
+{{- define "ao-data-platform.authMethodsUsers" -}}
+{{- $users := list
+      (dict "ch" "otel"         "cfg" .Values.clickhouse.otel)
+      (dict "ch" "schema_owner" "cfg" .Values.clickhouse.schemaOwner)
+      (dict "ch" "llm_worker"   "cfg" .Values.clickhouse.llmWorker)
+      (dict "ch" "monte_carlo"  "cfg" .Values.clickhouse.monteCarlo)
+-}}
+{{- if .Values.clickhouse.admin.enabled -}}
+{{- $users = append $users (dict "ch" "admin" "cfg" .Values.clickhouse.admin) -}}
+{{- end -}}
+{{- if .Values.clickhouse.readonlyUser.enabled -}}
+{{- $users = append $users (dict "ch" "readonly_user" "cfg" .Values.clickhouse.readonlyUser) -}}
+{{- end -}}
+{{- toJson $users -}}
+{{- end }}
+
+{{/*
+Absolute path of the mounted auth-methods substitution file. The Altinity
+operator mounts a secret-backed `files:` entry as its own volume at
+/etc/clickhouse-server/secrets.d/<files-key>/<secret-name>/<secret-key> — NOT in
+the directory the key names. Only the secret-name segment is values-derived; the
+literals `auth-methods.xml` (here and in clickhouse-installation.yaml's `files:` key)
+and `auth.xml` (here and in the bundle ExternalSecret's data key) are each hardcoded
+in two places and must stay in lockstep — a drift is a missing `include_from` file
+and a ClickHouse crash loop.
+*/}}
+{{- define "ao-data-platform.authMethodsSecretPath" -}}
+{{- printf "/etc/clickhouse-server/secrets.d/auth-methods.xml/%s/auth.xml" .Values.clickhouse.authMethods.secret -}}
+{{- end }}
+
+{{/*
+The auth-methods bundle ExternalSecret: assembles every enabled user's current
+(and, during a rotation, previous) password into one substitution file.
+The guard around the previous method is ESO-side and load-bearing: the previous
+secret holds the sentinel "-" in steady state (Secrets Manager rejects empty
+strings), and a bare `if` is truthy for it — a rendered sentinel <password>-</password>
+would be a valid, matchable one-character auth method, i.e. a login bypass.
+Helm cannot see the value, so only ESO can gate it. Validated live on dev-us1
+(Spike Finding 10).
+The whole previous block is additionally gated Helm-side on previousKey, so a
+user without one renders no reference to a `_previous` key ESO was never asked
+to fetch — the steady state stays byte-identical to pre-5.0.0 auth.
+*/}}
+{{- define "ao-data-platform.authMethodsExternalSecret" -}}
+{{- $users := fromJsonArray (include "ao-data-platform.authMethodsUsers" .) -}}
+{{- $am := .Values.clickhouse.authMethods -}}
+{{- $storeName := $am.externalSecret.secretStoreRef.name | default .Values.clickhouse.otel.externalSecret.secretStoreRef.name -}}
+{{- $storeKind := $am.externalSecret.secretStoreRef.kind | default .Values.clickhouse.otel.externalSecret.secretStoreRef.kind -}}
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: {{ $am.secret }}
+  labels:
+    {{- include "ao-data-platform.labels" . | nindent 4 }}
+spec:
+  refreshInterval: {{ $am.externalSecret.refreshInterval }}
+  secretStoreRef:
+    name: {{ required "clickhouse.authMethods.externalSecret.secretStoreRef.name (or clickhouse.otel.externalSecret.secretStoreRef.name) is required — the ClickHouse server reads its auth methods from this store" $storeName }}
+    kind: {{ $storeKind }}
+  target:
+    name: {{ $am.secret }}
+    creationPolicy: Owner
+    template:
+      data:
+        auth.xml: |
+          <clickhouse>
+          {{- range $u := $users }}
+            <{{ $u.ch }}_auth_methods>
+              <current><password>{{ printf "{{ .%s_password }}" $u.ch }}</password></current>
+              {{- if $u.cfg.externalSecret.previousKey }}
+              {{ printf "{{- if and .%s_previous (ne .%s_previous \"-\") }}" $u.ch $u.ch }}
+              <previous><password>{{ printf "{{ .%s_previous }}" $u.ch }}</password></previous>
+              {{ "{{- end }}" }}
+              {{- end }}
+            </{{ $u.ch }}_auth_methods>
+          {{- end }}
+          </clickhouse>
+  data:
+  {{- range $u := $users }}
+    - secretKey: {{ $u.ch }}_password
+      remoteRef:
+        {{- include "ao-data-platform.externalSecretRemoteRef" (dict "key" $u.cfg.externalSecret.remoteRef.key "remoteRef" $u.cfg.externalSecret.remoteRef "errorContext" (printf "for ClickHouse user %s" $u.ch)) | nindent 8 }}
+    {{- if $u.cfg.externalSecret.previousKey }}
+    - secretKey: {{ $u.ch }}_previous
+      remoteRef:
+        {{- /* The previous (B) secret is written by the rotation tooling in the same format as the current secret, so it shares the property/version extraction shape; on the Fake provider every remoteRef needs version or the bundle's all-or-nothing sync stalls for all users. */}}
+        {{- include "ao-data-platform.externalSecretRemoteRef" (dict "key" $u.cfg.externalSecret.previousKey "remoteRef" $u.cfg.externalSecret.remoteRef "errorContext" (printf "for ClickHouse user %s (previous password)" $u.ch)) | nindent 8 }}
+    {{- end }}
+  {{- end }}
 {{- end }}

@@ -30,6 +30,9 @@ clickhouse:
         name: ci-placeholder
       remoteRef:
         key: ci-placeholder
+      # Exercise the rotation branch of the auth-methods template (default "" is
+      # the steady state and would leave the previous-password path unrendered).
+      previousKey: ci-placeholder-previous
   schemaOwner:
     externalSecret:
       secretStoreRef:

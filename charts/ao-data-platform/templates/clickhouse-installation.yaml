@@ -37,143 +37,15 @@ spec:
       nodes:
         - host: {{ include "ao-data-platform.keeperServiceName" . }}
           port: 2181
-    # Adding a ClickHouse user? Also update values.yaml and templates/external-secret.yaml.
-    users:
-      otel/password:
-        valueFrom:
-          secretKeyRef:
-            name: {{ .Values.clickhouse.otel.secret }}
-            key: password
-      otel/networks/ip:
-        {{- toYaml .Values.clickhouse.otel.networksIp | nindent 8 }}
-      {{- if .Values.clickhouse.otel.restrictGrants }}
-      # otel (ingest) — restricted to INSERT on otel_traces.otel_traces. The MV cascade runs
-      # as schema_owner (the MV DEFINER), so otel needs nothing on the normalized targets. Gated
-      # so it can stay broad until external readers have moved to monte_carlo, then be flipped on.
-      otel/grants/query:
-        - "GRANT INSERT ON otel_traces.otel_traces"
-      {{- end }}
-      # schema_owner — DDL/owner identity for the schema Job and the persistent MV DEFINER.
-      # Full DDL on otel_traces + ALTER on specific system-log tables (TTLs) + SYSTEM FLUSH LOGS;
-      # deliberately NO access management.
-      schema_owner/password:
-        valueFrom:
-          secretKeyRef:
-            name: {{ .Values.clickhouse.schemaOwner.secret }}
-            key: password
-      schema_owner/networks/ip:
-        {{- toYaml .Values.clickhouse.schemaOwner.networksIp | nindent 8 }}
-      schema_owner/grants/query:
-        # CREATE DATABASE cannot be scoped to a single database in ClickHouse — it is irreducibly
-        # global. A future reader should not attempt to narrow this to a specific database.
-        - "GRANT CREATE DATABASE ON *.*"
-        - "GRANT CREATE TABLE, CREATE VIEW, ALTER, SELECT, INSERT, DROP, OPTIMIZE ON otel_traces.*"
-        # ALTER granted only on the specific system-log tables whose TTLs the schema Job manages
-        # (ALTER TABLE system.<log> MODIFY TTL). Derived from the modify_ttl_if_exists calls in
-        # templates/schema-job.yaml. Do not widen back to system.* — that would include system
-        # tables the schema Job never touches.
-        - "GRANT ALTER ON system.query_log"
-        - "GRANT ALTER ON system.query_thread_log"
-        - "GRANT ALTER ON system.query_views_log"
-        - "GRANT ALTER ON system.part_log"
-        - "GRANT ALTER ON system.trace_log"
-        - "GRANT ALTER ON system.metric_log"
-        - "GRANT ALTER ON system.text_log"
-        - "GRANT SYSTEM FLUSH LOGS ON *.*"
-        # Every statement the schema Job runs is ON CLUSTER, and ClickHouse gates ON CLUSTER
-        # queries behind the CLUSTER privilege (on_cluster_queries_require_cluster_grant is on
-        # by default in this CH line) — without this the Job fails ACCESS_DENIED on its first
-        # statement. The privilege is irreducibly global; it cannot be scoped below *.*.
-        - "GRANT CLUSTER ON *.*"
-      # llm_worker — the llm-worker Deployment. Reads the queue, appends results, and writes its
-      # (cloud, provider) marker to llm_worker_info on startup (for monolith cloud identification).
-      llm_worker/password:
-        valueFrom:
-          secretKeyRef:
-            name: {{ .Values.clickhouse.llmWorker.secret }}
-            key: password
-      llm_worker/networks/ip:
-        {{- toYaml .Values.clickhouse.llmWorker.networksIp | nindent 8 }}
-      llm_worker/grants/query:
-        - "GRANT SELECT ON otel_traces.llm_batches"
-        - "GRANT SELECT ON otel_traces.llm_inputs"
-        - "GRANT SELECT ON otel_traces.llm_results"
-        - "GRANT SELECT ON otel_traces.llm_worker_info"
-        - "GRANT INSERT ON otel_traces.llm_batches"
-        - "GRANT INSERT ON otel_traces.llm_results"
-        - "GRANT INSERT ON otel_traces.llm_worker_info"
-      # monte_carlo — Monte Carlo service account: shared reader bundle, agent queue producer, and
-      # the conversation turn rollup writer. NO readonly profile: readonly=2 would block these
-      # INSERTs, so the read-mostly shape is enforced by grants alone.
-      # conversations_normalized is the first grant here on a source table rather than a derived
-      # annotation, and the reader bundle above already carries SELECT on the whole database, so
-      # the widening this adds is write access to conversation turns. The writer must itself
-      # exclude what the 0012 MV admits, which no grant can express (sql/0022); and the table's
-      # engine has no version column, so a stray write is not correctable by re-writing. A separate
-      # writer user was declined because the Monte Carlo side reaches this cluster through one
-      # per-account connection, so a second writer credential would have to be provisioned per
-      # install.
-      monte_carlo/password:
-        valueFrom:
-          secretKeyRef:
-            name: {{ .Values.clickhouse.monteCarlo.secret }}
-            key: password
-      monte_carlo/networks/ip:
-        {{- toYaml .Values.clickhouse.monteCarlo.networksIp | nindent 8 }}
-      monte_carlo/grants/query:
-        {{- include "ao-data-platform.readerGrants" . | nindent 8 }}
-        - "GRANT INSERT ON otel_traces.llm_inputs"
-        - "GRANT INSERT ON otel_traces.llm_batches"
-        - "GRANT INSERT ON otel_traces.conversation_eval_scores"
-        - "GRANT INSERT ON otel_traces.span_eval_scores"
-        - "GRANT INSERT ON otel_traces.conversation_cluster_assignments"
-        - "GRANT INSERT ON otel_traces.conversations_normalized"
-        - "GRANT INSERT ON otel_traces.conversation_rollup_watermarks"
-        # The writer's correctness-bearing reads (ledger anti-join, cursor read, duplicate
-        # assertion) go through clusterAllReplicas, which is gated by READ ON REMOTE — not by
-        # CLUSTER (verified on 26.2.15.4: a SELECT-only user gets code 497 until granted).
-        # READ ON REMOTE takes no object clause — the ON *.* form is a syntax error
-        # (verified on 26.2.15.4 and 26.4.3) — it is global by construction.
-        - "GRANT READ ON REMOTE"
-        # The README's watermark note prescribes the exact-guarantee read as a
-        # SYSTEM SYNC REPLICA on the turns table followed by local reads, and
-        # monte_carlo is the only user that recipe exists for — without this
-        # grant it fails closed on every call. Table-level; LIGHTWEIGHT needs
-        # no separate grant.
-        - "GRANT SYSTEM SYNC REPLICA ON otel_traces.conversations_normalized"
-      {{- if .Values.clickhouse.admin.enabled }}
-      # admin — gated break-glass superuser: full access + user management + SYSTEM. Not for
-      # service-to-service. Defaults to loopback-only (admin.networksIp), so it's usable only
-      # by exec-ing into the pod.
-      admin/password:
-        valueFrom:
-          secretKeyRef:
-            name: {{ .Values.clickhouse.admin.secret }}
-            key: password
-      admin/networks/ip:
-        {{- toYaml .Values.clickhouse.admin.networksIp | nindent 8 }}
-      # GRANT ALL includes the ACCESS MANAGEMENT privilege group (CREATE USER / GRANT / …), so a
-      # separate access_management setting is unnecessary — and ClickHouse rejects combining any
-      # legacy access-control setting (access_management) with config-level `grants`.
-      admin/grants/query:
-        - "GRANT ALL ON *.* WITH GRANT OPTION"
-      {{- end }}
-      {{- if .Values.clickhouse.readonlyUser.enabled }}
-      readonly_user/password:
-        valueFrom:
-          secretKeyRef:
-            name: {{ .Values.clickhouse.readonlyUser.secret }}
-            key: password
-      readonly_user/networks/ip:
-        {{- toYaml .Values.clickhouse.readonlyUser.networksIp | nindent 8 }}
-      readonly_user/profile: readonly_settings
-      # Shared reader bundle (same as monte_carlo's reads): otel_traces.* + the system /
-      # information_schema metadata reads DataGrip/MCP need. Going explicit removes the implicit
-      # all-DB read a config user would otherwise have; readonly=2 (above) stays orthogonal and
-      # governs SET, not table access.
-      readonly_user/grants/query:
-        {{- include "ao-data-platform.readerGrants" . | nindent 8 }}
-      {{- end }}
+    # No SQL users in the operator spec (YET-2680, Spike Finding 7): the operator
+    # renders a password hash for any password-less users: entry, which cannot
+    # coexist with the <auth_methods> the rotation mechanism needs — ClickHouse
+    # rejects the whole users config. Every user is defined completely in the
+    # users.d/auth-methods.xml fragment in `files:` below (networks, grants, and
+    # auth substituted from the mounted auth-methods secret), the same pattern
+    # users.d/probe_user.xml already uses.
+    # Adding a ClickHouse user? Also update values.yaml, templates/external-secret.yaml
+    # and the authMethodsUsers helper.
     {{- if .Values.clickhouse.readonlyUser.enabled }}
     profiles:
       # readonly=2 keeps the user SELECT-only but allows per-session SET; the
@@ -182,6 +54,192 @@ spec:
       readonly_settings/readonly: "2"
     {{- end }}
     files:
+      # The auth-methods substitution file, mounted as its own secret-backed
+      # volume. Unlike the env/from_env path this refreshes in place when the
+      # secret changes (kubelet, ~30s), which is what makes rotation restartless.
+      # The operator mounts it at secrets.d/<this key>/<secret name>/<secret key> —
+      # see the authMethodsSecretPath helper, which derives the include path below
+      # from the same values so the two cannot drift. The bundle secret MUST exist
+      # before any pod references it: a missing include_from file at container
+      # start is fatal (exit + crash loop). ESO syncs it within seconds of the
+      # ExternalSecret existing, so a normal upgrade self-heals (pods park in
+      # ContainerCreating until the mount appears).
+      auth-methods.xml:
+        valueFrom:
+          secretKeyRef:
+            name: {{ .Values.clickhouse.authMethods.secret }}
+            key: auth.xml
+      # The complete definitions of every ClickHouse SQL user (YET-2680) — why
+      # here and not the operator users: spec: see the comment above the profiles
+      # section. Networks and grants are exactly what the users spec carried
+      # before; auth comes from the mounted file via incl. include_from is read
+      # per separately-loaded config file, so it must be declared here in the
+      # users config, not in config.d. A secret-only change does NOT auto-reload
+      # users (the secret volume's symlink swap defeats the watcher); rotations
+      # issue SYSTEM RELOAD CONFIG via the consuming Terraform module's rotation
+      # tooling — instant and restartless.
+      users.d/auth-methods.xml: |
+        <clickhouse>
+          <include_from>{{ include "ao-data-platform.authMethodsSecretPath" . }}</include_from>
+          <users>
+            <!-- otel — the OTel collector ingest identity. Writes raw telemetry into
+                 otel_traces.otel_traces. The MV cascade runs as schema_owner (the MV
+                 DEFINER), so otel needs nothing on the normalized targets. -->
+            <otel>
+              <networks>
+                {{- range $ip := .Values.clickhouse.otel.networksIp }}
+                <ip>{{ $ip }}</ip>
+                {{- end }}
+              </networks>
+              {{- if .Values.clickhouse.otel.restrictGrants }}
+              <!-- Restricted to INSERT on otel_traces.otel_traces. Gated so otel can stay
+                   broad (no <grants> element at all = implicit full access) until external
+                   readers have moved to monte_carlo, then be flipped on. -->
+              <grants>
+                <query>GRANT INSERT ON otel_traces.otel_traces</query>
+              </grants>
+              {{- end }}
+              <auth_methods incl="otel_auth_methods"/>
+            </otel>
+            <!-- schema_owner — DDL/owner identity for the schema Job and the persistent MV
+                 DEFINER. Full DDL on otel_traces + ALTER on specific system-log tables
+                 (TTLs) + SYSTEM FLUSH LOGS; deliberately NO access management. -->
+            <schema_owner>
+              <networks>
+                {{- range $ip := .Values.clickhouse.schemaOwner.networksIp }}
+                <ip>{{ $ip }}</ip>
+                {{- end }}
+              </networks>
+              <grants>
+                <!-- CREATE DATABASE cannot be scoped to a single database in ClickHouse — it is
+                     irreducibly global. A future reader should not attempt to narrow this to a
+                     specific database. -->
+                <query>GRANT CREATE DATABASE ON *.*</query>
+                <query>GRANT CREATE TABLE, CREATE VIEW, ALTER, SELECT, INSERT, DROP, OPTIMIZE ON otel_traces.*</query>
+                <!-- ALTER granted only on the specific system-log tables whose TTLs the schema Job
+                     manages (ALTER TABLE system.<log> MODIFY TTL). Derived from the
+                     modify_ttl_if_exists calls in templates/schema-job.yaml. Do not widen back to
+                     system.* — that would include system tables the schema Job never touches. -->
+                <query>GRANT ALTER ON system.query_log</query>
+                <query>GRANT ALTER ON system.query_thread_log</query>
+                <query>GRANT ALTER ON system.query_views_log</query>
+                <query>GRANT ALTER ON system.part_log</query>
+                <query>GRANT ALTER ON system.trace_log</query>
+                <query>GRANT ALTER ON system.metric_log</query>
+                <query>GRANT ALTER ON system.text_log</query>
+                <query>GRANT SYSTEM FLUSH LOGS ON *.*</query>
+                <!-- Every statement the schema Job runs is ON CLUSTER, and ClickHouse gates ON
+                     CLUSTER queries behind the CLUSTER privilege
+                     (on_cluster_queries_require_cluster_grant is on by default in this CH line) —
+                     without this the Job fails ACCESS_DENIED on its first statement. The privilege
+                     is irreducibly global; it cannot be scoped below *.*. -->
+                <query>GRANT CLUSTER ON *.*</query>
+              </grants>
+              <auth_methods incl="schema_owner_auth_methods"/>
+            </schema_owner>
+            <!-- llm_worker — the llm-worker Deployment. Reads the queue, appends results, and
+                 writes its (cloud, provider) marker to llm_worker_info on startup (for monolith
+                 cloud identification). -->
+            <llm_worker>
+              <networks>
+                {{- range $ip := .Values.clickhouse.llmWorker.networksIp }}
+                <ip>{{ $ip }}</ip>
+                {{- end }}
+              </networks>
+              <grants>
+                <query>GRANT SELECT ON otel_traces.llm_batches</query>
+                <query>GRANT SELECT ON otel_traces.llm_inputs</query>
+                <query>GRANT SELECT ON otel_traces.llm_results</query>
+                <query>GRANT SELECT ON otel_traces.llm_worker_info</query>
+                <query>GRANT INSERT ON otel_traces.llm_batches</query>
+                <query>GRANT INSERT ON otel_traces.llm_results</query>
+                <query>GRANT INSERT ON otel_traces.llm_worker_info</query>
+              </grants>
+              <auth_methods incl="llm_worker_auth_methods"/>
+            </llm_worker>
+            <!-- monte_carlo — Monte Carlo read-only service account + agent queue producer.
+                 Shared reader bundle plus the queue/eval-score INSERTs. NO readonly profile:
+                 readonly=2 would block these INSERTs, so the read-mostly shape is enforced by
+                 grants alone. -->
+            <monte_carlo>
+              <networks>
+                {{- range $ip := .Values.clickhouse.monteCarlo.networksIp }}
+                <ip>{{ $ip }}</ip>
+                {{- end }}
+              </networks>
+              <grants>
+                {{- include "ao-data-platform.readerGrants" . | nindent 16 }}
+                <query>GRANT INSERT ON otel_traces.llm_inputs</query>
+                <query>GRANT INSERT ON otel_traces.llm_batches</query>
+                <query>GRANT INSERT ON otel_traces.conversation_eval_scores</query>
+                <query>GRANT INSERT ON otel_traces.span_eval_scores</query>
+                <query>GRANT INSERT ON otel_traces.conversation_cluster_assignments</query>
+                <!-- conversations_normalized + conversation_rollup_watermarks: the conversation
+                     turn rollup writer (AO-1108). The reader bundle above already carries SELECT
+                     on the whole database, so the widening here is write access to conversation
+                     turns. The writer must itself exclude what the 0012 MV admits, which no grant
+                     can express (sql/0022); and the table's engine has no version column, so a
+                     stray write is not correctable by re-writing. A separate writer user was
+                     declined because the Monte Carlo side reaches this cluster through one
+                     per-account connection. -->
+                <query>GRANT INSERT ON otel_traces.conversations_normalized</query>
+                <query>GRANT INSERT ON otel_traces.conversation_rollup_watermarks</query>
+                <!-- The writer's correctness-bearing reads (ledger anti-join, cursor read,
+                     duplicate assertion) go through clusterAllReplicas, which is gated by READ
+                     ON REMOTE — not by CLUSTER (verified on 26.2.15.4: a SELECT-only user gets
+                     code 497 until granted). READ ON REMOTE takes no object clause — the ON *.*
+                     form is a syntax error (verified on 26.2.15.4 and 26.4.3) — it is global by
+                     construction. -->
+                <query>GRANT READ ON REMOTE</query>
+                <!-- The README's watermark note prescribes the exact-guarantee read as a
+                     SYSTEM SYNC REPLICA on the turns table followed by local reads, and
+                     monte_carlo is the only user that recipe exists for — without this grant it
+                     fails closed on every call. Table-level; LIGHTWEIGHT needs no separate
+                     grant. -->
+                <query>GRANT SYSTEM SYNC REPLICA ON otel_traces.conversations_normalized</query>
+              </grants>
+              <auth_methods incl="monte_carlo_auth_methods"/>
+            </monte_carlo>
+        {{- if .Values.clickhouse.admin.enabled }}
+            <!-- admin — gated break-glass superuser: full access + user management + SYSTEM.
+                 Not for service-to-service. Defaults to loopback-only (admin.networksIp), so
+                 it's usable only by exec-ing into the pod. GRANT ALL includes the ACCESS
+                 MANAGEMENT privilege group (CREATE USER / GRANT / …), so a separate
+                 access_management setting is unnecessary — and ClickHouse rejects combining any
+                 legacy access-control setting (access_management) with config-level grants. -->
+            <admin>
+              <networks>
+                {{- range $ip := .Values.clickhouse.admin.networksIp }}
+                <ip>{{ $ip }}</ip>
+                {{- end }}
+              </networks>
+              <grants>
+                <query>GRANT ALL ON *.* WITH GRANT OPTION</query>
+              </grants>
+              <auth_methods incl="admin_auth_methods"/>
+            </admin>
+        {{- end }}
+        {{- if .Values.clickhouse.readonlyUser.enabled }}
+            <readonly_user>
+              <networks>
+                {{- range $ip := .Values.clickhouse.readonlyUser.networksIp }}
+                <ip>{{ $ip }}</ip>
+                {{- end }}
+              </networks>
+              <profile>readonly_settings</profile>
+              <!-- Shared reader bundle (same as monte_carlo's reads): otel_traces.* + the
+                   system / information_schema metadata reads DataGrip/MCP need. Going explicit
+                   removes the implicit all-DB read a config user would otherwise have;
+                   readonly=2 (the profile above) stays orthogonal and governs SET, not table
+                   access. -->
+              <grants>
+                {{- include "ao-data-platform.readerGrants" . | nindent 16 }}
+              </grants>
+              <auth_methods incl="readonly_user_auth_methods"/>
+            </readonly_user>
+        {{- end }}
+          </users>
+        </clickhouse>
       # Remove the built-in `default` user. Stock ClickHouse ships `default`
       # with an empty password and `access_management: 1` (full superuser).
       # The Altinity operator restricts its networks to pod IPs but leaves the
