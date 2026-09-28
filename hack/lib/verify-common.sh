@@ -314,7 +314,7 @@ verify_clickhouse_user_model() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Zone spread — replicas/voters each occupy a distinct availability zone
+# Zone spread — replicas/voters occupy enough distinct zones, and distinct nodes
 #
 # The chart's hard topologySpreadConstraints (maxSkew: 1, minDomains, DoNotSchedule)
 # are meant to guarantee one ClickHouse replica and one Keeper voter per zone. Before
@@ -324,22 +324,29 @@ verify_clickhouse_user_model() {
 # it has already lost the single-AZ-failure tolerance HA exists for, until the first
 # reschedule turns a co-located replica into a wiped one. Placement is not visible in any
 # other check here, so read it directly: fail if a replica set's pod count doesn't match
-# its CR's declared replicasCount, or if it occupies fewer distinct zones than it has
-# pods. Requires $NS.
+# its CR's declared replicasCount, if it occupies fewer distinct zones than required, or
+# if two pods share a node. The zone requirement is per-pod for ClickHouse, but for
+# Keeper it honors the chart's keeper.zoneSpread.minDomains opt-out (voters packed 2+1
+# across 2 AZs is a valid, documented reduced-HA posture): read the rendered minDomains
+# from the live CHK's zone constraint and require that many distinct zones instead.
+# Requires $NS.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Assert the pods matching a selector (a) match the CR's declared replica count and
-# (b) occupy as many distinct zones as there are pods (no two share a zone). Fails if:
-# the declared count can't be read (empty — never silently skip), the observed pod
-# count differs from it (a half-built cluster, e.g. 1 of 2 replicas, must not pass), a
-# pod is unscheduled (no node — an under-zoned cluster leaves the excess replica
-# Pending), or its node carries no zone label. A terminating pod (deletionTimestamp
-# set) is excluded so it can't inflate the count while still Running. Requires $NS and
-# a precomputed node→zone TSV in $2. $1 = friendly name, $3 = label selector, $4 =
-# declared replica count from the owning CR.
-_assert_distinct_zones() {  # friendly-name node-zone-tsv selector declared-count
-  local what="$1" node_zones="$2" selector="$3" declared="$4"
-  local pod_nodes rows pods_n zones_n pod node zone
+# Assert the pods matching a selector (a) match the CR's declared replica count,
+# (b) occupy at least the required number of distinct zones, and (c) each sit on their
+# own node (the chart's hostname anti-affinity is what keeps co-zoned voters off a
+# shared node, where one node failure costs two of them — verify the outcome, not the
+# rendered constraint). Fails if: the declared count can't be read (empty — never silently skip), the
+# observed pod count differs from it (a half-built cluster, e.g. 1 of 2 replicas, must
+# not pass), a pod is unscheduled (no node — an under-zoned cluster leaves the excess
+# replica Pending), or its node carries no zone label. A terminating pod
+# (deletionTimestamp set) is excluded so it can't inflate the count while still
+# Running. Requires $NS and a precomputed node→zone TSV in $2. $1 = friendly name,
+# $3 = label selector, $4 = declared replica count from the owning CR, $5 (optional) =
+# required distinct zones — defaults to the pod count (one per zone).
+_assert_distinct_zones() {  # friendly-name node-zone-tsv selector declared-count [min-zones]
+  local what="$1" node_zones="$2" selector="$3" declared="$4" min_zones="${5:-$4}"
+  local pod_nodes rows pods_n zones_n nodes_n pod node zone
   [[ -z "$declared" ]] && fail "$what — could not read the declared replica count from its CR; cannot verify zone spread."
   pod_nodes=$(kubectl get pods -n "$NS" -l "$selector" -o json 2>/dev/null \
     | jq -r '.items[] | select(.metadata.deletionTimestamp == null) | [.metadata.name, (.spec.nodeName // "")] | @tsv' \
@@ -356,15 +363,20 @@ _assert_distinct_zones() {  # friendly-name node-zone-tsv selector declared-coun
   printf '%s' "$rows" | sed 's/^/    /'
   pods_n=$(printf '%s' "$rows" | grep -c .)
   [[ "$pods_n" -ne "$declared" ]] && fail "$what — ${pods_n} pod(s) found for a declared replicasCount of ${declared}."
+  # The zone floor can't exceed the pod count (the chart's render-time validation
+  # forbids it), but clamp anyway so a bad CR read can't demand the impossible.
+  [[ "$min_zones" -gt "$pods_n" ]] && min_zones="$pods_n"
   zones_n=$(printf '%s' "$rows" | awk -F'\t' 'NF { print $3 }' | sort -u | grep -c .)
-  [[ "$zones_n" -lt "$pods_n" ]] && fail "$what — ${pods_n} replica(s) occupy only ${zones_n} distinct zone(s); replicas are co-located and a single AZ failure can break the cluster."
-  echo -e "  ${GREEN}  ${what}: ${pods_n} replica(s) across ${zones_n} distinct zone(s)${RESET}"
+  [[ "$zones_n" -lt "$min_zones" ]] && fail "$what — ${pods_n} replica(s) occupy only ${zones_n} distinct zone(s) of the ${min_zones} required; replicas are co-located and a single AZ failure can break the cluster."
+  nodes_n=$(printf '%s' "$rows" | awk -F'\t' 'NF { print $2 }' | sort -u | grep -c .)
+  [[ "$nodes_n" -lt "$pods_n" ]] && fail "$what — ${pods_n} replica(s) occupy only ${nodes_n} distinct node(s); replicas share a node and a single node failure can take out more than one."
+  echo -e "  ${GREEN}  ${what}: ${pods_n} replica(s) across ${zones_n} distinct zone(s) (${min_zones} required) on ${nodes_n} distinct node(s)${RESET}"
 }
 
 verify_zone_spread() {
   : "${NS:?NS must be set}"
-  banner "ClickHouse replicas and Keeper voters each occupy a distinct zone"
-  local node_zones ch_expected keeper_expected
+  banner "ClickHouse replicas and Keeper voters occupy enough distinct zones, on distinct nodes"
+  local node_zones ch_expected keeper_expected keeper_min_zones
   node_zones=$(kubectl get nodes -o json 2>/dev/null \
     | jq -r '.items[] | [.metadata.name, (.metadata.labels["topology.kubernetes.io/zone"] // "")] | @tsv' \
     || true)
@@ -374,7 +386,20 @@ verify_zone_spread() {
     -o jsonpath='{.spec.configuration.clusters[0].layout.replicasCount}' 2>/dev/null || true)
   keeper_expected=$(kubectl get chk -n "$NS" otel \
     -o jsonpath='{.spec.configuration.clusters[0].layout.replicasCount}' 2>/dev/null || true)
+  # The voters' zone floor is whatever the chart rendered into the CHK's zone
+  # constraint — replicasCount by default, lower when keeper.zoneSpread.minDomains
+  # opted down (a 2+1 packing is then the correct, verified shape, not a failure).
+  # Select the constraint by topologyKey rather than by list position so a future
+  # extra constraint can't silently take its place. Falls back to the
+  # declared voter count (the strict one-per-zone check) if the field can't be read —
+  # e.g. a pre-override CHK from an older chart.
+  keeper_min_zones=$(kubectl get chk -n "$NS" otel -o json 2>/dev/null \
+    | jq -r '[.spec.templates.podTemplates[]?.spec.topologySpreadConstraints[]?
+              | select(.topologyKey == "topology.kubernetes.io/zone") | .minDomains]
+             | first // empty' \
+    || true)
+  [[ -z "$keeper_min_zones" ]] && keeper_min_zones="$keeper_expected"
   _assert_distinct_zones "ClickHouse (chi=otel)"    "$node_zones" "clickhouse.altinity.com/chi=otel"        "$ch_expected"
-  _assert_distinct_zones "Keeper (chk=otel)"        "$node_zones" "clickhouse-keeper.altinity.com/chk=otel" "$keeper_expected"
-  pass "ClickHouse replicas and Keeper voters are spread across distinct zones."
+  _assert_distinct_zones "Keeper (chk=otel)"        "$node_zones" "clickhouse-keeper.altinity.com/chk=otel" "$keeper_expected" "$keeper_min_zones"
+  pass "ClickHouse replicas and Keeper voters are spread across the required zones and on distinct nodes."
 }
