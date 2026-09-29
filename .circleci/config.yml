@@ -697,9 +697,13 @@ jobs:
             # accepted, and a fractional float64 must fail — it is the only case
             # that exercises the template's printf float guard, without which
             # 2.9 would silently truncate to minDomains: 2.
-            if ! helm template charts/ao-data-platform \
+            # Render to a file rather than piping into grep -q: under CI's
+            # pipefail, grep -q's early exit SIGPIPEs helm and fails the
+            # pipeline even when the line matched.
+            helm template charts/ao-data-platform \
               -f charts/ao-data-platform/ci/lint-values.yaml \
-              --set-json 'keeper.zoneSpread.minDomains=2' | grep -qE '^              minDomains: 2$'; then
+              --set-json 'keeper.zoneSpread.minDomains=2' > override-json.yaml
+            if ! grep -qE '^              minDomains: 2$' override-json.yaml; then
               echo "float64 integer keeper.zoneSpread.minDomains=2 (--set-json) was rejected or did not render."
               exit 1
             fi
