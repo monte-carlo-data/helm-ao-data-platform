@@ -659,8 +659,10 @@ jobs:
           # that it does NOT leak into the CHI's spread (the opt-out is Keeper-only),
           # and that the template's render-time validation rejects out-of-range and
           # non-integer values (0 is rejected by the API server; above replicasCount
-          # demands more zones than there are voters; booleans/floats would be
-          # silently coerced) instead of shipping them to the cluster.
+          # demands more zones than there are voters; booleans and strings via --set,
+          # float64s via --set-json — the latter is how a values file delivers
+          # numbers, and what Helm's int would silently truncate) instead of
+          # shipping them to the cluster.
           command: |
             helm template charts/ao-data-platform \
               -f charts/ao-data-platform/ci/lint-values.yaml \
@@ -679,7 +681,10 @@ jobs:
               echo "A rendered minDomains still tracks keeper.replicasCount (5) despite the override."
               exit 1
             fi
-            for bad in 0 6 true 2.9; do   # 6 > the lint-values voter count of 5; true/2.9 are non-integers Helm's int would silently coerce
+            # 6 > the lint-values voter count of 5. true is a bool; 2.9 arrives as
+            # the string "2.9" (--set only types ints/bools/null), covering quoted
+            # string input — the float64 path is the --set-json cases below.
+            for bad in 0 6 true 2.9; do
               if helm template charts/ao-data-platform \
                 -f charts/ao-data-platform/ci/lint-values.yaml \
                 --set keeper.zoneSpread.minDomains=$bad > /dev/null 2>&1; then
@@ -687,6 +692,23 @@ jobs:
                 exit 1
               fi
             done
+            # --set-json delivers real JSON types, matching how a values file
+            # delivers numbers (float64): an integer-valued float64 must be
+            # accepted, and a fractional float64 must fail — it is the only case
+            # that exercises the template's printf float guard, without which
+            # 2.9 would silently truncate to minDomains: 2.
+            if ! helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --set-json 'keeper.zoneSpread.minDomains=2' | grep -qE '^              minDomains: 2$'; then
+              echo "float64 integer keeper.zoneSpread.minDomains=2 (--set-json) was rejected or did not render."
+              exit 1
+            fi
+            if helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --set-json 'keeper.zoneSpread.minDomains=2.9' > /dev/null 2>&1; then
+              echo "Expected the render to fail with float keeper.zoneSpread.minDomains=2.9 (--set-json), but it succeeded."
+              exit 1
+            fi
             echo "Keeper zone-spread override rendered correctly and invalid values failed."
       - run:
           name: Verify rendered readiness probe and probe-user wiring
