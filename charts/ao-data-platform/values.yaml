@@ -247,13 +247,25 @@ keeper:
   # availability zones with eligible nodes — it also feeds minDomains on the CHK
   # zone spread (templates/clickhouse-keeper-installation.yaml), so a count above
   # the AZ ceiling leaves the excess voters Pending permanently rather than
-  # packing an AZ the way pre-4.3.0 releases allowed. The consuming terraform
-  # derives this from the length of its Keeper availability-zone list, so the
-  # voter count cannot drift from the number of per-AZ Keeper node groups. Named
-  # `replicasCount` (not the Helm-conventional `replicaCount`) to match both the
-  # CRD field it feeds (the CHK's layout.replicasCount) and its sibling
-  # clickhouse.replicasCount.
+  # packing an AZ the way pre-4.3.0 releases allowed (unless zoneSpread.minDomains
+  # below opts down). The consuming terraform derives this from the length of its
+  # Keeper availability-zone list, so the voter count cannot drift from the number
+  # of per-AZ Keeper node groups. Named `replicasCount` (not the Helm-conventional
+  # `replicaCount`) to match both the CRD field it feeds (the CHK's
+  # layout.replicasCount) and its sibling clickhouse.replicasCount.
   replicasCount: 3
+  # Zone-spread opt-out for clusters with fewer availability zones than voters — an
+  # EXPLICIT REDUCED-HA POSTURE, not a tuning knob. minDomains sets the minimum
+  # number of distinct zones the voters must occupy; null (the default) means
+  # replicasCount, i.e. the full one-voter-per-zone guarantee. Setting it lower
+  # (e.g. 3 voters, minDomains: 2 on a 2-AZ cluster) keeps the hard DoNotSchedule
+  # spread — maxSkew: 1 still forces the flattest layout the zones allow (2+1,
+  # never 3+0), and hard pod anti-affinity keeps co-zoned voters on distinct nodes —
+  # but losing the AZ holding 2 voters drops the ensemble below quorum and blocks
+  # ClickHouse writes until that AZ recovers. Must be an integer >= 1 and
+  # <= replicasCount; non-integers and values outside that range fail the render.
+  zoneSpread:
+    minDomains: null
   # Keeper image. Pinned to track the ClickHouse server release line (clickhouse.image
   # is clickhouse-server:26.4.3); the AO team owns periodic bumps, same as the server
   # image. NOTE: confirm this exact tag is published for clickhouse-keeper before the

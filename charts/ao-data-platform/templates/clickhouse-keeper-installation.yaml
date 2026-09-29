@@ -1,5 +1,29 @@
 {{- if lt (int .Values.keeper.replicasCount) 1 }}
-{{- fail "keeper.replicasCount must be >= 1. minDomains on the zone topologySpreadConstraints below is set from this value, and the Kubernetes API rejects minDomains: 0." }}
+{{- fail "keeper.replicasCount must be >= 1. minDomains on the zone topologySpreadConstraints below is derived from this value, and the Kubernetes API rejects minDomains: 0." }}
+{{- end }}
+{{- /* Effective minDomains for the zone spread below: keeper.zoneSpread.minDomains when
+   set (the reduced-HA opt-out for clusters with fewer zones than voters), else
+   replicasCount (one voter per zone). Validated here so a bad value fails the render,
+   not the API server: non-integers would otherwise be silently coerced (true -> 1,
+   2.9 -> 2), quietly relaxing the zone floor; below 1 the API rejects the field
+   outright; and above replicasCount the constraint demands more zones than there are
+   voters to fill them — an unsatisfiable ask that means the caller misunderstood the
+   knob. The printf comparison rejects any value whose textual form differs from its
+   int coercion, while still admitting values-file integers (which Helm delivers as
+   float64: %v of 3.0 is "3"). */ -}}
+{{- $zoneMinDomains := int .Values.keeper.replicasCount }}
+{{- $zoneSpreadOverride := (.Values.keeper.zoneSpread | default dict).minDomains }}
+{{- if not (kindIs "invalid" $zoneSpreadOverride) }}
+{{- if ne (printf "%v" $zoneSpreadOverride) (printf "%d" (int $zoneSpreadOverride)) }}
+{{- fail (printf "keeper.zoneSpread.minDomains must be an integer, got %v. Leave it null to default to keeper.replicasCount." $zoneSpreadOverride) }}
+{{- end }}
+{{- $zoneMinDomains = int $zoneSpreadOverride }}
+{{- if lt $zoneMinDomains 1 }}
+{{- fail "keeper.zoneSpread.minDomains must be >= 1 when set — the Kubernetes API rejects minDomains: 0. Leave it null to default to keeper.replicasCount." }}
+{{- end }}
+{{- if gt $zoneMinDomains (int .Values.keeper.replicasCount) }}
+{{- fail (printf "keeper.zoneSpread.minDomains (%d) must not exceed keeper.replicasCount (%d) — the constraint would demand more zones than there are voters to fill them, leaving voters Pending forever. Leave it null to default to keeper.replicasCount." $zoneMinDomains (int .Values.keeper.replicasCount)) }}
+{{- end }}
 {{- end }}
 # ClickHouse Keeper ensemble (Raft coordination for ReplicatedMergeTree).
 #
@@ -11,7 +35,11 @@
 #
 # Keeper is intrinsic to the clustered design — this renders on every install; a
 # dev/small deployment just sets keeper.replicasCount: 1. Prod runs 3 voters, one per
-# AZ (hard topology spread below), so a quorum of 2 survives losing one AZ.
+# AZ (hard topology spread below), so a quorum of 2 survives losing one AZ. Clusters
+# with fewer zones than voters can opt down via keeper.zoneSpread.minDomains (e.g. 3
+# voters packed 2+1 across 2 AZs) — a documented reduced-HA posture where losing the
+# 2-voter AZ loses quorum; the pod anti-affinity below still keeps voters on distinct
+# nodes so any single node failure costs exactly one voter.
 apiVersion: "clickhouse-keeper.altinity.com/v1"
 kind: "ClickHouseKeeperInstallation"
 metadata:
@@ -59,11 +87,11 @@ spec:
           tolerations:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-          # Hard AZ spread — one voter per zone. There is no cluster autoscaler in the
-          # target environment, so the per-AZ Keeper node groups (provisioned by the
-          # consuming terraform) must pre-exist or a voter stays Pending. DoNotSchedule
-          # (not ScheduleAnyway) is deliberate: a 3-voter quorum that packed 2 voters
-          # into one AZ would lose its single-AZ-failure tolerance.
+          # Hard AZ spread — by default one voter per zone. There is no cluster
+          # autoscaler in the target environment, so the per-AZ Keeper node groups
+          # (provisioned by the consuming terraform) must pre-exist or a voter stays
+          # Pending. DoNotSchedule (not ScheduleAnyway) is deliberate: a 3-voter quorum
+          # that packed 2 voters into one AZ would lose its single-AZ-failure tolerance.
           #
           # minDomains is what makes that guarantee real; maxSkew alone does not.
           # Skew is measured only across zones that already hold an eligible
@@ -72,16 +100,37 @@ spec:
           # global minimum is that zone's own count, so skew stays 0 and every voter
           # packs in. minDomains forces the global minimum to 0 while fewer than this
           # many eligible domains exist, so the later voters stay Pending until their
-          # zones' nodes appear. One voter per zone, so minDomains == replicasCount ==
-          # the zone count it must cover. GA in k8s 1.30; valid only with DoNotSchedule.
+          # zones' nodes appear. Default is one voter per zone (minDomains ==
+          # replicasCount); keeper.zoneSpread.minDomains lowers the zone floor for
+          # under-zoned clusters, with maxSkew: 1 still forcing the flattest packing
+          # the zones allow (3 voters / 2 zones = 2+1, never 3+0). GA in k8s 1.30;
+          # valid only with DoNotSchedule.
           topologySpreadConstraints:
             - maxSkew: 1
-              minDomains: {{ .Values.keeper.replicasCount }}
+              minDomains: {{ $zoneMinDomains }}
               topologyKey: topology.kubernetes.io/zone
               whenUnsatisfiable: DoNotSchedule
               labelSelector:
                 matchLabels:
                   clickhouse-keeper.altinity.com/chk: {{ include "ao-data-platform.chkName" . }}
+          # Hard one-voter-per-node — a single node failure costs at most one voter.
+          # Redundant while the zone spread above forces distinct zones (distinct
+          # zones imply distinct nodes), but load-bearing whenever
+          # zoneSpread.minDomains packs co-zoned voters. Deliberately anti-affinity,
+          # not a hostname topologySpreadConstraint: spread constraints enforce
+          # balance, not distinctness — once every eligible node holds a voter, the
+          # global minimum is 1 and a second voter on an occupied node shows skew 1,
+          # so maxSkew: 1 admits it (e.g. when the Keeper node group has fewer nodes
+          # than voters, or a lost node deregisters before its replacement joins).
+          # Required anti-affinity is unconditional: a voter with no voter-free node
+          # waits Pending instead of packing.
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - topologyKey: kubernetes.io/hostname
+                  labelSelector:
+                    matchLabels:
+                      clickhouse-keeper.altinity.com/chk: {{ include "ao-data-platform.chkName" . }}
     volumeClaimTemplates:
       - name: keeper-data
         spec:

@@ -18,6 +18,8 @@ The ClickHouse instance ships with production hardening: a capped memory ceiling
 
 > **Chart-version bumps no longer recreate ClickHouse:** the ClickHouse operator propagates only a fixed allowlist of stable labels onto the resources it generates. A chart-version bump changes the volatile `helm.sh/chart` label, but that label is no longer stamped onto the StatefulSet's immutable `volumeClaimTemplates`, so the bump no longer forces a delete/recreate of the ClickHouse StatefulSet.
 
+> **Upgrading to 5.1.0:** the Keeper zone spread gains an explicit reduced-HA opt-out and a per-node hardening. `keeper.zoneSpread.minDomains` (default: unset = `replicasCount`, the existing one-voter-per-zone guarantee) lets clusters with fewer zones than voters schedule anyway — e.g. 3 voters on a 2-AZ cluster pack 2+1 (`maxSkew: 1` still forbids 3+0, and `DoNotSchedule` stays). This is a deliberate weaker posture, not a tuning knob: **losing the AZ holding 2 voters drops the ensemble below quorum**, turning ClickHouse readonly until that AZ recovers — a 3-AZ ensemble survives any single-AZ loss. The CHK pod template also gains required pod anti-affinity on `kubernetes.io/hostname` (one voter per node), so co-zoned voters can't share a node where one node failure would cost two of them. That podTemplate change **rolls the Keeper voters once** on upgrade (one at a time; each re-syncs from the Raft quorum — safe, but not a no-op). This affects no cluster on 4.3.0 or later: the zone floor already forces distinct zones, hence distinct nodes, so the roll lands each voter back where it was. The only way to hit the new rule is a pre-4.3.0 install upgrading directly with the opt-out set in the same step — its co-located voters then stick `Pending` on the roll until the packed AZ has enough eligible nodes (the same node-group + PVC procedure as the 4.3.0 note below).
+>
 > **Upgrading to 5.0.0:** a breaking major release — the ClickHouse SQL users leave the CHI `users:` spec for a static `users.d` fragment whose auth is substituted from an ESO-assembled secret, so each user can hold two valid passwords during a rotation. The upgrade rolls ClickHouse **once** (the pod template gains the auth-methods secret mount); every rotation after that is restartless. Direct consumers who set `clickhouse.<user>.externalSecret` need **no value changes**; consumers who patched the CHI `users:` spec must move their changes into the fragment — see [Upgrading to 5.0.0](#upgrading-to-500--users-leave-the-chi-users-spec).
 >
 > **Upgrading to 4.6.0:** adds the conversation turn rollup schema — the turn columns on `conversations_normalized`, the `conversation_rollup_watermarks` cursor table, and the `spans_normalized.ingested_at` arrival stamp — and grants the `monte_carlo` user INSERT on the two new-write tables (`conversations_normalized` and `conversation_rollup_watermarks`), plus `READ ON REMOTE` and `SYSTEM SYNC REPLICA` on `conversations_normalized`, for the Monte Carlo-side rollup writer, which requires this version or later. Mind the rollback direction: the schema is applied state and survives a rollback, but the grants are release state, re-rendered from the deployed chart. A `helm rollback` below 4.6.0 revokes that whole grant set — the INSERTs, the cluster reads (the writer's ledger anti-join, cursor read and duplicate assertion all go through `clusterAllReplicas`), and the exact-guarantee sync — while the tables and any written turns remain: the writer starts failing ACCESS_DENIED against a cluster whose schema is intact, and only the verify scripts' grant assertions see it.
@@ -82,16 +84,36 @@ rather than ClickHouse's built-in `{uuid}` default.
   eligible nodes — 3 voters tolerate losing one; use `1` for dev. `minDomains` (below)
   requires one zone per voter, so odd is not license to go above the AZ count: 3 voters
   in 3 AZs is fine, but 5 voters in a 3-AZ region — which pre-4.3.0 just packed as
-  2/2/1 — no longer schedules, and the excess stays `Pending` permanently.
+  2/2/1 — no longer schedules, and the excess stays `Pending` permanently (unless
+  `keeper.zoneSpread.minDomains` opts down — see below).
 - **Hard per-AZ spread:** the CHK pod template applies a `DoNotSchedule` topology spread on
-  `topology.kubernetes.io/zone` with `minDomains` set to the voter count, so a 3-voter
-  ensemble demands schedulable nodes in three distinct zones. `minDomains` is what enforces
+  `topology.kubernetes.io/zone` with `minDomains` by default set to the voter count, so a
+  3-voter ensemble demands schedulable nodes in three distinct zones. `minDomains` is what enforces
   it: `maxSkew: 1` alone would let all voters pack into a single eligible zone — a zone with
   no eligible node is not a zero-count domain, it is not a domain at all — so without it an
   under-zoned ensemble co-locates silently. A voter with no zone to land in stays `Pending`
   — expected on single-AZ or local clusters; set `keeper.replicasCount: 1` there. The spread
   is deliberately hard: packing two voters into one AZ would forfeit the ensemble's
   single-AZ-failure tolerance.
+- **Reduced-HA opt-out for under-zoned clusters:** `keeper.zoneSpread.minDomains` lowers
+  the zone floor below the voter count when the cluster simply doesn't have enough AZs —
+  e.g. 3 voters with `minDomains: 2` on a 2-AZ cluster schedule 2+1 (`maxSkew: 1` still
+  forces the flattest packing the zones allow, never 3+0, and the spread stays
+  `DoNotSchedule`). Understand what is being traded away: **losing the AZ that holds 2 of
+  the 3 voters drops the ensemble below quorum**, and ClickHouse turns readonly until that
+  AZ recovers — whereas the default one-per-zone layout survives any single-AZ loss. Prefer
+  a third zone whenever one exists; use the opt-out only when the topology genuinely can't
+  provide one. Values outside `1..replicasCount` fail at render time.
+- **One voter per node, always:** the CHK pod template also carries required pod
+  anti-affinity on `kubernetes.io/hostname`, so no two voters share a node and a single
+  node failure costs at most one voter. Anti-affinity, deliberately not a hostname
+  topology spread: spread constraints enforce balance, not distinctness — once every
+  eligible node holds a voter, a second voter on an occupied node is within `maxSkew: 1`
+  and packs silently, whereas anti-affinity leaves it `Pending` until a voter-free node
+  exists. Under the default zone spread the rule is implied (distinct zones ⇒ distinct
+  nodes); under the opt-out it is what keeps the co-zoned voters apart — with 2+1 across
+  two AZs, any single *node* failure still leaves a quorum of 2. The 2-voter AZ therefore
+  needs (at least) two eligible nodes, or its second voter waits `Pending`.
 - Keeper persists only coordination metadata (Raft log + snapshots), so its PVCs are small
   (`keeper.storageSize`, default `10Gi`) and a replaced voter re-syncs from the quorum.
 - Pin voters to dedicated nodes with `keeper.nodeSelector` / `keeper.tolerations`, same
@@ -414,7 +436,7 @@ helm upgrade --install ao-data-platform charts/ao-data-platform/ -n montecarlo -
 
 For a full post-deploy check, run `hack/verify-deployment-aws.sh -n <namespace> -r <region>` —
 it verifies pods, ClickHouse, the OTel collector, certs, zone spread (replicas/voters in
-distinct AZs), and the NLB/DNS endpoints.
+enough distinct AZs — honoring `keeper.zoneSpread.minDomains` — and on distinct nodes), and the NLB/DNS endpoints.
 
 ## Deploying to Azure (AKS)
 
@@ -483,7 +505,7 @@ with `kubectl get gateway,httproute,certificate -n montecarlo`.
 
 For a full post-deploy check, run `hack/verify-deployment-azure.sh -n <namespace>` — it
 auto-detects gateway vs internal-LB mode and verifies pods, ClickHouse, the OTel collector,
-certs, zone spread (replicas/voters in distinct AZs), and (in gateway mode) the
+certs, zone spread (replicas/voters in enough distinct AZs — honoring `keeper.zoneSpread.minDomains` — and on distinct nodes), and (in gateway mode) the
 Gateway/HTTPRoute/BackendTLSPolicy resources.
 
 ## Deploying to GCP (GKE)
@@ -559,7 +581,7 @@ enabling the gateway with `tls.enabled=false` fails the render. Verify with
 
 For a full post-deploy check, run `hack/verify-deployment-gcp.sh -n <namespace>` — it verifies
 pods, ClickHouse, the OTel collector, certs, StorageClass, zone spread (replicas/voters in
-distinct AZs), and the Gateway/HTTPRoute/BackendTLSPolicy + GCPBackendPolicy/HealthCheckPolicy
+enough distinct AZs — honoring `keeper.zoneSpread.minDomains` — and on distinct nodes), and the Gateway/HTTPRoute/BackendTLSPolicy + GCPBackendPolicy/HealthCheckPolicy
 resources.
 
 ## CI / CD
@@ -849,7 +871,8 @@ helm upgrade ao-data-platform oci://registry-1.docker.io/montecarlodata/ao-data-
 | `clickhouse.hostname` | `""` | If set, adds `external-dns.alpha.kubernetes.io/hostname` annotation to the ClickHouse Service |
 | `clickhouse.service.type` | `ClusterIP` | ClickHouse Service type (`ClusterIP`, `LoadBalancer`) |
 | `clickhouse.service.annotations` | `{}` | Annotations on the ClickHouse Service (e.g. AWS NLB annotations) |
-| `keeper.replicasCount` | `3` | Number of Keeper voters. Should be odd (Raft quorum) and must not exceed the number of availability zones with eligible nodes; 3 for production HA, `1` for dev/single-AZ clusters (the default 3 require nodes in three zones — see the Keeper section). Also sets `minDomains` on the voter zone spread, so a count above the AZ ceiling leaves the excess voters `Pending` permanently rather than packing an AZ. |
+| `keeper.replicasCount` | `3` | Number of Keeper voters. Should be odd (Raft quorum) and must not exceed the number of availability zones with eligible nodes; 3 for production HA, `1` for dev/single-AZ clusters (the default 3 require nodes in three zones — see the Keeper section). Also sets `minDomains` on the voter zone spread (unless `keeper.zoneSpread.minDomains` opts down), so a count above the AZ ceiling leaves the excess voters `Pending` permanently rather than packing an AZ. |
+| `keeper.zoneSpread.minDomains` | `null` | Minimum distinct zones the voters must occupy; `null` means `replicasCount` (one voter per zone). Setting it lower is an explicit reduced-HA opt-out for clusters with fewer AZs than voters — e.g. `2` schedules 3 voters as 2+1 across 2 AZs (never 3+0; the spread stays hard and voters still land on distinct nodes), but losing the 2-voter AZ drops the ensemble below quorum. Must be `1..replicasCount`; out-of-range values fail render. See [Keeper sizing and scheduling](#keeper-sizing-and-scheduling). |
 | `keeper.image` | `clickhouse/clickhouse-keeper:26.4.3` | Keeper image; pinned to track the ClickHouse server release line. |
 | `keeper.storageClass` | `""` | StorageClass for the Keeper PVCs (empty = cluster default). |
 | `keeper.storageSize` | `10Gi` | PVC size per Keeper voter. Keeper stores only Raft log + snapshots, so a small volume is ample. |
@@ -927,8 +950,9 @@ the same node, so no anti-affinity rule is needed.
 
 The Keeper voters follow the same pattern via `keeper.nodeSelector` /
 `keeper.tolerations` (e.g. a `dedicated: keeper` node group). Their one-voter-per-AZ
-topology spread is built into the CHK pod template and is not configurable through
-values — the node groups you pin them to must span the required zones.
+topology spread is built into the CHK pod template — the node groups you pin them to
+must span the required zones; `keeper.zoneSpread.minDomains` is the only knob, and it
+only lowers the zone floor (see [Keeper sizing and scheduling](#keeper-sizing-and-scheduling)).
 
 If you are not partitioning nodes, either set `clickhouse.nodeSelector` +
 `clickhouse.tolerations` to target your own dedicated node group, or restore

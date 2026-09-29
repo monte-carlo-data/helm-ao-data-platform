@@ -439,8 +439,11 @@ spec:
           tolerations:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-          # Hard AZ spread — replicas land in distinct zones (mirrors the CHK
-          # spread in clickhouse-keeper-installation.yaml). No cluster autoscaler
+          # Hard AZ spread — replicas land in distinct zones. Unlike the CHK's
+          # spread (clickhouse-keeper-installation.yaml), this one is strict and
+          # unconditional: there is no zoneSpread.minDomains opt-out for the
+          # ClickHouse replicas, and no per-node anti-affinity (distinct
+          # zones already imply distinct nodes here). No cluster autoscaler
           # in the target environment, so the per-AZ ClickHouse node groups must
           # pre-exist or the second replica stays Pending. DoNotSchedule is
           # deliberate: two replicas in one AZ would silently forfeit the
