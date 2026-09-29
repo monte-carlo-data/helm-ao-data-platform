@@ -581,7 +581,7 @@ jobs:
           # a broken minDomains derivation would let an under-zoned cluster pack an AZ.
           command: |
             facts=$(awk '
-              /^---$/ { chi = 0; chk = 0; zk = 0; set = 0; chcs = 0; kpcs = 0 }
+              /^---$/ { chi = 0; chk = 0; zk = 0; set = 0; chcs = 0; kpcs = 0; kaff = 0 }
               /^kind: "ClickHouseInstallation"$/       { chi = 1 }
               /^kind: "ClickHouseKeeperInstallation"$/ { chk = 1 }
               chi && /^    [a-zA-Z]/   { zk = 0; set = 0 }
@@ -602,6 +602,10 @@ jobs:
               chk && /^              minDomains: /          { print "kpminDomains=" $2; kpcs = 1 }
               chk && kpcs && /^              topologyKey: /       { print "kpkey=" $2 }
               chk && kpcs && /^              whenUnsatisfiable: / { print "kpwhen=" $2; kpcs = 0 }
+              chk && /^            podAntiAffinity:/ { kaff = 1 }
+              chk && kaff && /^              requiredDuringSchedulingIgnoredDuringExecution:/ { print "kpaffreq=1" }
+              chk && kaff && /^                - topologyKey: /                              { print "kpaffkey=" $3 }
+              chk && kaff && /^                      clickhouse-keeper.altinity.com\/chk: /  { print "kpaffsel=" $2; kaff = 0 }
             ' rendered.yaml)
             assert_fact() {
               if ! echo "$facts" | grep -qxF "$1"; then
@@ -629,8 +633,87 @@ jobs:
             assert_fact 'chkey=topology.kubernetes.io/zone'
             assert_fact 'kpwhen=DoNotSchedule'
             assert_fact 'kpkey=topology.kubernetes.io/zone'
+            # The CHK's hostname anti-affinity is the one-voter-per-node guarantee that
+            # keeps co-zoned voters (under a keeper.zoneSpread.minDomains opt-out) off a
+            # shared node. It must stay *required* — kpaffreq only renders on the
+            # requiredDuringScheduling list, so a downgrade to preferred (which packs
+            # instead of Pending) drops the fact — on the hostname key, selecting the
+            # CHK's own voter label.
+            assert_fact 'kpaffreq=1'
+            assert_fact 'kpaffkey=kubernetes.io/hostname'
+            assert_fact 'kpaffsel=otel'
+            if [ "$(echo "$facts" | grep -c '^kpminDomains=')" -ne 1 ]; then
+              echo "Expected exactly one minDomains in the CHK topologySpreadConstraints (on the zone constraint only)."
+              echo "Extracted facts were:"
+              echo "$facts"
+              exit 1
+            fi
             assert_fact 'fourlw="ruok,mntr,srvr,stat,conf"'
             echo "ClickHouse replication wiring rendered correctly."
+      - run:
+          name: Keeper zone-spread override renders, and out-of-range values fail
+          # keeper.zoneSpread.minDomains is the documented reduced-HA opt-out (voters
+          # packed 2+1 across 2 AZs). Assert the override actually reaches the CHK's
+          # zone constraint (a misnamed key would silently render the replicasCount
+          # default — the exact drift the assert above pins for the default path),
+          # that it does NOT leak into the CHI's spread (the opt-out is Keeper-only),
+          # and that the template's render-time validation rejects out-of-range and
+          # non-integer values (0 is rejected by the API server; above replicasCount
+          # demands more zones than there are voters; booleans and strings via --set,
+          # float64s via --set-json — the latter is how a values file delivers
+          # numbers, and what Helm's int would silently truncate) instead of
+          # shipping them to the cluster.
+          command: |
+            helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --set keeper.zoneSpread.minDomains=2 > override.yaml
+            if ! grep -qE '^              minDomains: 2$' override.yaml; then
+              echo "keeper.zoneSpread.minDomains=2 did not reach the rendered CHK zone constraint."
+              exit 1
+            fi
+            # ci/lint-values.yaml sets clickhouse.replicasCount: 3 — the CHI spread
+            # must still derive minDomains from that, untouched by the keeper override.
+            if ! grep -qE '^              minDomains: 3$' override.yaml; then
+              echo "The CHI zone constraint no longer renders minDomains from clickhouse.replicasCount under a keeper-only override."
+              exit 1
+            fi
+            if grep -qE '^              minDomains: 5$' override.yaml; then
+              echo "A rendered minDomains still tracks keeper.replicasCount (5) despite the override."
+              exit 1
+            fi
+            # 6 > the lint-values voter count of 5. true is a bool; 2.9 arrives as
+            # the string "2.9" (--set only types ints/bools/null), covering quoted
+            # string input — the float64 path is the --set-json cases below.
+            for bad in 0 6 true 2.9; do
+              if helm template charts/ao-data-platform \
+                -f charts/ao-data-platform/ci/lint-values.yaml \
+                --set keeper.zoneSpread.minDomains=$bad > /dev/null 2>&1; then
+                echo "Expected the render to fail with keeper.zoneSpread.minDomains=$bad, but it succeeded."
+                exit 1
+              fi
+            done
+            # --set-json delivers real JSON types, matching how a values file
+            # delivers numbers (float64): an integer-valued float64 must be
+            # accepted, and a fractional float64 must fail — it is the only case
+            # that exercises the template's printf float guard, without which
+            # 2.9 would silently truncate to minDomains: 2.
+            # Render to a file rather than piping into grep -q: under CI's
+            # pipefail, grep -q's early exit SIGPIPEs helm and fails the
+            # pipeline even when the line matched.
+            helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --set-json 'keeper.zoneSpread.minDomains=2' > override-json.yaml
+            if ! grep -qE '^              minDomains: 2$' override-json.yaml; then
+              echo "float64 integer keeper.zoneSpread.minDomains=2 (--set-json) was rejected or did not render."
+              exit 1
+            fi
+            if helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --set-json 'keeper.zoneSpread.minDomains=2.9' > /dev/null 2>&1; then
+              echo "Expected the render to fail with float keeper.zoneSpread.minDomains=2.9 (--set-json), but it succeeded."
+              exit 1
+            fi
+            echo "Keeper zone-spread override rendered correctly and invalid values failed."
       - run:
           name: Verify rendered readiness probe and probe-user wiring
           # The /ready chain has several links that drop out silently: the handler
