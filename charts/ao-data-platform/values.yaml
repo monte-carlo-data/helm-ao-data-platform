@@ -24,6 +24,45 @@ clickhouse:
   # excess replicas stay Pending permanently instead of co-locating the way
   # pre-4.3.0 releases allowed.
   replicasCount: 2
+  # Optional scheduled backups; storage and passwords must already exist.
+  backup:
+    enabled: false
+    provider: aws
+    image: altinity/clickhouse-backup:2.8.1
+    aws:
+      bucket: ""
+      region: ""
+      roleArn: ""
+      # Catalog files and native ClickHouse data use separate subdirectories.
+      path: clickhouse
+    serviceAccount:
+      name: clickhouse-backup
+    secret: ao-clickhouse-backup-credentials
+    externalSecret:
+      secretStoreRef:
+        name: ""
+        kind: ClusterSecretStore
+      remoteRef:
+        key: ""
+        property: ""
+        version: ""
+      previousKey: ""
+      refreshInterval: 1h
+    api:
+      # Separate from the rotating database password. Secret key: password.
+      existingSecret: ""
+    schedule:
+      # One job chooses a daily full backup or an increment from that day's full.
+      cron: "0 */4 * * *"
+      image: python:3.14.3-alpine3.23
+      suspend: false
+      timeoutSeconds: 10800
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        memory: 512Mi
   storageClass: ""
   storageSize: 100Gi
   # Data retention, in days, for the telemetry tables — the raw traces, the

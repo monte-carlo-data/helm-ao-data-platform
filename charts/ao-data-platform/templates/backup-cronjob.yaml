@@ -1,0 +1,86 @@
+{{- include "ao-data-platform.backupValidate" . -}}
+{{- if .Values.clickhouse.backup.enabled }}
+{{- $b := .Values.clickhouse.backup }}
+{{- $endpoints := list }}
+{{- range $replica := until (int (min 2 .Values.clickhouse.replicasCount)) }}
+{{- $endpoints = append $endpoints (printf "http://%s-backup-%d:7171" (include "ao-data-platform.chiName" $) $replica) }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ao-data-platform.chiName" . }}-backup-job
+  labels:
+    {{- include "ao-data-platform.labels" . | nindent 4 }}
+data:
+  run_backup.py: |
+    {{- .Files.Get "files/clickhouse-backup/run_backup.py" | nindent 4 }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "ao-data-platform.chiName" . }}-backup
+  labels:
+    {{- include "ao-data-platform.labels" . | nindent 4 }}
+spec:
+  schedule: {{ $b.schedule.cron | quote }}
+  timeZone: Etc/UTC
+  suspend: {{ $b.schedule.suspend }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 900
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # A lost API response may still have started a backup. Never blindly retry.
+      backoffLimit: 0
+      activeDeadlineSeconds: {{ add (int $b.schedule.timeoutSeconds) 60 }}
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/instance: {{ .Release.Name }}
+            app.kubernetes.io/component: clickhouse-backup-job
+        spec:
+          automountServiceAccountToken: false
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: backup
+              image: {{ $b.schedule.image | quote }}
+              command: ["python3", "/scripts/run_backup.py"]
+              env:
+                - name: BACKUP_ENDPOINTS
+                  value: {{ $endpoints | toJson | quote }}
+                - name: BACKUP_PASSWORD_FILE
+                  value: /credentials/password
+                - name: BACKUP_TIMEOUT_SECONDS
+                  value: {{ $b.schedule.timeoutSeconds | quote }}
+                - name: PYTHONDONTWRITEBYTECODE
+                  value: "1"
+              volumeMounts:
+                - name: script
+                  mountPath: /scripts
+                  readOnly: true
+                - name: credentials
+                  mountPath: /credentials
+                  readOnly: true
+              resources:
+                requests: {cpu: 25m, memory: 32Mi}
+                limits: {memory: 128Mi}
+              securityContext:
+                readOnlyRootFilesystem: true
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
+          volumes:
+            - name: script
+              configMap:
+                name: {{ include "ao-data-platform.chiName" . }}-backup-job
+            - name: credentials
+              secret:
+                secretName: {{ $b.api.existingSecret }}
+{{- end }}

@@ -1,0 +1,25 @@
+# Render-test placeholders only; never deploy this file.
+clickhouse:
+  replicasCount: 2
+  backup:
+    enabled: true
+    aws:
+      bucket: ao-backup-render-test
+      region: us-west-1
+      roleArn: arn:aws:iam::123456789012:role/ao-backup-render-test
+      path: render-test
+    serviceAccount:
+      name: ci-clickhouse-backup
+    externalSecret:
+      secretStoreRef:
+        name: ci-placeholder
+      remoteRef:
+        key: ci-backup-current
+        property: password
+        version: AWSCURRENT
+      previousKey: ci-backup-previous
+    api:
+      existingSecret: ci-backup-api
+
+gateway:
+  enabled: false

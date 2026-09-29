@@ -1,0 +1,23 @@
+{{- include "ao-data-platform.backupValidate" . -}}
+{{- if .Values.clickhouse.backup.enabled }}
+{{- range $replica := until (int (min 2 $.Values.clickhouse.replicasCount)) }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ao-data-platform.chiName" $ }}-backup-{{ $replica }}
+  labels:
+    {{- include "ao-data-platform.labels" $ | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    clickhouse.altinity.com/chi: {{ include "ao-data-platform.chiName" $ }}
+    clickhouse.altinity.com/cluster: otel
+    clickhouse.altinity.com/shard: "0"
+    clickhouse.altinity.com/replica: {{ $replica | quote }}
+  ports:
+    - name: backup-api
+      port: 7171
+      targetPort: backup-api
+{{- end }}
+{{- end }}

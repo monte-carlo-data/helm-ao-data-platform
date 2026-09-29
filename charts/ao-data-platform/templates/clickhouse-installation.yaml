@@ -6,6 +6,7 @@
    so enforcing the same guard the gateway-*.yaml files use keeps an isolated render of just
    this file from silently emitting a wrong/absent appProtocol for an invalid provider. */ -}}
 {{- include "ao-data-platform.gatewayValidate" . -}}
+{{- include "ao-data-platform.backupValidate" . -}}
 apiVersion: "clickhouse.altinity.com/v1"
 kind: "ClickHouseInstallation"
 metadata:
@@ -82,6 +83,17 @@ spec:
         <clickhouse>
           <include_from>{{ include "ao-data-platform.authMethodsSecretPath" . }}</include_from>
           <users>
+            {{- if .Values.clickhouse.backup.enabled }}
+            <backup>
+              <networks><ip>127.0.0.1</ip><ip>::1</ip></networks>
+              <grants>
+                <query>GRANT BACKUP ON otel_traces.*</query>
+                <query>GRANT SHOW TABLES, SHOW DATABASES ON otel_traces.*</query>
+                <query>GRANT SELECT ON system.*</query>
+              </grants>
+              <auth_methods incl="backup_auth_methods"/>
+            </backup>
+            {{- end }}
             <!-- otel — the OTel collector ingest identity. Writes raw telemetry into
                  otel_traces.otel_traces. The MV cascade runs as schema_owner (the MV
                  DEFINER), so otel needs nothing on the normalized targets. -->
@@ -323,6 +335,10 @@ spec:
             <defaults/>
           </http_handlers>
         </clickhouse>
+      {{- if .Values.clickhouse.backup.enabled }}
+      config.d/backup.xml: |
+        {{- include "ao-data-platform.backupDisk" . | nindent 8 }}
+      {{- end }}
       {{- if .Values.tls.enabled }}
       server.crt:
         valueFrom:
@@ -385,6 +401,17 @@ spec:
     podTemplates:
       - name: clickhouse
         spec:
+          {{- if .Values.clickhouse.backup.enabled }}
+          serviceAccountName: {{ .Values.clickhouse.backup.serviceAccount.name }}
+          automountServiceAccountToken: false
+          volumes:
+            - name: backup-config
+              secret:
+                secretName: {{ .Values.clickhouse.backup.secret }}
+                items:
+                  - key: config.yml
+                    path: config.yml
+          {{- end }}
           # `image` is required whenever this podTemplate emits a containers[]
           # entry — the Altinity operator does not merge container spec defaults.
           containers:
@@ -431,6 +458,9 @@ spec:
                 periodSeconds: 10
                 timeoutSeconds: 5
                 failureThreshold: 3
+            {{- if .Values.clickhouse.backup.enabled }}
+            {{- include "ao-data-platform.backupContainer" . | nindent 12 }}
+            {{- end }}
           {{- with .Values.clickhouse.nodeSelector }}
           nodeSelector:
             {{- toYaml . | nindent 12 }}

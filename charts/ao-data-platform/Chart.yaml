@@ -1,9 +1,8 @@
 apiVersion: v2
 name: ao-data-platform
 description: Monte Carlo data platform — ClickHouse, OTel collector, and schema management
-# 5.1.0 — keeper.zoneSpread.minDomains reduced-HA opt-out + per-node voter anti-affinity
-# (rolls the Keeper voters once); see README "Upgrading to 5.1.0".
-version: 5.1.0
+# 5.2.0 adds optional scheduled ClickHouse backups; disabled by default.
+version: 5.2.0
 type: application
 # minDomains on the ClickHouse/Keeper zone topologySpreadConstraints is GA in
 # Kubernetes 1.30. Declare the floor so a render/install against an older API

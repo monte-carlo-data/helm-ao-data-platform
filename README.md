@@ -2,6 +2,9 @@
 
 Helm chart for the Monte Carlo data plane for Agent Observability.
 
+Optional scheduled ClickHouse backups are available in chart 5.2.0. See
+[backup setup and checks](docs/clickhouse-backups.md). They are disabled by default.
+
 ## Chart
 
 ### ao-data-platform
