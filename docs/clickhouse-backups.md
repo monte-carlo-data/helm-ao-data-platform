@@ -58,6 +58,8 @@ logs before retrying; concurrent or automatic retries could duplicate work.
 Before calling the installation complete, check a scheduled full and incremental
 backup, an incremental on copy 1 based on copy 0's full, and denied API access
 from an unrelated pod. Local tests do not prove AWS permissions or network rules.
+Follow [the live backup test steps](verify-clickhouse-backups.md) and record the
+backup names and results in the issue.
 
 Retention and alerts belong to AO-1300. Automatic deletion is off, including S3
 expiry, because newer backups can depend on older files. Restore drills belong
