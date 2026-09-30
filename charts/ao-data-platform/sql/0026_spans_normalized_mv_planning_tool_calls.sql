@@ -11,8 +11,13 @@
 --     message and its tool calls.
 --
 -- Keep the text arms and the tool_calls arm in lockstep with the read
--- query's completion (Snowflake side). The cortex_search/cortex_analyst
--- arms and the nullIf wrappers stay MV-only, as 0021 describes.
+-- template's completion (monolith agent_observability_queries.yaml,
+-- ``native``). Two differences are deliberate; do not sync them away:
+--   * The cortex_search/cortex_analyst arms fold tool-span content into the
+--     completion, because spans_normalized has no tool I/O columns. Removing
+--     them drops all Cortex tool-span content from ClickHouse.
+--   * The nullIf wrappers treat '' as absent. The read template's bare casts
+--     let '' win, which is a latent bug on that side.
 --
 -- All added expressions are total, so the MV never raises. Output columns
 -- are unchanged.

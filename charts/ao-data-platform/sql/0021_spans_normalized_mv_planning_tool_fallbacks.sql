@@ -10,8 +10,7 @@
 -- pre-planning-tool-calls SELECT for the window between it and 0026, and
 -- because the view is insert-triggered and forward-only, a Cortex planning
 -- tool-use span ingested in that window keeps the superseded rendering
--- permanently. Measured on a two-replica cluster: the equivalent flip-flop
--- when 0020 was superseded by this file.
+-- permanently. Measured on a two-replica cluster when 0020 superseded 0019.
 --
 -- The file is retained (not deleted) to hold the numbering, so this ordinal
 -- is never reused, the relative order of files mirrored from the source
@@ -39,12 +38,6 @@
 --   3. The last two arms (agent.tool.cortex_search.results,
 --      agent.tool.cortex_analyst.text) were an MV-only fold of the tool
 --      namespace, deliberately absent from the read query.
---
--- SIZE (historical): tool_execution.results was tool-controlled and copied
--- verbatim, so completions[].message was unbounded here too. 0026 drops that
--- arm from the completion text (tool_execution.results is the turn's
--- cumulative input, not this step's output) in favor of a structured
--- tool_calls arm.
 --
 -- Every expression it added was total (never raises), preserving this
 -- view's headline invariant: a raising SELECT expression fails the source
