@@ -664,6 +664,7 @@ to the normalized target tables. The stock `default` superuser is removed.
 | `probe` | `system.replicas` + table visibility (`SHOW TABLES` on `otel_traces.*`; no data reads) | — (`readonly=2` profile) | the `/ready` readiness handler (see [Writer-safe readiness](#writer-safe-readiness-ready)) | always (passwordless; no ExternalSecret) |
 | `readonly_user` | reader bundle¹ | — (`readonly=2`, so JDBC `SET` works) | humans / MCP / JDBC clients | `clickhouse.readonlyUser.enabled=true` |
 | `backup` | `SELECT ON system.*` (including all users' query log text); `SHOW TABLES` / `SHOW DATABASES` on `otel_traces.*` | `BACKUP` on `otel_traces.*`; no restore or table changes | backup container over loopback only | `clickhouse.backup.enabled=true` |
+| `backup_probe` | `SELECT ON system.replicas`; `SHOW TABLES` / `SHOW DATABASES` on `otel_traces.*`; no table data | — | scheduled backup Job, to check whether a replica has caught up | `clickhouse.backup.enabled=true` |
 | `admin` | all | all + user management + `SYSTEM` | break-glass DBA (not service-to-service; loopback-only by default) | `clickhouse.admin.enabled=true` |
 
 ¹ **reader bundle** = `SELECT` on `otel_traces.*`, `system.tables/parts/query_log`,
@@ -688,8 +689,9 @@ construction and the broadest grant in the release; the per-caller network ACL i
 what scopes who can wield it. `SYSTEM SYNC REPLICA` backs the exact-guarantee read in the
 watermark note above.
 
-Each password-backed user has an ExternalSecret sourcing its password from your secret store (see the
-per-user `*.externalSecret` values below). Network *reachability* is typically restricted one layer
+Each password-backed database user has an ExternalSecret sourcing its password from your secret store
+(see the per-user `*.externalSecret` values below). Backup and probe users have separate
+optional authentication files; their secret-store failures do not block the shared user bundle. Network *reachability* is typically restricted one layer
 up at the load balancer; per-caller CH-user-level network scoping is handled separately.
 
 `monte_carlo` can now write a source table (`conversations_normalized`, for the turn rollup), not
@@ -706,12 +708,15 @@ set `clickhouse.readonlyUser.enabled=true` to use them.
 
 ### ClickHouse credential rotation (chart 5.0.0+)
 
-The chart renders each password-backed user's auth as an `<auth_methods>` element substituted
+The chart renders the main database users' auth as `<auth_methods>` elements substituted
 from a single ESO-assembled Secret (`ao-clickhouse-auth-methods`, mounted at
 `/etc/clickhouse-server/secrets.d/auth-methods.xml/<secret>/auth.xml`). That element can hold
 **two** valid passwords for a user at once, which is what makes rotation downtime-free: add the
 new password while the old one still works, then retire the old one after every client has
-re-read its credentials.
+re-read its credentials. The optional `backup` and `backup_probe` users use the same
+two-password process in separate Secrets and separate XML user stores; a failed
+backup Secret lookup does not freeze the main bundle. The backup API has a separate
+revision-controlled pod roll, described in [backup setup](docs/clickhouse-backups.md).
 
 The secret-store layout is two secrets per user:
 
@@ -898,29 +903,33 @@ helm upgrade ao-data-platform oci://registry-1.docker.io/montecarlodata/ao-data-
 | `clickhouse.readonlyUser.externalSecret.previousKey` | `""` | Previous-password key for `readonly_user` — same semantics as `clickhouse.otel.externalSecret.previousKey`. |
 | `clickhouse.backup.enabled` | `false` | Install scheduled backups, the backup database user, and a container in every ClickHouse pod. Enabling rolls the pods; see [backup setup](docs/clickhouse-backups.md). |
 | `clickhouse.backup.provider` | `aws` | Backup storage provider; only AWS is supported. |
-| `clickhouse.backup.image` | `altinity/clickhouse-backup:2.8.1` | Backup container image, not the Job runner. Changing it rolls ClickHouse pods. |
+| `clickhouse.backup.sidecar.image` | `""` | Required digest-pinned patched backup image; see [image build](images/clickhouse-backup/). Changing it rolls ClickHouse pods. |
 | `clickhouse.backup.aws.bucket` | `""` | Existing S3 backup bucket; required when enabled. |
 | `clickhouse.backup.aws.region` | `""` | Bucket's AWS region; required when enabled. |
 | `clickhouse.backup.aws.roleArn` | `""` | Existing IRSA role ARN; required when enabled. Both ClickHouse and the backup container use this role. |
 | `clickhouse.backup.aws.path` | `clickhouse` | S3 prefix: native backup data uses `<path>/native/`, and the catalog uses `<path>/catalog/`. Neither prefix may have lifecycle expiration. |
 | `clickhouse.backup.serviceAccount.name` | `clickhouse-backup` | Dedicated Kubernetes ServiceAccount created by the chart and named in the role's trust policy; cannot be `default`. |
-| `clickhouse.backup.secret` | `ao-clickhouse-backup-credentials` | Kubernetes Secret created by External Secrets for the database password and backup configuration. This is separate from the API password Secret. |
-| `clickhouse.backup.externalSecret.secretStoreRef.name` | `""` | Store for the backup database password; required when enabled. |
-| `clickhouse.backup.externalSecret.secretStoreRef.kind` | `ClusterSecretStore` | Kind of the backup password store reference. |
-| `clickhouse.backup.externalSecret.remoteRef.key` | `""` | External secret key holding the backup database password; required when enabled. |
-| `clickhouse.backup.externalSecret.remoteRef.property` | `""` | Property within a JSON secret (optional). |
-| `clickhouse.backup.externalSecret.remoteRef.version` | `""` | Version of the backup database secret (required for Fake provider). |
-| `clickhouse.backup.externalSecret.refreshInterval` | `1h` | How often External Secrets syncs the backup database password and configuration. |
-| `clickhouse.backup.externalSecret.previousKey` | `""` | Previous database-password key; follows `clickhouse.otel.externalSecret.previousKey`. Does not rotate the API password. |
-| `clickhouse.backup.api.existingSecret` | `""` | Existing Secret in the release namespace with the separate API `password` key; required when enabled. Rotation requires a ClickHouse pod roll; see [credential limitations](docs/clickhouse-backups.md#install-with-the-schedule-paused). |
+| `clickhouse.backup.user.secret` | `ao-clickhouse-backup-credentials` | Kubernetes Secret created by External Secrets for the database password and backup configuration. This is separate from the API password Secret. |
+| `clickhouse.backup.user.externalSecret.secretStoreRef.name` | `""` | Store for the backup database password; required when enabled. |
+| `clickhouse.backup.user.externalSecret.secretStoreRef.kind` | `ClusterSecretStore` | Kind of the backup password store reference. |
+| `clickhouse.backup.user.externalSecret.remoteRef.key` | `""` | External secret key holding the backup database password; required when enabled. |
+| `clickhouse.backup.user.externalSecret.remoteRef.property` | `""` | Property within a JSON secret (optional). |
+| `clickhouse.backup.user.externalSecret.remoteRef.version` | `""` | Version of the backup database secret (required for Fake provider). |
+| `clickhouse.backup.user.externalSecret.refreshInterval` | `1h` | How often External Secrets syncs the backup database password and configuration. |
+| `clickhouse.backup.user.externalSecret.previousKey` | `""` | Previous database-password key; follows `clickhouse.otel.externalSecret.previousKey`. Does not rotate the API password. |
+| `clickhouse.backup.probe.secret` | `ao-clickhouse-backup-probe-credentials` | Separate Kubernetes Secret for the authenticated replica-freshness probe. Missing or empty credentials disable this user without blocking ClickHouse startup. |
+| `clickhouse.backup.probe.externalSecret.*` | same shape as `backup.user.externalSecret.*` | Store reference, current and optional previous password keys, and refresh interval for `backup_probe`. Required when backups are enabled. |
+| `clickhouse.backup.api.existingSecret` | `""` | Existing Secret containing separate API `password` and `revision` keys. Set exactly one of this value or `api.externalSecret`. |
+| `clickhouse.backup.api.passwordRevision` | `""` | Required revision matching the API Secret. Changing it rolls ClickHouse pods; Jobs refuse to send credentials during mismatched revisions. See [API rotation](docs/clickhouse-backups.md#install-with-the-schedule-paused). |
+| `clickhouse.backup.api.externalSecret` | `null` | Optional `secretStoreRef`, `remoteRef`, and `refreshInterval` (`1h` default). Source JSON must contain both `password` and `revision`; omit `remoteRef.property`. Creates `otel-backup-api`, independently of database credentials. |
 | `clickhouse.backup.schedule.cron` | `0 */4 * * *` | UTC schedule. The first successful run each day is full; later runs use that full as their base. |
 | `clickhouse.backup.schedule.suspend` | `false` | Pause new scheduled Jobs. Does not stop existing work or prevent the installation's pod roll; set `true` for initial setup. |
 | `clickhouse.backup.schedule.timeoutSeconds` | `10800` | Job wait and backup tool's ClickHouse timeout, in seconds; minimum 60. Leave time before the next run or `Forbid` can skip scheduled Jobs. |
 | `clickhouse.backup.schedule.startingDeadlineSeconds` | `900` | Latest allowed start after a missed scheduled time, in seconds. |
 | `clickhouse.backup.schedule.image` | `python:3.14.3-alpine3.23` | Backup Job runner image; changing it does not roll ClickHouse pods. |
 | `clickhouse.backup.schedule.resources` | requests: `25m` CPU / `32Mi` memory; limit: `128Mi` memory | Backup Job resources. |
-| `clickhouse.backup.resources` | requests: `100m` CPU / `128Mi` memory; limit: `512Mi` memory | Backup container resources; changing these rolls ClickHouse pods. |
-| `clickhouse.backup.goMemoryLimit` | `400MiB` | Go's soft memory target for the backup container. Keep it below `clickhouse.backup.resources.limits.memory`. |
+| `clickhouse.backup.sidecar.resources` | requests: `100m` CPU / `128Mi` memory; limit: `512Mi` memory | Backup container resources; changing these rolls ClickHouse pods. |
+| `clickhouse.backup.sidecar.goMemoryLimit` | `400MiB` | Go's soft memory target for the backup container. Keep it below `clickhouse.backup.sidecar.resources.limits.memory`. |
 | `clickhouse.backup.networkPolicy.additionalPorts` | `[]` | Extra TCP listeners allowed from all sources when backups are enabled. Port 7171 is reserved for backup Jobs and rejected here; requires NetworkPolicy enforcement. |
 | `clickhouse.authMethods.secret` | `ao-clickhouse-auth-methods` | Name of the K8s Secret (created by ESO) holding the assembled auth-methods substitution file. |
 | `clickhouse.authMethods.externalSecret.secretStoreRef.name` | `""` (→ `otel`'s) | Store for the bundle ExternalSecret; defaults to the `otel` user's store when empty. |

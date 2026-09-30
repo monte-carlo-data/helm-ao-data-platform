@@ -287,9 +287,6 @@ templates/clickhouse-installation.yaml, and the user lists in .circleci/config.y
 {{- if .Values.clickhouse.readonlyUser.enabled -}}
 {{- $users = append $users (dict "ch" "readonly_user" "cfg" .Values.clickhouse.readonlyUser) -}}
 {{- end -}}
-{{- if .Values.clickhouse.backup.enabled -}}
-{{- $users = append $users (dict "ch" "backup" "cfg" .Values.clickhouse.backup) -}}
-{{- end -}}
 {{- toJson $users -}}
 {{- end }}
 

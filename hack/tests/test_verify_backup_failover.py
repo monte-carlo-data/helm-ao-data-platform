@@ -49,10 +49,12 @@ class CopyAPI:
         self.local = {FULL:metadata(location="local")} if first else {}
         self.history = [{"command":"create_remote " + FULL, "status":"success", "operation_id":"full-id"}] if first else []
         self.posts = []
+        self.calls = []
         self.unavailable = unavailable
         self.fail_post = False
 
     def request(self, method, path, query=None):
+        self.calls.append((method, path, query))
         if self.unavailable:
             raise scheduler.BackupError("not reachable")
         if method == "POST":
@@ -81,26 +83,42 @@ class CopyAPI:
         raise AssertionError(path)
 
 
+class ProbeAPI:
+    def __init__(self):
+        self.delay = 0
+
+    def request(self, method, path, query=None):
+        return [{"database": "otel_traces", "table": "spans", "engine": "ReplicatedMergeTree",
+                 "replica_table": "spans", "is_readonly": 0, "is_session_expired": 0,
+                 "inserts_in_queue": 0, "absolute_delay": self.delay}]
+
+
 class PodTests(unittest.TestCase):
     def setUp(self):
         self.remote = {FULL:metadata()}
         self.copies = [CopyAPI(self.remote, first=True), CopyAPI(self.remote)]
+        self.probes = [ProbeAPI(), ProbeAPI()]
+        self.revision_failure = None
 
     def run_pod(self, expected=FULL):
         fake_datetime = types.ModuleType("datetime")
         fake_datetime.__dict__.update(vars(importlib.import_module("datetime")))
         fake_datetime.datetime = FrozenDateTime
         endpoints = {"http://copy0:7171":self.copies[0], "http://copy1:7171":self.copies[1],
-                     "http://127.0.0.1:1":CopyAPI(self.remote, unavailable=True)}
+                     "http://copy0:8123":self.probes[0], "http://copy1:8123":self.probes[1]}
         environment = {"VERIFY_EXPECTED_FULL":expected, "VERIFY_TIMEOUT_SECONDS":"600",
                        "VERIFY_SCRIPT_SHA256":hashlib.sha256(b"installed scheduler").hexdigest(),
-                       "BACKUP_ENDPOINTS":json.dumps(list(endpoints)[:2]), "BACKUP_PASSWORD_FILE":"/credentials/password"}
+                       "BACKUP_ENDPOINTS":json.dumps(list(endpoints)[:2]), "BACKUP_PASSWORD_FILE":"/credentials/password",
+                       "BACKUP_DATABASE_ENDPOINTS": json.dumps(list(endpoints)[2:]),
+                       "BACKUP_PASSWORD_REVISION": "revision-1", "POD_NAMESPACE": "test",
+                       "BACKUP_POD_SELECTOR": "test=clickhouse"}
         output = io.StringIO()
         with mock.patch.dict(sys.modules, {"run_backup":scheduler, "datetime":fake_datetime}), \
                 mock.patch.dict(helper.os.environ, environment, clear=True), \
                 mock.patch.object(Path, "read_text", return_value="do-not-log-this-password"), \
                 mock.patch.object(Path, "read_bytes", return_value=b"installed scheduler"), \
-                mock.patch.object(scheduler, "API", side_effect=lambda endpoint, *args:endpoints[endpoint]), \
+                mock.patch.object(scheduler, "API", side_effect=lambda endpoint, *args, **kwargs:endpoints[endpoint]), \
+                mock.patch.object(scheduler, "PasswordRevisionGuard", return_value=mock.Mock(side_effect=self.revision_failure)), \
                 redirect_stdout(output):
             try:
                 exec(helper.POD_SCRIPT, {})
@@ -125,6 +143,18 @@ class PodTests(unittest.TestCase):
         self.assertEqual(result["required"], FULL)
         self.assertEqual(self.copies[0].posts, [])
         self.assertEqual([p[0] for p in self.copies[1].posts], ["/backup/download/" + FULL, "/backup/create_remote"])
+
+    def test_helper_cannot_bypass_password_revision_guard(self):
+        self.revision_failure = scheduler.RevisionError("Password revision changed.")
+        self.assert_inconclusive(self.run_pod(), "Password revision changed.")
+        self.assertEqual(self.copies[0].calls + self.copies[1].calls, [])
+
+    def test_helper_cannot_back_up_a_copy_that_is_behind(self):
+        self.probes[1].delay = 1
+        self.assert_inconclusive(
+            self.run_pod(),
+            "No ClickHouse copy is caught up and able to list the trace tables and remote backups.")
+        self.assertEqual(self.copies[0].posts + self.copies[1].posts, [])
 
     def test_wrong_full_fails_before_any_post(self):
         self.assert_inconclusive(

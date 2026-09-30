@@ -61,10 +61,7 @@ try:
     now = window()
     endpoints = json.loads(os.environ["BACKUP_ENDPOINTS"])
     check(len(endpoints) == 2 and endpoints[0] != endpoints[1], "Two distinct backup endpoints are required.")
-    password = Path(os.environ["BACKUP_PASSWORD_FILE"]).read_text()
-    check(bool(password), "The mounted API password is empty.")
-    username = os.environ.get("BACKUP_API_USERNAME", "backup")
-    real = [b.API(endpoint, username, password) for endpoint in endpoints]
+    real, probes = b.configured_clients()
     for api in real: actions(api)
     before = catalog(real[0], "remote")
     check(catalog(real[1], "remote") == before, "The copies disagree about remote backups.")
@@ -81,7 +78,10 @@ try:
     for api in real:
         check(catalog(api, "remote") == before, "The remote catalog changed during preflight.")
     selected = []
-    scheduler = b.Scheduler([b.API("http://127.0.0.1:1", username, password), real[1]],
+    class UnreachableCopy:
+        def request(self, *args, **kwargs):
+            raise b.BackupError("Copy 0 is unavailable for this controlled test.")
+    scheduler = b.Scheduler([UnreachableCopy(), real[1]], probes,
                             timeout=timeout - 30, poll_seconds=5)
     choose = scheduler.choose_copy
     def choose_copy():

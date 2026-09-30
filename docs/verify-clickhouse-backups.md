@@ -33,8 +33,8 @@ kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" logs \
 A successful job has `1/1` completions and logs `Verified completed full backup
 ... in S3.` or `Verified completed incremental backup ... in S3.` Record the job
 name and backup name. A folder in S3 or a changed last-scheduled time only shows
-that work started. The catalog check does not prove replica freshness or that
-restoring the data will succeed.
+that work started. The scheduler checks replica freshness before submission; the completed
+catalog check still does not prove that restoring the data will succeed.
 
 The first successful run each UTC day is full. Later runs that day are
 incremental. A manual test does not replace checking that the clock starts a
@@ -44,7 +44,7 @@ successful incremental run.
 
 Inside each ClickHouse copy, make a request without a password. Every command
 must report `401 Unauthorized`; a nonzero exit code is expected. Do not test with
-a real incorrect password: clickhouse-backup 2.8.1 logs failed credentials.
+a real incorrect password, and use the required patched helper image.
 
 ```bash
 for ((copy=0; copy<REPLICA_COUNT; copy++)); do

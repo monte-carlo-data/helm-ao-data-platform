@@ -1,0 +1,273 @@
+--- a/pkg/server/server.go
++++ b/pkg/server/server.go
+@@ -86,9 +86,12 @@
+ 	for {
+ 		cfg, err = config.LoadConfig(configPath)
+ 		if err != nil {
+-			log.Error().Stack().Err(err).Send()
++			log.Error().Msg("Backup server configuration is unavailable or invalid.")
+ 			time.Sleep(5 * time.Second)
+ 			continue
++		}
++		if err = config.ValidateServerCredentials(cfg); err != nil {
++			return err
+ 		}
+ 		ch := clickhouse.NewClickHouse(&cfg.ClickHouse)
+ 		if connErr := ch.Connect(); connErr != nil {
+@@ -303,10 +306,18 @@
+ 
+ func (api *APIServer) basicAuthMiddleware(next http.Handler) http.Handler {
+ 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		// Route templates contain no user-supplied backup names or query values.
++		// Never log the URL, Authorization header, username, or password.
++		routeName := "unmatched"
++		if route := mux.CurrentRoute(r); route != nil {
++			if template, err := route.GetPathTemplate(); err == nil {
++				routeName = template
++			}
++		}
+ 		if r.URL.Path != "/metrics" {
+-			log.Info().Msgf("API call %s %s", r.Method, r.URL.Path)
++			log.Info().Str("route", routeName).Msg("API request")
+ 		} else {
+-			log.Debug().Msgf("API call %s %s", r.Method, r.URL.Path)
++			log.Debug().Str("route", routeName).Msg("API request")
+ 		}
+ 		user, pass, _ := r.BasicAuth()
+ 		query := r.URL.Query()
+@@ -316,8 +327,9 @@
+ 		if p, exist := query["pass"]; exist {
+ 			pass = p[0]
+ 		}
+-		if (user != api.GetConfig().API.Username) || (pass != api.GetConfig().API.Password) {
+-			log.Warn().Msgf("%s %s Authorization failed %s:%s", r.Method, r.URL, user, pass)
++		cfg := api.GetConfig()
++		if cfg.API.Username == "" || cfg.API.Password == "" || user != cfg.API.Username || pass != cfg.API.Password {
++			log.Warn().Str("route", routeName).Int("status", http.StatusUnauthorized).Msg("API authentication failed")
+ 			w.Header().Set("WWW-Authenticate", "Basic realm=\"Provide username and password\"")
+ 			w.WriteHeader(http.StatusUnauthorized)
+ 			if _, err := w.Write([]byte("401 Unauthorized\n")); err != nil {
+@@ -2916,8 +2928,14 @@
+ 
+ func (api *APIServer) ReloadConfig(w http.ResponseWriter, command string) (*config.Config, error) {
+ 	cfg, err := config.LoadConfig(api.configPath)
+-	if err != nil {
+-		log.Error().Msgf("config.LoadConfig(%s) return error: %v", api.configPath, err)
++	if err == nil {
++		err = config.ValidateServerCredentials(cfg)
++	}
++	if err != nil {
++		// YAML errors can include Secret contents. Keep both logs and API errors
++		// generic, and retain the previous valid configuration.
++		err = errors.New("backup server configuration is unavailable or invalid")
++		log.Error().Msg(err.Error())
+ 		if w != nil {
+ 			api.writeError(w, http.StatusInternalServerError, command, err)
+ 		}
+--- /dev/null
++++ b/pkg/server/api_security_test.go
+@@ -0,0 +1,104 @@
++package server
++
++import (
++	"bytes"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/Altinity/clickhouse-backup/v2/pkg/config"
++	"github.com/gorilla/mux"
++	"github.com/rs/zerolog"
++	"github.com/rs/zerolog/log"
++)
++
++func TestBackupAPIAuthDoesNotLogCredentials(t *testing.T) {
++	for _, tc := range []struct {
++		name, username, password, query, rawHeader string
++		configUser, configPassword                 string
++		want                                       int
++	}{
++		{name: "wrong header password", username: "header-user-secret", password: "wrong-header-secret", want: 401},
++		{name: "wrong query password", query: "?user=query-user-secret&pass=wrong-query-secret", want: 401},
++		{name: "malformed header", rawHeader: "Basic malformed-header-secret", want: 401},
++		{name: "no credentials", want: 401},
++		{name: "valid header", username: "configured-user-secret", password: "configured-password-secret", want: 204},
++		{name: "valid query", query: "?user=configured-user-secret&pass=configured-password-secret", want: 204},
++		{name: "empty configured password", username: "configured-user-secret", configPassword: "empty", want: 401},
++		{name: "empty configured username", password: "configured-password-secret", configUser: "empty", want: 401},
++		{name: "empty configured credentials", configUser: "empty", configPassword: "empty", want: 401},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			var output bytes.Buffer
++			original := log.Logger
++			log.Logger = zerolog.New(&output)
++			t.Cleanup(func() { log.Logger = original })
++			cfg := config.DefaultConfig()
++			cfg.API.Username, cfg.API.Password = "configured-user-secret", "configured-password-secret"
++			if tc.configUser == "empty" {
++				cfg.API.Username = ""
++			}
++			if tc.configPassword == "empty" {
++				cfg.API.Password = ""
++			}
++			api := &APIServer{config: cfg}
++			router := mux.NewRouter()
++			router.Use(api.basicAuthMiddleware)
++			router.HandleFunc("/backup/status/{name}", func(w http.ResponseWriter, r *http.Request) {
++				w.WriteHeader(http.StatusNoContent)
++			})
++			request := httptest.NewRequest(http.MethodGet, "http://api/backup/status/path-secret"+tc.query, nil)
++			if tc.username != "" || tc.password != "" {
++				request.SetBasicAuth(tc.username, tc.password)
++			}
++			if tc.rawHeader != "" {
++				request.Header.Set("Authorization", tc.rawHeader)
++			}
++			response := httptest.NewRecorder()
++			router.ServeHTTP(response, request)
++			if response.Code != tc.want {
++				t.Fatalf("status = %d, want %d", response.Code, tc.want)
++			}
++			for _, secret := range []string{"configured-user-secret", "configured-password-secret", "header-user-secret", "wrong-header-secret", "query-user-secret", "wrong-query-secret", "malformed-header-secret", "path-secret", "?user=", "http://api"} {
++				if strings.Contains(output.String(), secret) {
++					t.Fatalf("request or configured credential appeared in logs")
++				}
++			}
++			if !strings.Contains(output.String(), "/backup/status/{name}") {
++				t.Fatal("logs should identify the route template")
++			}
++			if tc.want == 401 && !strings.Contains(output.String(), `"status":401`) {
++				t.Fatal("logs should identify the refusal status")
++			}
++		})
++	}
++}
++
++func TestBackupAPIRejectsEmptyReloadCredentials(t *testing.T) {
++	for _, key := range []string{"api", "clickhouse"} {
++		t.Run(key, func(t *testing.T) {
++			path := filepath.Join(t.TempDir(), "config.yml")
++			contents := "general:\n  disable_environment_override: true\napi:\n  username: backup\n  password: api-secret\nclickhouse:\n  username: backup\n  password: database-secret\n"
++			if key == "api" {
++				contents = strings.Replace(contents, "password: api-secret", `password: ""`, 1)
++			} else {
++				contents = strings.Replace(contents, "password: database-secret", `password: ""`, 1)
++			}
++			if err := os.WriteFile(path, []byte(contents), 0600); err != nil {
++				t.Fatal(err)
++			}
++			previous := config.DefaultConfig()
++			previous.API.Username, previous.API.Password = "backup", "previous-secret"
++			api := &APIServer{config: previous, configPath: path}
++			if _, err := api.ReloadConfig(nil, "test"); err == nil {
++				t.Fatal("empty reloaded credentials were accepted")
++			}
++			if api.GetConfig() != previous {
++				t.Fatal("invalid configuration replaced the prior valid configuration")
++			}
++		})
++	}
++}
+--- a/pkg/config/config.go
++++ b/pkg/config/config.go
+@@ -646,6 +646,18 @@
+ 	return cfg, nil
+ }
+ 
++// ValidateServerCredentials prevents the API from using empty defaults, even
++// when it is started directly instead of through the chart's startup wrapper.
++func ValidateServerCredentials(cfg *Config) error {
++	if cfg.API.Username == "" || cfg.API.Password == "" {
++		return errors.New("backup API username and password must be nonempty")
++	}
++	if cfg.ClickHouse.Username == "" || cfg.ClickHouse.Password == "" {
++		return errors.New("backup database username and password must be nonempty")
++	}
++	return nil
++}
++
+ func ValidateConfig(cfg *Config) error {
+ 	if cfg.General.RemoteStorage == "s3" {
+ 		if _, err := aws.ParseRetryMode(cfg.S3.RetryMode); err != nil {
+@@ -731,12 +743,13 @@
+ 	if cfg.General.DownloadDiskLimit < 0 || cfg.General.DownloadDiskLimit > 100 {
+ 		return errors.Errorf("download_disk_limit=%d is invalid, it must be between 0 and 100", cfg.General.DownloadDiskLimit)
+ 	}
++	// The deployment chooses this timeout to fit its scheduled Job deadline.
++	// Embedded backups use the same configurable connection/read timeout; a
++	// fixed four-hour floor can exceed that deadline and is not an engine limit.
+ 	if timeout, err := time.ParseDuration(cfg.ClickHouse.Timeout); err != nil {
+ 		return errors.Wrap(err, "invalid clickhouse timeout")
+-	} else {
+-		if cfg.ClickHouse.UseEmbeddedBackupRestore && timeout < 240*time.Minute {
+-			return errors.Errorf("clickhouse `timeout: %v`, not enough for `use_embedded_backup_restore: true`", cfg.ClickHouse.Timeout)
+-		}
++	} else if timeout <= 0 {
++		return errors.New("clickhouse timeout must be positive")
+ 	}
+ 	if cfg.ClickHouse.FreezeByPart && cfg.ClickHouse.UseEmbeddedBackupRestore {
+ 		return errors.Errorf("`freeze_by_part: %v` is not compatible with `use_embedded_backup_restore: %v`", cfg.ClickHouse.FreezeByPart, cfg.ClickHouse.UseEmbeddedBackupRestore)
+--- a/pkg/config/config_test.go
++++ b/pkg/config/config_test.go
+@@ -456,10 +456,10 @@
+ 		{"bad clickhouse timeout", func(cfg *Config) {
+ 			cfg.ClickHouse.Timeout = "1parsec"
+ 		}, "invalid clickhouse timeout"},
+-		{"embedded backup restore requires timeout >= 4h", func(cfg *Config) {
++		{"embedded backup restore accepts a positive configured timeout", func(cfg *Config) {
+ 			cfg.ClickHouse.UseEmbeddedBackupRestore = true
+ 			cfg.ClickHouse.Timeout = "1h"
+-		}, "not enough for `use_embedded_backup_restore: true`"},
++		}, ""},
+ 		{"freeze_by_part incompatible with embedded backup restore", func(cfg *Config) {
+ 			cfg.ClickHouse.UseEmbeddedBackupRestore = true
+ 			cfg.ClickHouse.Timeout = "5h"
+--- /dev/null
++++ b/pkg/config/server_credentials_test.go
+@@ -0,0 +1,43 @@
++package config
++
++import "testing"
++
++func TestBackupServerCredentials(t *testing.T) {
++	for _, field := range []string{"none", "API username", "API password", "database username", "database password"} {
++		t.Run(field, func(t *testing.T) {
++			cfg := DefaultConfig()
++			cfg.API.Username, cfg.API.Password = "backup", "api-password"
++			cfg.ClickHouse.Username, cfg.ClickHouse.Password = "backup", "database-password"
++			switch field {
++			case "API username":
++				cfg.API.Username = ""
++			case "API password":
++				cfg.API.Password = ""
++			case "database username":
++				cfg.ClickHouse.Username = ""
++			case "database password":
++				cfg.ClickHouse.Password = ""
++			}
++			err := ValidateServerCredentials(cfg)
++			if (err != nil) != (field != "none") {
++				t.Fatalf("credential check = %v for missing %s", err, field)
++			}
++		})
++	}
++}
++
++func TestBackupConfiguredTimeout(t *testing.T) {
++	for _, tc := range []struct {
++		duration string
++		valid    bool
++	}{{"10800s", true}, {"3h", true}, {"4h", true}, {"0s", false}, {"-1s", false}} {
++		t.Run(tc.duration, func(t *testing.T) {
++			cfg := DefaultConfig()
++			cfg.ClickHouse.UseEmbeddedBackupRestore = true
++			cfg.ClickHouse.Timeout = tc.duration
++			if err := ValidateConfig(cfg); (err == nil) != tc.valid {
++				t.Fatalf("timeout validation = %v, valid should be %t", err, tc.valid)
++			}
++		})
++	}
++}

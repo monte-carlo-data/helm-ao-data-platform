@@ -10,16 +10,29 @@ clickhouse:
       path: render-test
     serviceAccount:
       name: ci-clickhouse-backup
-    externalSecret:
-      secretStoreRef:
-        name: ci-placeholder
-      remoteRef:
-        key: ci-backup-current
-        property: password
-        version: AWSCURRENT
-      previousKey: ci-backup-previous
+    sidecar:
+      image: example.invalid/clickhouse-backup@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    user:
+      externalSecret:
+        secretStoreRef:
+          name: ci-placeholder
+        remoteRef:
+          key: ci-backup-current
+          property: password
+          version: AWSCURRENT
+        previousKey: ci-backup-previous
+    probe:
+      externalSecret:
+        secretStoreRef:
+          name: ci-placeholder
+        remoteRef:
+          key: ci-backup-probe-current
+          property: password
+          version: AWSCURRENT
+        previousKey: ci-backup-probe-previous
     api:
       existingSecret: ci-backup-api
+      passwordRevision: revision-1
 
 gateway:
   enabled: false

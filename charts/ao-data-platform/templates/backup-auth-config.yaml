@@ -1,0 +1,23 @@
+{{- include "ao-data-platform.backupValidate" . -}}
+{{- if .Values.clickhouse.backup.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ao-data-platform.chiName" . }}-backup-auth
+  labels:
+    {{- include "ao-data-platform.labels" . | nindent 4 }}
+data:
+  # Optional Secrets overlay this fallback. Missing credentials omit the whole
+  # user, so database startup and unrelated users do not depend on backup ESO.
+  empty-auth.xml: <clickhouse/>
+  user.xml: |
+    <clickhouse>
+      <include_from>/etc/clickhouse-backup-auth/user/auth.xml</include_from>
+      <users><backup incl="user" optional="true"/></users>
+    </clickhouse>
+  probe.xml: |
+    <clickhouse>
+      <include_from>/etc/clickhouse-backup-auth/probe/auth.xml</include_from>
+      <users><backup_probe incl="user" optional="true"/></users>
+    </clickhouse>
+{{- end }}

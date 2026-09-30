@@ -36,7 +36,8 @@ spec:
             app.kubernetes.io/instance: {{ .Release.Name }}
             app.kubernetes.io/component: clickhouse-backup-job
         spec:
-          automountServiceAccountToken: false
+          serviceAccountName: {{ include "ao-data-platform.chiName" . }}-backup-job
+          automountServiceAccountToken: true
           restartPolicy: Never
           securityContext:
             runAsNonRoot: true
@@ -51,6 +52,28 @@ spec:
               env:
                 - name: BACKUP_ENDPOINTS
                   value: {{ include "ao-data-platform.backupEndpoints" . | quote }}
+                - name: BACKUP_DATABASE_ENDPOINTS
+                  value: {{ include "ao-data-platform.backupDatabaseEndpoints" . | quote }}
+                - name: BACKUP_PROBE_USERNAME
+                  value: backup_probe
+                - name: BACKUP_PROBE_PASSWORD_FILE
+                  value: /probe-credentials/password
+                - name: BACKUP_PASSWORD_REVISION
+                  value: {{ $b.api.passwordRevision | quote }}
+                - name: BACKUP_PASSWORD_REVISION_FILE
+                  value: /credentials/revision
+                - name: POD_NAMESPACE
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.namespace
+                - name: BACKUP_POD_SELECTOR
+                  value: {{ printf "clickhouse.altinity.com/chi=%s,clickhouse.altinity.com/cluster=%s,clickhouse.altinity.com/shard=0" (include "ao-data-platform.chiName" .) (include "ao-data-platform.clickhouseClusterName" .) | quote }}
+                - name: BACKUP_COPY_LABEL
+                  value: clickhouse.altinity.com/replica
+                {{- if .Values.tls.enabled }}
+                - name: BACKUP_DATABASE_CA_FILE
+                  value: /clickhouse-ca/ca.crt
+                {{- end }}
                 - name: BACKUP_PASSWORD_FILE
                   value: /credentials/password
                 - name: BACKUP_TIMEOUT_SECONDS
@@ -64,6 +87,14 @@ spec:
                 - name: credentials
                   mountPath: /credentials
                   readOnly: true
+                - name: probe-credentials
+                  mountPath: /probe-credentials
+                  readOnly: true
+                {{- if .Values.tls.enabled }}
+                - name: clickhouse-ca
+                  mountPath: /clickhouse-ca
+                  readOnly: true
+                {{- end }}
               resources:
                 {{- toYaml $b.schedule.resources | nindent 16 }}
               securityContext:
@@ -77,5 +108,17 @@ spec:
                 name: {{ include "ao-data-platform.chiName" . }}-backup-job
             - name: credentials
               secret:
-                secretName: {{ $b.api.existingSecret }}
+                secretName: {{ include "ao-data-platform.backupAPISecretName" . }}
+                optional: true
+            - name: probe-credentials
+              secret:
+                secretName: {{ $b.probe.secret }}
+                optional: true
+            {{- if .Values.tls.enabled }}
+            - name: clickhouse-ca
+              secret:
+                secretName: clickhouse-server-tls
+                items:
+                  - {key: ca.crt, path: ca.crt}
+            {{- end }}
 {{- end }}

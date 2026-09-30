@@ -84,17 +84,6 @@ spec:
         <clickhouse>
           <include_from>{{ include "ao-data-platform.authMethodsSecretPath" . }}</include_from>
           <users>
-            {{- if .Values.clickhouse.backup.enabled }}
-            <backup>
-              <networks><ip>127.0.0.1</ip><ip>::1</ip></networks>
-              <grants>
-                <query>GRANT BACKUP ON otel_traces.*</query>
-                <query>GRANT SHOW TABLES, SHOW DATABASES ON otel_traces.*</query>
-                <query>GRANT SELECT ON system.*</query>
-              </grants>
-              <auth_methods incl="backup_auth_methods"/>
-            </backup>
-            {{- end }}
             <!-- otel — the OTel collector ingest identity. Writes raw telemetry into
                  otel_traces.otel_traces. The MV cascade runs as schema_owner (the MV
                  DEFINER), so otel needs nothing on the normalized targets. -->
@@ -337,6 +326,13 @@ spec:
           </http_handlers>
         </clickhouse>
       {{- if .Values.clickhouse.backup.enabled }}
+      config.d/backup-users.xml: |
+        <clickhouse>
+          <user_directories>
+            <users_xml name="backup"><name>backup</name><path>/etc/clickhouse-backup-auth/user/users.xml</path></users_xml>
+            <users_xml name="backup_probe"><name>backup_probe</name><path>/etc/clickhouse-backup-auth/probe/users.xml</path></users_xml>
+          </user_directories>
+        </clickhouse>
       config.d/backup.xml: |
         {{- include "ao-data-platform.backupDisk" . | nindent 8 }}
       {{- end }}
@@ -401,6 +397,11 @@ spec:
     # load-bearing chart behavior, not optional tuning.
     podTemplates:
       - name: clickhouse
+        {{- if .Values.clickhouse.backup.enabled }}
+        metadata:
+          annotations:
+            backup.montecarlodata.com/password-revision: {{ .Values.clickhouse.backup.api.passwordRevision | quote }}
+        {{- end }}
         spec:
           {{- if .Values.clickhouse.backup.enabled }}
           serviceAccountName: {{ .Values.clickhouse.backup.serviceAccount.name }}
@@ -408,16 +409,42 @@ spec:
           volumes:
             - name: backup-config
               secret:
-                secretName: {{ .Values.clickhouse.backup.secret }}
-                items:
-                  - key: config.yml
-                    path: config.yml
+                secretName: {{ .Values.clickhouse.backup.user.secret }}
+                optional: true
+            - name: backup-api-credentials
+              secret:
+                secretName: {{ include "ao-data-platform.backupAPISecretName" . }}
+                optional: true
+            {{- range $kind := list "user" "probe" }}
+            - name: backup-{{ $kind }}-auth
+              projected:
+                sources:
+                  - configMap:
+                      name: {{ include "ao-data-platform.chiName" $ }}-backup-auth
+                      items:
+                        - {key: {{ printf "%s.xml" $kind | quote }}, path: users.xml}
+                        - {key: empty-auth.xml, path: auth.xml}
+                  - secret:
+                      name: {{ (index $.Values.clickhouse.backup $kind).secret }}
+                      optional: true
+                      items:
+                        - {key: auth.xml, path: auth.xml}
+            {{- end }}
           {{- end }}
           # `image` is required whenever this podTemplate emits a containers[]
           # entry — the Altinity operator does not merge container spec defaults.
           containers:
             - name: clickhouse
               image: {{ .Values.clickhouse.image }}
+              {{- if .Values.clickhouse.backup.enabled }}
+              volumeMounts:
+                - name: backup-user-auth
+                  mountPath: /etc/clickhouse-backup-auth/user
+                  readOnly: true
+                - name: backup-probe-auth
+                  mountPath: /etc/clickhouse-backup-auth/probe
+                  readOnly: true
+              {{- end }}
               {{- with .Values.clickhouse.resources }}
               resources:
                 {{- toYaml . | nindent 16 }}

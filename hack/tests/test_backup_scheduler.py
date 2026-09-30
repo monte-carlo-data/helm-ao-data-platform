@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import tempfile
 import threading
 import unittest
 from unittest import mock
@@ -23,6 +24,26 @@ FULL = "ao-otel-full-20260929T000000Z-12345678"
 
 def remote(name=FULL, required="", **changes):
     return dict(name=name, location="remote", desc="directory, embedded", required=required, **changes)
+
+
+def fresh_table(name="spans", **changes):
+    row = dict(database="otel_traces", table=name, engine="ReplicatedMergeTree", replica_table=name,
+               is_readonly=0, is_session_expired=0, inserts_in_queue=0, absolute_delay=0)
+    row.update(changes)
+    return row
+
+
+class FakeProbe:
+    def __init__(self, rows=None, failure=False):
+        self.rows = [fresh_table()] if rows is None else rows
+        self.failure = failure
+        self.calls = []
+
+    def request(self, method, path, query=None):
+        self.calls.append((method, path, query))
+        if self.failure:
+            raise backup.BackupError("Database probe failed.")
+        return self.rows
 
 
 class Clock:
@@ -111,12 +132,73 @@ class FakeAPI:
 
 
 class SchedulerTests(unittest.TestCase):
-    def run_scheduler(self, *apis, timeout=30):
+    def run_scheduler(self, *apis, timeout=30, probes=None):
         clock = Clock()
-        scheduler = backup.Scheduler(apis, timeout=timeout, poll_seconds=10,
+        probes = probes if probes is not None else [FakeProbe() for _ in apis]
+        scheduler = backup.Scheduler(apis, probes, timeout=timeout, poll_seconds=10,
                                      clock=clock.now, sleep=clock.sleep)
         with redirect_stdout(io.StringIO()):
             return scheduler.run(NOW)
+
+    def test_behind_readonly_expired_or_incomplete_copy_is_not_selected(self):
+        bad_rows = [[], [fresh_table(absolute_delay=1)], [fresh_table(inserts_in_queue=1)],
+                    [fresh_table(is_readonly=1)], [fresh_table(is_session_expired=1)],
+                    [fresh_table(replica_table="")],
+                    [fresh_table(), fresh_table("new_table", replica_table="")],
+                    [fresh_table(), fresh_table()],
+                    [fresh_table(absolute_delay="0")], [fresh_table(inserts_in_queue=None)]]
+        for field in ("absolute_delay", "inserts_in_queue", "is_readonly", "is_session_expired"):
+            row = fresh_table()
+            del row[field]
+            bad_rows.append([row])
+        for rows in bad_rows:
+            with self.subTest(rows=rows):
+                first, second = FakeAPI(), FakeAPI()
+                self.run_scheduler(first, second, probes=[FakeProbe(rows), FakeProbe()])
+                self.assertEqual(first.posts, [])
+                self.assertEqual(len(second.posts), 1)
+
+    def test_database_probe_failure_uses_only_a_qualified_copy(self):
+        first, second = FakeAPI(), FakeAPI()
+        self.run_scheduler(first, second, probes=[FakeProbe(failure=True), FakeProbe()])
+        self.assertEqual(first.posts, [])
+        self.assertEqual(len(second.posts), 1)
+
+    def test_no_fresh_copy_stops_without_a_backup(self):
+        first, second = FakeAPI(), FakeAPI()
+        with self.assertRaisesRegex(backup.BackupError, "No ClickHouse copy is caught up"):
+            self.run_scheduler(first, second, probes=[FakeProbe([fresh_table(absolute_delay=1)]), FakeProbe([])])
+        self.assertEqual(first.posts + second.posts, [])
+
+    def test_copy_that_falls_behind_during_metadata_download_is_not_backed_up(self):
+        first, second = FakeAPI([remote()], created_required=FULL), FakeAPI()
+        probe = FakeProbe()
+        with mock.patch.object(probe, "request", side_effect=[[fresh_table()], [fresh_table(inserts_in_queue=1)]]):
+            with self.assertRaisesRegex(backup.BackupError, "no longer caught up"):
+                self.run_scheduler(first, second, probes=[probe, FakeProbe()])
+        self.assertEqual(first.posts, [("POST", "/backup/download/" + FULL, None)])
+        self.assertEqual(second.posts, [])
+
+    def test_pending_merges_do_not_disqualify_a_current_copy(self):
+        first = FakeAPI()
+        probe = FakeProbe([fresh_table(queue_size=30, merges_in_queue=30)])
+        self.run_scheduler(first, probes=[probe])
+        self.assertEqual(len(first.posts), 1)
+        self.assertIn("FROM system.tables", probe.calls[0][2]["query"])
+        self.assertIn("LEFT JOIN system.replicas", probe.calls[0][2]["query"])
+
+    def test_running_work_on_a_behind_copy_still_blocks_a_fresh_copy(self):
+        first, second = FakeAPI(), FakeAPI(history=[{"status": "in progress"}])
+        with self.assertRaisesRegex(backup.BackupError, "already running"):
+            self.run_scheduler(first, second, probes=[FakeProbe(), FakeProbe([fresh_table(absolute_delay=100)])])
+        self.assertEqual(first.posts + second.posts, [])
+
+    def test_revision_failure_is_not_treated_as_an_unreachable_copy(self):
+        first, second = FakeAPI(), FakeAPI()
+        with mock.patch.object(first, "request", side_effect=backup.RevisionError("Password revision changed.")):
+            with self.assertRaisesRegex(backup.RevisionError, "Password revision changed"):
+                self.run_scheduler(first, second)
+        self.assertEqual(first.posts + second.posts, [])
 
     def test_first_run_creates_full_for_all_trace_tables_on_copy_zero(self):
         first, second = FakeAPI(), FakeAPI()
@@ -293,6 +375,117 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(first.posts, [])
 
 
+class PasswordRevisionTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.password_file = Path(self.directory.name) / "password"
+        self.revision_file = Path(self.directory.name) / "revision"
+        self.password_file.write_text("private-password")
+        self.revision_file.write_text("revision-1")
+        self.guard = backup.PasswordRevisionGuard("private-password", "revision-1",
+                                                  self.password_file, self.revision_file,
+                                                  "test", "test=clickhouse")
+        self.api = backup.API("http://copy0:7171", "backup", "private-password", guard=self.guard)
+        self.api.opener = mock.Mock()
+
+    def pod(self, revision="revision-1", ready=True, index=0):
+        return {"metadata": {"annotations": {backup.REVISION_ANNOTATION: revision},
+                             "labels": {"clickhouse.altinity.com/replica": str(index)}},
+                "status": {"conditions": [{"type": "Ready", "status": str(ready)}]}}
+
+    def assert_refused_without_api_request(self, pods, message):
+        with mock.patch.object(self.guard, "list_pods", return_value=pods):
+            with self.assertRaisesRegex(backup.RevisionError, message) as caught:
+                self.api.request("GET", "/backup/actions")
+        self.api.opener.open.assert_not_called()
+        self.assertNotIn("private-password", str(caught.exception))
+
+    def test_wrong_revision_on_any_copy_stops_before_credentials_are_sent(self):
+        for pods in ([self.pod(), self.pod("old")], [self.pod("old", ready=False), self.pod()],
+                     [{"metadata": {}}], [None]):
+            with self.subTest(pods=pods):
+                self.assert_refused_without_api_request(pods, "not all adopted")
+
+    def test_old_job_refuses_a_new_projected_password_or_revision(self):
+        self.password_file.write_text("new-private-password")
+        self.assert_refused_without_api_request([self.pod()], "mounted backup password changed")
+        self.password_file.write_text("private-password")
+        self.revision_file.write_text("revision-2")
+        self.assert_refused_without_api_request([self.pod()], "wrong revision")
+
+    def test_password_update_during_pod_lookup_stops_before_api_request(self):
+        def rotated_pods():
+            self.password_file.write_text("new-private-password")
+            return [self.pod()]
+        with mock.patch.object(self.guard, "list_pods", side_effect=rotated_pods):
+            with self.assertRaisesRegex(backup.RevisionError, "mounted backup password changed"):
+                self.api.request("GET", "/backup/actions")
+        self.api.opener.open.assert_not_called()
+
+    def test_missing_secret_file_stops_before_api_request(self):
+        self.revision_file.unlink()
+        self.assert_refused_without_api_request([self.pod()], "Could not read")
+
+    def test_missing_or_not_ready_copy_does_not_bypass_revision_checks(self):
+        for pods in ([], [self.pod()], [self.pod(ready=False)]):
+            with self.subTest(pods=pods), mock.patch.object(self.guard, "list_pods", return_value=pods):
+                self.guard()
+
+    def test_missing_copy_is_skipped_without_sending_its_credentials(self):
+        self.api.guard = lambda: self.guard(0)
+        with mock.patch.object(self.guard, "list_pods", return_value=[self.pod(index=1)]):
+            with self.assertRaisesRegex(backup.BackupError, "has no Pod"):
+                self.api.request("GET", "/backup/actions")
+            self.guard(1)
+        self.api.opener.open.assert_not_called()
+
+    def test_pod_without_a_copy_label_cannot_authorize_an_endpoint(self):
+        pod = self.pod()
+        del pod["metadata"]["labels"]
+        self.assert_refused_without_api_request([pod], "Could not identify")
+
+    def test_kubernetes_lookup_failure_does_not_send_api_credentials(self):
+        with mock.patch.object(self.guard, "list_pods", side_effect=backup.RevisionError("Could not check Pods.")):
+            with self.assertRaisesRegex(backup.RevisionError, "Could not check"):
+                self.api.request("GET", "/backup/actions")
+        self.api.opener.open.assert_not_called()
+
+    def test_kubernetes_lookup_uses_verified_tls_and_namespace_selector(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps({"items": [self.pod()]}).encode()
+        opener = mock.Mock()
+        opener.open.return_value = response
+        verified_context = backup.ssl.create_default_context()
+        with mock.patch.object(backup.Path, "read_text", return_value="private-kubernetes-token"), \
+                mock.patch.object(backup.ssl, "create_default_context", return_value=verified_context) as context, \
+                mock.patch.object(backup.urllib.request, "HTTPSHandler") as handler, \
+                mock.patch.object(backup.urllib.request, "build_opener", return_value=opener):
+            self.assertEqual(self.guard.list_pods(), [self.pod()])
+        context.assert_called_once_with(cafile="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
+        handler.assert_called_once_with(context=context.return_value)
+        self.assertTrue(verified_context.check_hostname)
+        self.assertEqual(verified_context.verify_mode, backup.ssl.CERT_REQUIRED)
+        request = opener.open.call_args.args[0]
+        self.assertEqual(request.full_url,
+                         "https://kubernetes.default.svc/api/v1/namespaces/test/pods?labelSelector=test%3Dclickhouse")
+        self.assertEqual(request.get_header("Authorization"), "Bearer private-kubernetes-token")
+
+    def test_incomplete_or_invalid_pod_response_fails_without_printing_body(self):
+        for payload in (b"private malformed body", b'{}', b'{"items": [], "metadata": {"continue": "next"}}'):
+            response = mock.MagicMock()
+            response.__enter__.return_value.read.return_value = payload
+            opener = mock.Mock()
+            opener.open.return_value = response
+            with self.subTest(payload=payload), \
+                    mock.patch.object(backup.Path, "read_text", return_value="private-token"), \
+                    mock.patch.object(backup.ssl, "create_default_context"), \
+                    mock.patch.object(backup.urllib.request, "build_opener", return_value=opener):
+                with self.assertRaisesRegex(backup.RevisionError, "Could not check") as caught:
+                    self.guard.list_pods()
+                self.assertNotIn("private", str(caught.exception))
+
+
 class APITests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -322,6 +515,14 @@ class APITests(unittest.TestCase):
 
     def setUp(self):
         type(self).requests = []
+        self.settings = {
+            "BACKUP_ENDPOINTS": json.dumps([self.url]),
+            "BACKUP_DATABASE_ENDPOINTS": json.dumps([self.url]),
+            "BACKUP_PASSWORD_FILE": "/credentials/password",
+            "BACKUP_PASSWORD_REVISION": "revision-1",
+            "POD_NAMESPACE": "test",
+            "BACKUP_POD_SELECTOR": "test=clickhouse",
+        }
 
     def test_reads_ndjson_and_sends_password_only_in_header(self):
         type(self).response = (200, {}, b'{"name":"one"}\n{"name":"two"}\n')
@@ -349,17 +550,37 @@ class APITests(unittest.TestCase):
             with self.subTest(endpoint=endpoint), self.assertRaises(backup.BackupError):
                 backup.API(endpoint, "backup", "password")
 
+    def test_database_probe_uses_the_mounted_ca_without_disabling_verification(self):
+        verified_context = backup.ssl.create_default_context()
+        with mock.patch.object(backup.ssl, "create_default_context", return_value=verified_context) as context, \
+                mock.patch.object(backup.urllib.request, "HTTPSHandler") as handler, \
+                mock.patch.object(backup.urllib.request, "build_opener"):
+            backup.API("https://copy0:8443", "backup_probe", "private", ca_file="/clickhouse-ca/ca.crt")
+        context.assert_called_once_with(cafile="/clickhouse-ca/ca.crt")
+        handler.assert_called_once_with(context=context.return_value)
+        self.assertTrue(verified_context.check_hostname)
+        self.assertEqual(verified_context.verify_mode, backup.ssl.CERT_REQUIRED)
+        with self.assertRaisesRegex(backup.BackupError, "requires an HTTPS endpoint"):
+            backup.API("http://copy0:8123", "backup_probe", "private", ca_file="/clickhouse-ca/ca.crt")
+
     def test_main_reads_password_from_file_without_logging_it(self):
-        settings = {"BACKUP_ENDPOINTS": json.dumps([self.url]), "BACKUP_PASSWORD_FILE": "/credentials/password"}
+        settings = dict(self.settings)
         stdout, stderr = io.StringIO(), io.StringIO()
         with mock.patch.dict(backup.os.environ, settings, clear=True), \
                 mock.patch.object(backup.Path, "read_text", return_value="private-password") as read, \
+                mock.patch.object(backup, "PasswordRevisionGuard") as guard, \
                 mock.patch.object(backup.Scheduler, "run"), \
                 mock.patch.object(backup, "API") as api, \
                 redirect_stdout(stdout), redirect_stderr(stderr):
             self.assertEqual(backup.main(), 0)
-            read.assert_called_once_with()
-            api.assert_called_once_with(self.url, "backup", "private-password")
+            self.assertEqual(read.call_count, 2)
+            self.assertEqual(len(api.call_args_list), 2)
+            self.assertEqual(api.call_args_list[0].args, (self.url, "backup", "private-password"))
+            self.assertEqual(api.call_args_list[1].args, (self.url, "backup_probe", "private-password"))
+            copy_guard = api.call_args_list[0].kwargs["guard"]
+            self.assertIs(copy_guard, api.call_args_list[1].kwargs["guard"])
+            copy_guard()
+            guard.return_value.assert_has_calls([mock.call(), mock.call(0)])
         self.assertNotIn("private-password", stdout.getvalue() + stderr.getvalue())
 
     def test_main_failures_return_one_and_keep_credentials_out_of_output(self):
@@ -381,12 +602,13 @@ class APITests(unittest.TestCase):
         ]
         for label, changes, password, failure, message in cases:
             with self.subTest(case=label):
-                settings = {"BACKUP_ENDPOINTS": json.dumps([self.url]), "BACKUP_PASSWORD_FILE": "/credentials/password"}
+                settings = dict(self.settings)
                 settings.update(changes)
                 settings = {key: value for key, value in settings.items() if value is not None}
                 stdout, stderr = io.StringIO(), io.StringIO()
                 with mock.patch.dict(backup.os.environ, settings, clear=True), \
                         mock.patch.object(backup.Path, "read_text", return_value=password), \
+                        mock.patch.object(backup, "PasswordRevisionGuard"), \
                         mock.patch.object(backup.Scheduler, "run", side_effect=failure) as run, \
                         mock.patch.object(backup, "API"), \
                         redirect_stdout(stdout), redirect_stderr(stderr):
@@ -398,7 +620,7 @@ class APITests(unittest.TestCase):
                     run.assert_not_called()
 
     def test_main_does_not_print_unreadable_password_file_details(self):
-        settings = {"BACKUP_ENDPOINTS": json.dumps([self.url])}
+        settings = dict(self.settings)
         stdout, stderr = io.StringIO(), io.StringIO()
         with mock.patch.dict(backup.os.environ, settings, clear=True), \
                 mock.patch.object(backup.Path, "read_text", side_effect=OSError("private-password private server body")), \
@@ -409,13 +631,14 @@ class APITests(unittest.TestCase):
 
     def test_main_api_failure_does_not_print_password_or_server_body(self):
         type(self).response = (500, {}, b"private server body")
-        settings = {"BACKUP_ENDPOINTS": json.dumps([self.url])}
+        settings = dict(self.settings)
         stdout, stderr = io.StringIO(), io.StringIO()
         with mock.patch.dict(backup.os.environ, settings, clear=True), \
                 mock.patch.object(backup.Path, "read_text", return_value="private-password"), \
+                mock.patch.object(backup, "PasswordRevisionGuard"), \
                 redirect_stdout(stdout), redirect_stderr(stderr):
             self.assertEqual(backup.main(), 1)
-        self.assertIn("could list the trace tables and remote backups", stderr.getvalue())
+        self.assertIn("able to list the trace tables and remote backups", stderr.getvalue())
         self.assertNotIn("private-password", stdout.getvalue() + stderr.getvalue())
         self.assertNotIn("private server body", stdout.getvalue() + stderr.getvalue())
 

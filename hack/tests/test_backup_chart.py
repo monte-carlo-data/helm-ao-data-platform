@@ -97,28 +97,30 @@ class BackupChartTests(unittest.TestCase):
 
         enabled_by_key = {(d["kind"], d["metadata"]["name"]): d for d in self.enabled}
         for document in self.disabled:
-            # Only ClickHouse and its shared password bundle need modification.
+            # Backup enablement changes CHI and its TLS SANs, never other users.
             if document["kind"] == "ClickHouseInstallation":
                 continue
-            if document["kind"] == "ExternalSecret" and "auth.xml" in document["spec"].get("target", {}).get("template", {}).get("data", {}):
+            if document["kind"] == "Certificate" and document["metadata"]["name"] == "clickhouse-server-tls":
                 continue
             key = (document["kind"], document["metadata"]["name"])
             self.assertEqual(document, enabled_by_key[key], key)
 
     def test_clickhouse_keeps_existing_users_and_backup_cannot_restore(self):
         files = self.chi["spec"]["configuration"]["files"]
-        users = xml_tree(files["users.d/auth-methods.xml"])
-        backup = users.find("users/backup")
-        self.assertIsNotNone(backup)
-        self.assertEqual({n.text for n in backup.findall("networks/ip")}, {"127.0.0.1", "::1"})
-        grants = [n.text for n in backup.findall("grants/query")]
-        self.assertIn("GRANT BACKUP ON otel_traces.*", grants)
-        for grant in grants:
-            for forbidden in (" DROP ", " INSERT ", " CREATE ", " ALTER ", " ALL ", "GRANT OPTION"):
-                self.assertNotIn(forbidden, grant)
-        users.find("users").remove(backup)
         disabled_files = one(self.disabled, "ClickHouseInstallation")["spec"]["configuration"]["files"]
-        self.assertEqual(ET.tostring(users), ET.tostring(xml_tree(disabled_files["users.d/auth-methods.xml"])))
+        self.assertEqual(files["users.d/auth-methods.xml"], disabled_files["users.d/auth-methods.xml"])
+        self.assertEqual(one(self.enabled, "ExternalSecret", "ao-clickhouse-auth-methods"),
+                         one(self.disabled, "ExternalSecret", "ao-clickhouse-auth-methods"))
+        for name, expected in (
+            ("ao-clickhouse-backup-credentials", {"GRANT BACKUP ON otel_traces.*", "GRANT SELECT ON system.*", "GRANT SHOW TABLES, SHOW DATABASES ON otel_traces.*"}),
+            ("ao-clickhouse-backup-probe-credentials", {"GRANT SELECT ON system.replicas", "GRANT SHOW TABLES, SHOW DATABASES ON otel_traces.*"}),
+        ):
+            with self.subTest(secret=name):
+                auth = one(self.enabled, "ExternalSecret", name)["spec"]["target"]["template"]["data"]["auth.xml"]
+                user = xml_tree(render_secret_template(auth, {"password": "fake", "previous": "-"})).find("user")
+                self.assertEqual({n.text for n in user.findall("grants/query")}, expected)
+                if name == "ao-clickhouse-backup-credentials":
+                    self.assertEqual({n.text for n in user.findall("networks/ip")}, {"127.0.0.1", "::1"})
 
     def test_database_and_backup_use_the_same_aws_role_and_data_volume(self):
         account = one(self.enabled, "ServiceAccount", "ci-clickhouse-backup")
@@ -127,7 +129,8 @@ class BackupChartTests(unittest.TestCase):
         spec = pod(self.chi)
         self.assertEqual(spec["serviceAccountName"], account["metadata"]["name"])
         sidecar = next(c for c in spec["containers"] if c["name"] == "clickhouse-backup")
-        self.assertEqual(sidecar["image"], "altinity/clickhouse-backup:2.8.1")
+        self.assertEqual(sidecar["image"], "example.invalid/clickhouse-backup@sha256:" + "a" * 64)
+        self.assertEqual(sidecar["command"], ["/usr/local/bin/start-backup.sh"])
         data_volume = self.chi["spec"]["defaults"]["templates"]["dataVolumeClaimTemplate"]
         mounts = {mount["mountPath"]: mount for mount in sidecar["volumeMounts"]}
         self.assertEqual(mounts["/var/lib/clickhouse"]["name"], data_volume)
@@ -135,8 +138,14 @@ class BackupChartTests(unittest.TestCase):
         self.assertTrue(mounts["/etc/clickhouse-backup"]["readOnly"])
         env = {item["name"]: item for item in sidecar["env"]}
         self.assertEqual(env["GOMEMLIMIT"]["value"], "400MiB")
-        self.assertEqual(env["API_PASSWORD"]["valueFrom"]["secretKeyRef"],
-                         {"name": "ci-backup-api", "key": "password"})
+        self.assertNotIn("API_PASSWORD", env)
+        self.assertEqual(env["BACKUP_PASSWORD_REVISION"]["value"], "revision-1")
+        self.assertEqual(mounts["/etc/clickhouse-backup-api"]["name"], "backup-api-credentials")
+        self.assertNotIn("subPath", mounts["/etc/clickhouse-backup-api"])
+        volumes = {v["name"]: v for v in spec["volumes"]}
+        self.assertTrue(volumes["backup-config"]["secret"]["optional"])
+        self.assertNotIn("items", volumes["backup-config"]["secret"])
+        self.assertTrue(volumes["backup-api-credentials"]["secret"]["optional"])
         for forbidden in ("CLICKHOUSE_PASSWORD", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"):
             self.assertNotIn(forbidden, env)
 
@@ -169,24 +178,76 @@ class BackupChartTests(unittest.TestCase):
         self.assertEqual(config["s3"]["acl"], "")
         self.assertNotIn("password", config["api"])
 
-        bundle = next(d for d in self.enabled if d["kind"] == "ExternalSecret"
-                      and "auth.xml" in d["spec"].get("target", {}).get("template", {}).get("data", {}))
-        references = {d["secretKey"]: d["remoteRef"] for d in bundle["spec"]["data"]}
-        disabled_bundle = one(self.disabled, "ExternalSecret", bundle["metadata"]["name"])
-        self.assertEqual({key: value for key, value in references.items() if not key.startswith("backup_")},
-                         {item["secretKey"]: item["remoteRef"] for item in disabled_bundle["spec"]["data"]})
-        self.assertEqual(references["backup_password"], credentials["spec"]["data"][0]["remoteRef"])
-        self.assertEqual(references["backup_previous"],
-                         {"key": "ci-backup-previous", "property": "password", "version": "AWSCURRENT"})
-        auth = bundle["spec"]["target"]["template"]["data"]["auth.xml"]
-        for previous in ("-", "", "previous-password"):
-            with self.subTest(previous=previous):
-                values = {key: "current-password" for key in references}
-                values["backup_previous"] = previous
-                methods = xml_tree(render_secret_template(auth, values)).find("backup_auth_methods")
-                self.assertEqual(methods.findtext("current/password"), "current-password")
-                self.assertEqual(methods.findtext("previous/password"),
-                                 "previous-password" if previous == "previous-password" else None)
+        for name in ("ao-clickhouse-backup-credentials", "ao-clickhouse-backup-probe-credentials"):
+            secret = one(self.enabled, "ExternalSecret", name)
+            auth = secret["spec"]["target"]["template"]["data"]["auth.xml"]
+            references = {d["secretKey"]: d["remoteRef"] for d in secret["spec"]["data"]}
+            self.assertEqual(set(references), {"password", "previous"})
+            self.assertEqual(references["password"]["version"], "AWSCURRENT")
+            self.assertEqual(references["previous"]["version"], "AWSCURRENT")
+            for previous in ("-", "", "previous-password"):
+                with self.subTest(secret=name, previous=previous):
+                    password = 'contains <xml> & "quotes"'
+                    user = xml_tree(render_secret_template(auth, {"password": password, "previous": previous})).find("user")
+                    self.assertEqual(user.findtext("auth_methods/current/password"), password)
+                    self.assertEqual(user.findtext("auth_methods/previous/password"),
+                                     previous if previous == "previous-password" else None)
+            empty = xml_tree(render_secret_template(auth, {"password": "", "previous": "previous-password"}))
+            self.assertIsNone(empty.find("user"), "An empty current credential must not create a passwordless user")
+
+    def test_missing_backup_secrets_have_empty_user_fallbacks(self):
+        config = one(self.enabled, "ConfigMap", self.name + "-backup-auth")["data"]
+        self.assertEqual(ET.tostring(xml_tree(config["empty-auth.xml"])), b"<clickhouse />")
+        volumes = {v["name"]: v for v in pod(self.chi)["volumes"]}
+        for kind, username in (("user", "backup"), ("probe", "backup_probe")):
+            with self.subTest(kind=kind):
+                wrapper = xml_tree(config[kind + ".xml"])
+                user = wrapper.find("users/" + username)
+                self.assertEqual(user.attrib, {"incl": "user", "optional": "true"})
+                self.assertEqual(wrapper.findtext("include_from"), f"/etc/clickhouse-backup-auth/{kind}/auth.xml")
+                sources = volumes[f"backup-{kind}-auth"]["projected"]["sources"]
+                self.assertEqual(sources[0]["configMap"]["items"], [{"key": kind + ".xml", "path": "users.xml"}, {"key": "empty-auth.xml", "path": "auth.xml"}])
+                self.assertTrue(sources[1]["secret"]["optional"])
+                self.assertEqual(sources[1]["secret"]["items"], [{"key": "auth.xml", "path": "auth.xml"}])
+        stores = xml_tree(self.chi["spec"]["configuration"]["files"]["config.d/backup-users.xml"])
+        self.assertEqual({n.findtext("path") for n in stores.findall("user_directories/users_xml")},
+                         {f"/etc/clickhouse-backup-auth/{k}/users.xml" for k in ("user", "probe")})
+
+    def test_api_revision_rolls_pods_and_job_can_only_read_pods(self):
+        documents = render("clickhouse.backup.api.passwordRevision=revision-2")
+        chi = one(documents, "ClickHouseInstallation")
+        annotations = chi["spec"]["templates"]["podTemplates"][0]["metadata"]["annotations"]
+        self.assertEqual(annotations["backup.montecarlodata.com/password-revision"], "revision-2")
+        spec = one(documents, "CronJob")["spec"]["jobTemplate"]["spec"]["template"]["spec"]
+        env = {v["name"]: v.get("value") for v in spec["containers"][0]["env"]}
+        self.assertEqual(env["BACKUP_PASSWORD_REVISION"], "revision-2")
+        self.assertEqual(env["BACKUP_PASSWORD_REVISION_FILE"], "/credentials/revision")
+        self.assertEqual(env["BACKUP_PROBE_PASSWORD_FILE"], "/probe-credentials/password")
+        role = one(documents, "Role", self.name + "-backup-job")
+        self.assertEqual(role["rules"], [{"apiGroups": [""], "resources": ["pods"], "verbs": ["get", "list"]}])
+        account = one(documents, "ServiceAccount", spec["serviceAccountName"])
+        self.assertNotIn("annotations", account["metadata"])
+        binding = one(documents, "RoleBinding", self.name + "-backup-job")
+        self.assertEqual(binding["subjects"], [{"kind": "ServiceAccount", "name": account["metadata"]["name"], "namespace": "montecarlo"}])
+        self.assertEqual(binding["roleRef"]["name"], role["metadata"]["name"])
+
+    def test_api_external_secret_preserves_paired_password_and_revision(self):
+        docs = render("clickhouse.backup.api.existingSecret=",
+                      "clickhouse.backup.api.externalSecret.secretStoreRef.name=ci-placeholder",
+                      "clickhouse.backup.api.externalSecret.remoteRef.key=ci-api-pair",
+                      "clickhouse.backup.api.externalSecret.remoteRef.version=AWSCURRENT")
+        secret = one(docs, "ExternalSecret", self.name + "-backup-api")
+        self.assertEqual(secret["spec"]["data"], [{"secretKey": "credentials", "remoteRef": {"key": "ci-api-pair", "version": "AWSCURRENT"}}])
+        templates = secret["spec"]["target"]["template"]["data"]
+        source = {"credentials": json.dumps({"password": "test-secret", "revision": "old-revision"})}
+        self.assertEqual(render_secret_template(templates["password"], source), "test-secret")
+        self.assertEqual(render_secret_template(templates["revision"], source), "old-revision")
+        for item in ("password", "revision"):
+            self.assertEqual(render_secret_template(templates[item], {"credentials": "{}"}), "")
+        for override in ("clickhouse.backup.api.existingSecret=also-set", "clickhouse.backup.api.externalSecret.remoteRef.property=password"):
+            with self.subTest(override=override), self.assertRaises(AssertionError):
+                render("clickhouse.backup.api.externalSecret.secretStoreRef.name=ci-placeholder",
+                       "clickhouse.backup.api.externalSecret.remoteRef.key=ci-api-pair", override)
 
     def test_one_job_runs_every_four_hours_without_blind_retries(self):
         job = one(self.enabled, "CronJob")
@@ -196,9 +257,9 @@ class BackupChartTests(unittest.TestCase):
         template = job["spec"]["jobTemplate"]["spec"]
         self.assertEqual(template["backoffLimit"], 0)
         self.assertEqual(template["template"]["spec"]["restartPolicy"], "Never")
-        self.assertFalse(template["template"]["spec"]["automountServiceAccountToken"])
+        self.assertTrue(template["template"]["spec"]["automountServiceAccountToken"])
         container = template["template"]["spec"]["containers"][0]
-        env = {v["name"]: v["value"] for v in container["env"]}
+        env = {v["name"]: v.get("value") for v in container["env"]}
         endpoints = json.loads(env["BACKUP_ENDPOINTS"])
         services = [d for d in self.enabled if d["kind"] == "Service"
                     and any(p["port"] == 7171 for p in d["spec"]["ports"])]
@@ -265,7 +326,7 @@ class BackupChartTests(unittest.TestCase):
                 chi = one(docs, "ClickHouseInstallation")
                 cluster = chi["spec"]["configuration"]["clusters"][0]
                 job = one(docs, "CronJob")
-                env = {v["name"]: v["value"] for v in job["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]["env"]}
+                env = {v["name"]: v.get("value") for v in job["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]["env"]}
                 endpoints = json.loads(env["BACKUP_ENDPOINTS"])
                 services = [d for d in docs if d["kind"] == "Service" and any(p["port"] == 7171 for p in d["spec"]["ports"])]
                 self.assertEqual(len(endpoints), count)
@@ -276,14 +337,14 @@ class BackupChartTests(unittest.TestCase):
                 for service in services:
                     self.assertEqual(service["spec"]["selector"]["clickhouse.altinity.com/cluster"], cluster["name"])
                     self.assertEqual(service["spec"]["selector"]["clickhouse.altinity.com/shard"], "0")
-                    self.assertFalse(service["spec"].get("publishNotReadyAddresses", False))
+                    self.assertTrue(service["spec"]["publishNotReadyAddresses"])
 
     def test_backup_timeouts_and_job_resources_follow_settings(self):
         docs = render("clickhouse.backup.schedule.timeoutSeconds=21600",
                       "clickhouse.backup.schedule.startingDeadlineSeconds=300",
                       "clickhouse.backup.schedule.resources.requests.cpu=50m",
                       "clickhouse.backup.schedule.resources.limits.memory=256Mi",
-                      "clickhouse.backup.goMemoryLimit=300MiB")
+                      "clickhouse.backup.sidecar.goMemoryLimit=300MiB")
         secret = one(docs, "ExternalSecret", "ao-clickhouse-backup-credentials")
         config = yaml.safe_load(render_secret_template(secret["spec"]["target"]["template"]["data"]["config.yml"], {"password": "fake"}))
         self.assertEqual(config["clickhouse"]["timeout"], "21600s")
@@ -297,6 +358,30 @@ class BackupChartTests(unittest.TestCase):
         self.assertEqual(next(e["value"] for e in runner["env"] if e["name"] == "BACKUP_TIMEOUT_SECONDS"), "21600")
         sidecar = next(c for c in pod(one(docs, "ClickHouseInstallation"))["containers"] if c["name"] == "clickhouse-backup")
         self.assertEqual(next(e["value"] for e in sidecar["env"] if e["name"] == "GOMEMLIMIT"), "300MiB")
+
+    def test_database_probe_tls_matches_certificates_and_mounts_only_public_ca(self):
+        for tls in (True, False):
+            with self.subTest(tls=tls):
+                docs = render("tls.enabled=" + str(tls).lower())
+                chi = one(docs, "ClickHouseInstallation")
+                spec = one(docs, "CronJob")["spec"]["jobTemplate"]["spec"]["template"]["spec"]
+                env = {v["name"]: v.get("value") for v in spec["containers"][0]["env"]}
+                endpoints = json.loads(env["BACKUP_DATABASE_ENDPOINTS"])
+                scheme, port = ("https", 8443) if tls else ("http", 8123)
+                hosts = [self.name + "-backup-" + str(i) for i in range(2)]
+                self.assertEqual(endpoints, [f"{scheme}://{h}:{port}" for h in hosts])
+                for host in hosts:
+                    service = one(docs, "Service", host)
+                    self.assertIn({"name": "database-probe", "port": port, "targetPort": port}, service["spec"]["ports"])
+                if tls:
+                    names = one(docs, "Certificate", "clickhouse-server-tls")["spec"]["dnsNames"]
+                    self.assertTrue(set(hosts) <= set(names))
+                    ca = next(v["secret"] for v in spec["volumes"] if v["name"] == "clickhouse-ca")
+                    self.assertEqual(ca["items"], [{"key": "ca.crt", "path": "ca.crt"}])
+                    self.assertEqual(env["BACKUP_DATABASE_CA_FILE"], "/clickhouse-ca/ca.crt")
+                else:
+                    self.assertNotIn("BACKUP_DATABASE_CA_FILE", env)
+                    self.assertFalse(any(v["name"] == "clickhouse-ca" for v in spec["volumes"]))
 
     def test_extra_database_listener_does_not_expose_backup_controls(self):
         docs = render("clickhouse.backup.networkPolicy.additionalPorts[0]=9004")
@@ -314,11 +399,18 @@ class BackupChartTests(unittest.TestCase):
             "clickhouse.backup.aws.roleArn=": "aws.roleArn",
             "clickhouse.backup.aws.path=../other": "safe directory names",
             "clickhouse.backup.serviceAccount.name=default": "dedicated account",
-            "clickhouse.backup.api.existingSecret=": "separate Secret",
+            "clickhouse.backup.api.existingSecret=": "exactly one",
+            "clickhouse.backup.api.passwordRevision=": "passwordRevision",
+            "clickhouse.backup.sidecar.image=": "digest-pinned",
+            "clickhouse.backup.sidecar.image=altinity/clickhouse-backup:2.8.1": "digest-pinned",
+            "clickhouse.backup.probe.secret=ao-clickhouse-backup-credentials": "separate Secrets",
+            "clickhouse.backup.user.secret=ao-clickhouse-auth-methods": "shared auth bundle",
+            "clickhouse.backup.probe.secret=ao-clickhouse-otel-credentials": "another ClickHouse user",
+            "clickhouse.backup.probe.externalSecret.remoteRef.key=": "backup_probe",
             "clickhouse.backup.api.existingSecret=ao-clickhouse-backup-credentials": "separate",
-            "clickhouse.backup.secret=": "backup.secret",
-            "clickhouse.backup.externalSecret.remoteRef.key=": "backup",
-            "clickhouse.backup.externalSecret.secretStoreRef.name=": "secretStoreRef.name",
+            "clickhouse.backup.user.secret=": "backup.user.secret",
+            "clickhouse.backup.user.externalSecret.remoteRef.key=": "backup",
+            "clickhouse.backup.user.externalSecret.secretStoreRef.name=": "secretStoreRef.name",
             "clickhouse.backup.schedule.timeoutSeconds=1": "at least 60",
             "clickhouse.backup.networkPolicy.additionalPorts[0]=7171": "protected backup port",
             "clickhouse.backup.networkPolicy.additionalPorts[0]=0": "TCP ports",
