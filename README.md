@@ -592,17 +592,42 @@ resources.
 CircleCI runs on every push:
 
 - **Lint** — `helm lint charts/ao-data-platform` on every branch and on `v*` tag pushes.
-- **Publish (dev)** — `dev` branch pushes publish two pre-release artifacts to Docker Hub: `0.0.0-latest` (floating, overwritten every push) and `0.0.0-dev.g<short-sha>` (immutable, one per commit).
+- **Publish (dev)** — `dev` branch pushes publish two pre-release artifacts to Docker Hub: `0.0.0-latest` (floating, overwritten every push) and `<chart-version>-dev.g<full-commit-sha>` (one exact version per commit).
 - **Publish (release)** — `v*` git tag pushes on `main`-ancestor commits publish the numbered version to Docker Hub.
 
 ### Versioning
 
 Two flows, by branch/tag:
 
-- **Dev (continuous):** every push to the `dev` branch publishes a `0.0.0-latest` floating tag and a `0.0.0-dev.g<short-sha>` immutable per-commit tag as pre-releases. The floating tag is for consumers that always want the tip of dev; the per-commit tag preserves history so you can pin or roll back. `0.0.0-` pre-releases are excluded from normal semver version constraints.
+- **Dev (continuous):** every push to `dev` publishes `<chart-version>-dev.g<full-commit-sha>`, using `version:` from `Chart.yaml` (for example, `5.2.0-dev.g<full-commit-sha>`). Pin that exact version for testing and rollback. Keeping the chart's numeric version lets the Terraform module check whether required features are present. CI also keeps publishing `0.0.0-latest` for existing consumers, but it changes on every push and does not satisfy the module's backup-version checks.
 - **Release (tag-driven):** to cut a release, push a `v<semver>` git tag (e.g. `v1.5.0`). CI strips the leading `v` and publishes that version. Tags on commits that are not ancestors of `origin/main` are refused at the start of the publish job. `main` branch pushes alone (without a tag) do not publish anything.
 
-The `version:` field in `Chart.yaml` is overridden by CI for dev publishes. For tagged releases, CI enforces that `Chart.yaml` `version:` matches the tag (minus the leading `v`) — bump `Chart.yaml` and merge to `main` before pushing the `v<semver>` tag, or the publish job will refuse.
+Dev publishing appends the commit suffix without editing `Chart.yaml`; its base
+version must be a release number such as `5.2.0`. Run
+`bash hack/dev-chart-version.sh` to print the exact version for the current commit
+without building or publishing anything. Other branches and PRs run checks only
+unless publishing is explicitly requested as described below. For tagged releases,
+CI enforces that `Chart.yaml` `version:` matches the
+tag (minus the leading `v`) — bump `Chart.yaml` and merge to `main` before pushing
+the `v<semver>` tag, or the publish job will refuse.
+
+To publish a reviewed PR branch for testing, run a new CircleCI pipeline on that
+branch with the boolean parameter `publish_dev_chart` set to `true`. In the UI,
+select the PR's branch in **Run pipeline** and add that parameter. Through the
+project's API v2 trigger endpoint, use a body such as:
+
+```json
+{"branch": "your-reviewed-pr-branch", "parameters": {"publish_dev_chart": true}}
+```
+
+The `publish-branch-chart` workflow runs the full lint/tests job before publishing
+only that commit's version with the existing Docker publishing context. It does
+not update `dev`, `main`, a release tag, or `0.0.0-latest`; `main`, `dev`, and tag
+triggers are excluded from this manual workflow. Confirm the pipeline's commit
+matches the reviewed PR head before using its chart. The parameter defaults to
+`false`, so ordinary PR pushes do not publish.
+CircleCI's parameter documentation:
+https://circleci.com/docs/guides/orchestrate/selecting-a-workflow-to-run-using-pipeline-parameters/
 
 ### Publishing
 

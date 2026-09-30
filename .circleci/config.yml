@@ -1,5 +1,10 @@
 version: 2.1
 
+parameters:
+  publish_dev_chart:
+    type: boolean
+    default: false
+
 defaults:
   - &dockerhub_context
     - docker
@@ -29,6 +34,17 @@ commands:
           command: |
             echo "$DOCKER_PASSWORD" \
               | helm registry login registry-1.docker.io --username "$DOCKER_LOGIN" --password-stdin
+
+  build-and-publish-dev-version:
+    steps:
+      - run:
+          name: Build and publish the exact dev chart version
+          command: |
+            DEV_VERSION=$(bash hack/dev-chart-version.sh)
+            helm dependency build charts/ao-data-platform
+            helm package charts/ao-data-platform --version "$DEV_VERSION"
+            helm push "ao-data-platform-${DEV_VERSION}.tgz" "oci://registry-1.docker.io/montecarlodata"
+            echo "Published ${DEV_VERSION}"
 
 jobs:
   lint:
@@ -974,17 +990,23 @@ jobs:
       - install-helm
       - login-dockerhub
       - add-helm-repos
+      - build-and-publish-dev-version
       - run:
-          name: Build and publish dev chart (latest + per-commit)
+          name: Update the shared dev chart
           command: |
-            SHORT_SHA=$(git rev-parse --short=7 HEAD)
-            DEV_VERSION="0.0.0-dev.g${SHORT_SHA}"
-            helm dependency build charts/ao-data-platform
-            helm package charts/ao-data-platform --version "$DEV_VERSION"
-            helm push "ao-data-platform-${DEV_VERSION}.tgz" "oci://registry-1.docker.io/montecarlodata"
             helm package charts/ao-data-platform --version "0.0.0-latest"
             helm push "ao-data-platform-0.0.0-latest.tgz" "oci://registry-1.docker.io/montecarlodata"
-            echo "Published ${DEV_VERSION} and 0.0.0-latest"
+            echo "Published 0.0.0-latest"
+
+  publish-dev-commit:
+    docker:
+      - image: cimg/base:current
+    steps:
+      - checkout
+      - install-helm
+      - login-dockerhub
+      - add-helm-repos
+      - build-and-publish-dev-version
 
   publish-tag:
     docker:
@@ -1024,6 +1046,8 @@ jobs:
 
 workflows:
   build:
+    when:
+      not: << pipeline.parameters.publish_dev_chart >>
     jobs:
       - lint:
           filters:
@@ -1045,3 +1069,21 @@ workflows:
               ignore: /.*/
             tags:
               only: /^v.*/
+  publish-branch-chart:
+    when: << pipeline.parameters.publish_dev_chart >>
+    jobs:
+      - lint:
+          filters:
+            branches:
+              ignore: [main, dev]
+            tags:
+              ignore: /.*/
+      - publish-dev-commit:
+          requires:
+            - lint
+          context: *dockerhub_context
+          filters:
+            branches:
+              ignore: [main, dev]
+            tags:
+              ignore: /.*/
