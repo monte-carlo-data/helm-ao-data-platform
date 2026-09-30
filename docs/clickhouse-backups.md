@@ -15,8 +15,8 @@ that limits which ports callers may reach. Later changes to the backup container
 image or resources roll the ClickHouse pods again. A failed backup container makes
 its whole pod NotReady and takes that replica out of client service, even if the
 database is healthy. The backup container uses a `400MiB` Go memory target under
-its default `512Mi` memory limit; keep `clickhouse.backup.sidecar.goMemoryLimit` below the
-container limit when changing either value.
+its default `512Mi` memory limit. Keep `clickhouse.backup.sidecar.goMemoryLimit`
+below the container limit when changing either value.
 
 ## AWS prerequisites
 
@@ -48,8 +48,9 @@ Create these before setting `clickhouse.backup.enabled: true`:
   `revision`, or `api.externalSecret` as described below. Set `api.passwordRevision`
   to that same revision. It is an identifier such as `1`, not a password.
 
-Missing backup credentials leave the corresponding database user absent and the
-backup helper waiting; ClickHouse can still start. Empty credentials do not create
+Missing database backup credentials leave that user absent and the helper waiting;
+missing probe credentials leave the probe user absent and cause backup Jobs to fail.
+ClickHouse can still start in either case. Empty credentials do not create
 passwordless users. After fixing Secret delivery, reload the database configuration
 using your normal credential-change process and verify the users before resuming
 backups. The helper itself waits for valid configuration, nonempty database/API
@@ -146,6 +147,7 @@ If no reachable replica passes, the Job fails without starting a backup. Service
 publish NotReady addresses so a recovering replica's active backup remains visible;
 that does not make it eligible to supply the next backup. Probe requests verify
 ClickHouse's TLS certificate when `tls.enabled` is true.
+
 Before an incremental on another copy, it downloads the full backup's small
 metadata files. Database backup data stays in S3, encrypted by the bucket's
 settings. No AWS access keys or KMS key material are stored in the chart.
@@ -165,8 +167,8 @@ includes all users' query log text, not just table metadata. It cannot restore
 or change tables. The API password separately grants control over the backup
 tool, including remote deletion. The separate `backup_probe` user has only
 `SELECT ON system.replicas` and `SHOW TABLES` / `SHOW DATABASES` on `otel_traces.*`;
-it cannot read table data or take backups. The Job has read-only access to pod
-metadata in its namespace to check API revisions and mounts only the public
+it cannot read table data or take backups. The Job can get and list pods in its
+namespace to check API revisions and mounts only the public
 ClickHouse CA certificate for the database probe.
 
 The job waits for completion and checks the S3 catalog. If a submission response

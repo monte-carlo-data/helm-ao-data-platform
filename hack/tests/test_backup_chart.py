@@ -244,10 +244,14 @@ class BackupChartTests(unittest.TestCase):
         self.assertEqual(render_secret_template(templates["revision"], source), "old-revision")
         for item in ("password", "revision"):
             self.assertEqual(render_secret_template(templates[item], {"credentials": "{}"}), "")
-        for override in ("clickhouse.backup.api.existingSecret=also-set", "clickhouse.backup.api.externalSecret.remoteRef.property=password"):
-            with self.subTest(override=override), self.assertRaises(AssertionError):
-                render("clickhouse.backup.api.externalSecret.secretStoreRef.name=ci-placeholder",
-                       "clickhouse.backup.api.externalSecret.remoteRef.key=ci-api-pair", override)
+        with self.assertRaisesRegex(AssertionError, "exactly one"):
+            render("clickhouse.backup.api.externalSecret.secretStoreRef.name=ci-placeholder",
+                   "clickhouse.backup.api.externalSecret.remoteRef.key=ci-api-pair")
+        with self.assertRaisesRegex(AssertionError, "remoteRef.property must be empty"):
+            render("clickhouse.backup.api.existingSecret=",
+                   "clickhouse.backup.api.externalSecret.secretStoreRef.name=ci-placeholder",
+                   "clickhouse.backup.api.externalSecret.remoteRef.key=ci-api-pair",
+                   "clickhouse.backup.api.externalSecret.remoteRef.property=password")
 
     def test_one_job_runs_every_four_hours_without_blind_retries(self):
         job = one(self.enabled, "CronJob")

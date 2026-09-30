@@ -42,10 +42,9 @@ spec:
     # No SQL users in the operator spec (YET-2680, Spike Finding 7): the operator
     # renders a password hash for any password-less users: entry, which cannot
     # coexist with the <auth_methods> the rotation mechanism needs — ClickHouse
-    # rejects the whole users config. Every user is defined completely in the
-    # users.d/auth-methods.xml fragment in `files:` below (networks, grants, and
-    # auth substituted from the mounted auth-methods secret), the same pattern
-    # users.d/probe_user.xml already uses.
+    # rejects the whole users config. Main users are defined in the
+    # users.d/auth-methods.xml fragment below. Optional backup/probe users have
+    # separate XML stores so missing backup Secrets do not affect main users.
     # Adding a ClickHouse user? Also update values.yaml, templates/external-secret.yaml
     # and the authMethodsUsers helper.
     {{- if .Values.clickhouse.readonlyUser.enabled }}
@@ -71,7 +70,7 @@ spec:
           secretKeyRef:
             name: {{ .Values.clickhouse.authMethods.secret }}
             key: auth.xml
-      # The complete definitions of every ClickHouse SQL user (YET-2680) — why
+      # The definitions of the main password-backed users (YET-2680) — why
       # here and not the operator users: spec: see the comment above the profiles
       # section. Networks and grants are exactly what the users spec carried
       # before; auth comes from the mounted file via incl. include_from is read
