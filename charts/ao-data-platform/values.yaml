@@ -29,6 +29,11 @@ clickhouse:
     enabled: false
     provider: aws
     image: altinity/clickhouse-backup:2.8.1
+    # Go's soft memory target. Keep below resources.limits.memory (512Mi here).
+    goMemoryLimit: "400MiB"
+    networkPolicy:
+      # Extra ClickHouse TCP listeners to allow. Never include backup API 7171.
+      additionalPorts: []
     aws:
       bucket: ""
       region: ""
@@ -57,6 +62,10 @@ clickhouse:
       image: python:3.14.3-alpine3.23
       suspend: false
       timeoutSeconds: 10800
+      startingDeadlineSeconds: 900
+      resources:
+        requests: {cpu: 25m, memory: 32Mi}
+        limits: {memory: 128Mi}
     resources:
       requests:
         cpu: 100m

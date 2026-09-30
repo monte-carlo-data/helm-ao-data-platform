@@ -3,7 +3,8 @@
 Helm chart for the Monte Carlo data plane for Agent Observability.
 
 Optional scheduled ClickHouse backups are available in chart 5.2.0. See
-[backup setup and checks](docs/clickhouse-backups.md). They are disabled by default.
+[backup setup and checks](docs/clickhouse-backups.md). They are disabled by default;
+restore is not yet documented.
 
 ## Chart
 
@@ -21,6 +22,8 @@ The ClickHouse instance ships with production hardening: a capped memory ceiling
 
 > **Chart-version bumps no longer recreate ClickHouse:** the ClickHouse operator propagates only a fixed allowlist of stable labels onto the resources it generates. A chart-version bump changes the volatile `helm.sh/chart` label, but that label is no longer stamped onto the StatefulSet's immutable `volumeClaimTemplates`, so the bump no longer forces a delete/recreate of the ClickHouse StatefulSet.
 
+> **Upgrading to 5.2.0:** upgrading with backups disabled leaves ClickHouse unchanged. Enabling `clickhouse.backup.enabled` rolls the ClickHouse pods once, keeping their data volumes, and moves them to the backup AWS ServiceAccount; the ClickHouse server itself then has S3 write access to the backup bucket through IRSA. It also adds an ingress NetworkPolicy selecting the ClickHouse pods, allowing the chart's database, replication, and metrics ports while restricting port 7171 to backup Jobs. Add any custom listener ports before enabling backups. Later backup container image or resource changes roll the ClickHouse pods again, and a failed backup container takes its replica out of client service. Install with the schedule paused, check prerequisites, then resume it; see [backup setup and current limitations](docs/clickhouse-backups.md).
+>
 > **Upgrading to 5.1.0:** the Keeper zone spread gains an explicit reduced-HA opt-out and a per-node hardening. `keeper.zoneSpread.minDomains` (default: unset = `replicasCount`, the existing one-voter-per-zone guarantee) lets clusters with fewer zones than voters schedule anyway — e.g. 3 voters on a 2-AZ cluster pack 2+1 (`maxSkew: 1` still forbids 3+0, and `DoNotSchedule` stays). This is a deliberate weaker posture, not a tuning knob: **losing the AZ holding 2 voters drops the ensemble below quorum**, turning ClickHouse readonly until that AZ recovers — a 3-AZ ensemble survives any single-AZ loss. The CHK pod template also gains required pod anti-affinity on `kubernetes.io/hostname` (one voter per node), so co-zoned voters can't share a node where one node failure would cost two of them. That podTemplate change **rolls the Keeper voters once** on upgrade (one at a time; each re-syncs from the Raft quorum — safe, but not a no-op). This affects no cluster on 4.3.0 or later: the zone floor already forces distinct zones, hence distinct nodes, so the roll lands each voter back where it was. The only way to hit the new rule is a pre-4.3.0 install upgrading directly with the opt-out set in the same step — its co-located voters then stick `Pending` on the roll until the packed AZ has enough eligible nodes (the same node-group + PVC procedure as the 4.3.0 note below).
 >
 > **Upgrading to 5.0.0:** a breaking major release — the ClickHouse SQL users leave the CHI `users:` spec for a static `users.d` fragment whose auth is substituted from an ESO-assembled secret, so each user can hold two valid passwords during a rotation. The upgrade rolls ClickHouse **once** (the pod template gains the auth-methods secret mount); every rotation after that is restartless. Direct consumers who set `clickhouse.<user>.externalSecret` need **no value changes**; consumers who patched the CHI `users:` spec must move their changes into the fragment — see [Upgrading to 5.0.0](#upgrading-to-500--users-leave-the-chi-users-spec).
@@ -591,7 +594,7 @@ resources.
 
 CircleCI runs on every push:
 
-- **Lint** — `helm lint charts/ao-data-platform` on every branch and on `v*` tag pushes.
+- **Checks** — Helm lint, shell syntax and ShellCheck, chart-render checks, and the Python test suites (including the backup scheduler and live-test helper) on every branch and on `v*` tag pushes.
 - **Publish (dev)** — `dev` branch pushes publish two pre-release artifacts to Docker Hub: `0.0.0-latest` (floating, overwritten every push) and `<chart-version>-dev.g<full-commit-sha>` (one exact version per commit).
 - **Publish (release)** — `v*` git tag pushes on `main`-ancestor commits publish the numbered version to Docker Hub.
 
@@ -647,7 +650,7 @@ helm pull oci://registry-1.docker.io/montecarlodata/ao-data-platform --version 2
 
 ## ClickHouse user model
 
-The chart provisions a least-privilege ClickHouse user per access path. Privileges are enforced
+The chart provisions a separate ClickHouse user per access path with the grants listed below. Privileges are enforced
 declaratively via config-level grants in the `ClickHouseInstallation` (no SQL-RBAC bootstrap). The
 materialized views run under `schema_owner` as their `DEFINER`, so the ingest user needs no access
 to the normalized target tables. The stock `default` superuser is removed.
@@ -660,6 +663,7 @@ to the normalized target tables. The stock `default` superuser is removed.
 | `monte_carlo` | reader bundle¹, `READ ON REMOTE`⁴, `SYSTEM SYNC REPLICA` on `conversations_normalized` | `INSERT` on `llm_inputs`/`llm_batches`/`conversation_eval_scores`/`span_eval_scores`/`conversation_cluster_assignments`/`conversations_normalized`/`conversation_rollup_watermarks` | Monte Carlo (data-source monitoring + agent observability, incl. the conversation rollup writer) | always |
 | `probe` | `system.replicas` + table visibility (`SHOW TABLES` on `otel_traces.*`; no data reads) | — (`readonly=2` profile) | the `/ready` readiness handler (see [Writer-safe readiness](#writer-safe-readiness-ready)) | always (passwordless; no ExternalSecret) |
 | `readonly_user` | reader bundle¹ | — (`readonly=2`, so JDBC `SET` works) | humans / MCP / JDBC clients | `clickhouse.readonlyUser.enabled=true` |
+| `backup` | `SELECT ON system.*` (including all users' query log text); `SHOW TABLES` / `SHOW DATABASES` on `otel_traces.*` | `BACKUP` on `otel_traces.*`; no restore or table changes | backup container over loopback only | `clickhouse.backup.enabled=true` |
 | `admin` | all | all + user management + `SYSTEM` | break-glass DBA (not service-to-service; loopback-only by default) | `clickhouse.admin.enabled=true` |
 
 ¹ **reader bundle** = `SELECT` on `otel_traces.*`, `system.tables/parts/query_log`,
@@ -892,6 +896,32 @@ helm upgrade ao-data-platform oci://registry-1.docker.io/montecarlodata/ao-data-
 | `clickhouse.readonlyUser.externalSecret.remoteRef.version` | `""` | Version of the readonly_user secret (required for Fake provider) |
 | `clickhouse.readonlyUser.externalSecret.refreshInterval` | `1h` | How often ESO syncs the readonly_user secret |
 | `clickhouse.readonlyUser.externalSecret.previousKey` | `""` | Previous-password key for `readonly_user` — same semantics as `clickhouse.otel.externalSecret.previousKey`. |
+| `clickhouse.backup.enabled` | `false` | Install scheduled backups, the backup database user, and a container in every ClickHouse pod. Enabling rolls the pods; see [backup setup](docs/clickhouse-backups.md). |
+| `clickhouse.backup.provider` | `aws` | Backup storage provider; only AWS is supported. |
+| `clickhouse.backup.image` | `altinity/clickhouse-backup:2.8.1` | Backup container image, not the Job runner. Changing it rolls ClickHouse pods. |
+| `clickhouse.backup.aws.bucket` | `""` | Existing S3 backup bucket; required when enabled. |
+| `clickhouse.backup.aws.region` | `""` | Bucket's AWS region; required when enabled. |
+| `clickhouse.backup.aws.roleArn` | `""` | Existing IRSA role ARN; required when enabled. Both ClickHouse and the backup container use this role. |
+| `clickhouse.backup.aws.path` | `clickhouse` | S3 prefix: native backup data uses `<path>/native/`, and the catalog uses `<path>/catalog/`. Neither prefix may have lifecycle expiration. |
+| `clickhouse.backup.serviceAccount.name` | `clickhouse-backup` | Dedicated Kubernetes ServiceAccount created by the chart and named in the role's trust policy; cannot be `default`. |
+| `clickhouse.backup.secret` | `ao-clickhouse-backup-credentials` | Kubernetes Secret created by External Secrets for the database password and backup configuration. This is separate from the API password Secret. |
+| `clickhouse.backup.externalSecret.secretStoreRef.name` | `""` | Store for the backup database password; required when enabled. |
+| `clickhouse.backup.externalSecret.secretStoreRef.kind` | `ClusterSecretStore` | Kind of the backup password store reference. |
+| `clickhouse.backup.externalSecret.remoteRef.key` | `""` | External secret key holding the backup database password; required when enabled. |
+| `clickhouse.backup.externalSecret.remoteRef.property` | `""` | Property within a JSON secret (optional). |
+| `clickhouse.backup.externalSecret.remoteRef.version` | `""` | Version of the backup database secret (required for Fake provider). |
+| `clickhouse.backup.externalSecret.refreshInterval` | `1h` | How often External Secrets syncs the backup database password and configuration. |
+| `clickhouse.backup.externalSecret.previousKey` | `""` | Previous database-password key; follows `clickhouse.otel.externalSecret.previousKey`. Does not rotate the API password. |
+| `clickhouse.backup.api.existingSecret` | `""` | Existing Secret in the release namespace with the separate API `password` key; required when enabled. Rotation requires a ClickHouse pod roll; see [credential limitations](docs/clickhouse-backups.md#install-with-the-schedule-paused). |
+| `clickhouse.backup.schedule.cron` | `0 */4 * * *` | UTC schedule. The first successful run each day is full; later runs use that full as their base. |
+| `clickhouse.backup.schedule.suspend` | `false` | Pause new scheduled Jobs. Does not stop existing work or prevent the installation's pod roll; set `true` for initial setup. |
+| `clickhouse.backup.schedule.timeoutSeconds` | `10800` | Job wait and backup tool's ClickHouse timeout, in seconds; minimum 60. Leave time before the next run or `Forbid` can skip scheduled Jobs. |
+| `clickhouse.backup.schedule.startingDeadlineSeconds` | `900` | Latest allowed start after a missed scheduled time, in seconds. |
+| `clickhouse.backup.schedule.image` | `python:3.14.3-alpine3.23` | Backup Job runner image; changing it does not roll ClickHouse pods. |
+| `clickhouse.backup.schedule.resources` | requests: `25m` CPU / `32Mi` memory; limit: `128Mi` memory | Backup Job resources. |
+| `clickhouse.backup.resources` | requests: `100m` CPU / `128Mi` memory; limit: `512Mi` memory | Backup container resources; changing these rolls ClickHouse pods. |
+| `clickhouse.backup.goMemoryLimit` | `400MiB` | Go's soft memory target for the backup container. Keep it below `clickhouse.backup.resources.limits.memory`. |
+| `clickhouse.backup.networkPolicy.additionalPorts` | `[]` | Extra TCP listeners allowed from all sources when backups are enabled. Port 7171 is reserved for backup Jobs and rejected here; requires NetworkPolicy enforcement. |
 | `clickhouse.authMethods.secret` | `ao-clickhouse-auth-methods` | Name of the K8s Secret (created by ESO) holding the assembled auth-methods substitution file. |
 | `clickhouse.authMethods.externalSecret.secretStoreRef.name` | `""` (→ `otel`'s) | Store for the bundle ExternalSecret; defaults to the `otel` user's store when empty. |
 | `clickhouse.authMethods.externalSecret.secretStoreRef.kind` | `ClusterSecretStore` | Kind of the bundle's secret store reference. |

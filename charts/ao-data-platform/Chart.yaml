@@ -2,6 +2,7 @@ apiVersion: v2
 name: ao-data-platform
 description: Monte Carlo data platform — ClickHouse, OTel collector, and schema management
 # 5.2.0 adds optional scheduled ClickHouse backups; disabled by default.
+# See README "Upgrading to 5.2.0" and docs/clickhouse-backups.md before enabling.
 version: 5.2.0
 type: application
 # minDomains on the ClickHouse/Keeper zone topologySpreadConstraints is GA in

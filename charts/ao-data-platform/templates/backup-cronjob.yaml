@@ -1,10 +1,6 @@
 {{- include "ao-data-platform.backupValidate" . -}}
 {{- if .Values.clickhouse.backup.enabled }}
 {{- $b := .Values.clickhouse.backup }}
-{{- $endpoints := list }}
-{{- range $replica := until (int (min 2 .Values.clickhouse.replicasCount)) }}
-{{- $endpoints = append $endpoints (printf "http://%s-backup-%d:7171" (include "ao-data-platform.chiName" $) $replica) }}
-{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -26,7 +22,7 @@ spec:
   timeZone: Etc/UTC
   suspend: {{ $b.schedule.suspend }}
   concurrencyPolicy: Forbid
-  startingDeadlineSeconds: 900
+  startingDeadlineSeconds: {{ $b.schedule.startingDeadlineSeconds }}
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 3
   jobTemplate:
@@ -54,7 +50,7 @@ spec:
               command: ["python3", "/scripts/run_backup.py"]
               env:
                 - name: BACKUP_ENDPOINTS
-                  value: {{ $endpoints | toJson | quote }}
+                  value: {{ include "ao-data-platform.backupEndpoints" . | quote }}
                 - name: BACKUP_PASSWORD_FILE
                   value: /credentials/password
                 - name: BACKUP_TIMEOUT_SECONDS
@@ -69,8 +65,7 @@ spec:
                   mountPath: /credentials
                   readOnly: true
               resources:
-                requests: {cpu: 25m, memory: 32Mi}
-                limits: {memory: 128Mi}
+                {{- toYaml $b.schedule.resources | nindent 16 }}
               securityContext:
                 readOnlyRootFilesystem: true
                 allowPrivilegeEscalation: false

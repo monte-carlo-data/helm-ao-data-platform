@@ -134,6 +134,7 @@ class BackupChartTests(unittest.TestCase):
         self.assertNotIn("subPath", mounts["/etc/clickhouse-backup"])
         self.assertTrue(mounts["/etc/clickhouse-backup"]["readOnly"])
         env = {item["name"]: item for item in sidecar["env"]}
+        self.assertEqual(env["GOMEMLIMIT"]["value"], "400MiB")
         self.assertEqual(env["API_PASSWORD"]["valueFrom"]["secretKeyRef"],
                          {"name": "ci-backup-api", "key": "password"})
         for forbidden in ("CLICKHOUSE_PASSWORD", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"):
@@ -143,6 +144,7 @@ class BackupChartTests(unittest.TestCase):
         destination = disk.find("storage_configuration/disks/backups_s3")
         self.assertEqual(destination.findtext("type"), "s3")
         self.assertEqual(destination.findtext("use_environment_credentials"), "1")
+        self.assertEqual(destination.findtext("skip_access_check"), "true")
         self.assertEqual(destination.findtext("endpoint"),
                          "https://s3.us-west-1.amazonaws.com/ao-backup-render-test/render-test/native/")
         self.assertEqual(disk.findtext("backups/allowed_disk"), "backups_s3")
@@ -158,6 +160,7 @@ class BackupChartTests(unittest.TestCase):
         self.assertEqual(config["clickhouse"]["password"], password)
         self.assertTrue(config["clickhouse"]["use_embedded_backup_restore"])
         self.assertEqual(config["clickhouse"]["embedded_backup_disk"], "backups_s3")
+        self.assertEqual(config["clickhouse"]["timeout"], "10800s")
         self.assertFalse(config["clickhouse"]["use_embedded_backup_restore_cluster"])
         self.assertFalse(config["general"]["rbac_backup_always"])
         self.assertFalse(config["api"]["allow_parallel"])
@@ -233,7 +236,75 @@ class BackupChartTests(unittest.TestCase):
             elif not rule.get("from"):
                 normal_ports.update(ports)
         self.assertEqual(len(api_rules), 1)
-        self.assertTrue({8123, 8443, 9000, 9440, 9009, 9363}.issubset(normal_ports))
+        required = self.database_listener_ports(self.chi)
+        self.assertEqual(required, normal_ports)
+
+    @staticmethod
+    def database_listener_ports(chi):
+        # Derive customer-facing ports from the rendered CHI, not a second copy
+        # of the policy's literals. The operator also exposes replication and
+        # metrics (9009/9363), and ClickHouse's default native listener (9000).
+        ports = {9009, 9363, 9000}
+        for service in chi["spec"]["templates"]["serviceTemplates"]:
+            ports.update(p["port"] for p in service["spec"]["ports"])
+        for container in pod(chi)["containers"]:
+            for key in ("readinessProbe", "livenessProbe"):
+                probe = container.get(key, {}).get("httpGet", {})
+                if "port" in probe:
+                    ports.add(probe["port"])
+        # The HTTP listener stays enabled even when the client Service uses TLS.
+        ports.add(8123)
+        settings = chi["spec"]["configuration"]["settings"]
+        ports.update(int(settings[k]) for k in ("https_port", "tcp_port_secure") if k in settings)
+        return ports
+
+    def test_every_replica_gets_a_matching_backup_address(self):
+        for count in (1, 2, 3):
+            with self.subTest(replicas=count):
+                docs = render(f"clickhouse.replicasCount={count}")
+                chi = one(docs, "ClickHouseInstallation")
+                cluster = chi["spec"]["configuration"]["clusters"][0]
+                job = one(docs, "CronJob")
+                env = {v["name"]: v["value"] for v in job["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]["env"]}
+                endpoints = json.loads(env["BACKUP_ENDPOINTS"])
+                services = [d for d in docs if d["kind"] == "Service" and any(p["port"] == 7171 for p in d["spec"]["ports"])]
+                self.assertEqual(len(endpoints), count)
+                self.assertEqual(len(services), count)
+                self.assertEqual(endpoints, [f"http://{chi['metadata']['name']}-backup-{i}:7171" for i in range(count)])
+                self.assertEqual({s["metadata"]["name"] for s in services}, {url.split("//")[1].split(":")[0] for url in endpoints})
+                self.assertEqual({s["spec"]["selector"]["clickhouse.altinity.com/replica"] for s in services}, {str(i) for i in range(count)})
+                for service in services:
+                    self.assertEqual(service["spec"]["selector"]["clickhouse.altinity.com/cluster"], cluster["name"])
+                    self.assertEqual(service["spec"]["selector"]["clickhouse.altinity.com/shard"], "0")
+                    self.assertFalse(service["spec"].get("publishNotReadyAddresses", False))
+
+    def test_backup_timeouts_and_job_resources_follow_settings(self):
+        docs = render("clickhouse.backup.schedule.timeoutSeconds=21600",
+                      "clickhouse.backup.schedule.startingDeadlineSeconds=300",
+                      "clickhouse.backup.schedule.resources.requests.cpu=50m",
+                      "clickhouse.backup.schedule.resources.limits.memory=256Mi",
+                      "clickhouse.backup.goMemoryLimit=300MiB")
+        secret = one(docs, "ExternalSecret", "ao-clickhouse-backup-credentials")
+        config = yaml.safe_load(render_secret_template(secret["spec"]["target"]["template"]["data"]["config.yml"], {"password": "fake"}))
+        self.assertEqual(config["clickhouse"]["timeout"], "21600s")
+        job = one(docs, "CronJob")
+        self.assertEqual(job["spec"]["startingDeadlineSeconds"], 300)
+        template = job["spec"]["jobTemplate"]["spec"]
+        self.assertEqual(template["activeDeadlineSeconds"], 21660)
+        runner = template["template"]["spec"]["containers"][0]
+        self.assertEqual(runner["resources"]["requests"]["cpu"], "50m")
+        self.assertEqual(runner["resources"]["limits"]["memory"], "256Mi")
+        self.assertEqual(next(e["value"] for e in runner["env"] if e["name"] == "BACKUP_TIMEOUT_SECONDS"), "21600")
+        sidecar = next(c for c in pod(one(docs, "ClickHouseInstallation"))["containers"] if c["name"] == "clickhouse-backup")
+        self.assertEqual(next(e["value"] for e in sidecar["env"] if e["name"] == "GOMEMLIMIT"), "300MiB")
+
+    def test_extra_database_listener_does_not_expose_backup_controls(self):
+        docs = render("clickhouse.backup.networkPolicy.additionalPorts[0]=9004")
+        chi = one(docs, "ClickHouseInstallation")
+        policy = one(docs, "NetworkPolicy", f"{chi['metadata']['name']}-backup-api")["spec"]
+        public_ports = {p["port"] for r in policy["ingress"] if not r.get("from") for p in r["ports"]}
+        self.assertEqual(public_ports, self.database_listener_ports(chi) | {9004})
+        self.assertNotIn(7171, public_ports)
 
     def test_unsafe_or_incomplete_backup_configuration_fails_rendering(self):
         cases = {
@@ -249,6 +320,9 @@ class BackupChartTests(unittest.TestCase):
             "clickhouse.backup.externalSecret.remoteRef.key=": "backup",
             "clickhouse.backup.externalSecret.secretStoreRef.name=": "secretStoreRef.name",
             "clickhouse.backup.schedule.timeoutSeconds=1": "at least 60",
+            "clickhouse.backup.networkPolicy.additionalPorts[0]=7171": "protected backup port",
+            "clickhouse.backup.networkPolicy.additionalPorts[0]=0": "TCP ports",
+            "clickhouse.backup.networkPolicy.additionalPorts[0]=65536": "TCP ports",
         }
         for override, message in cases.items():
             with self.subTest(override=override):

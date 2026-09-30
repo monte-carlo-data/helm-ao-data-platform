@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run one scheduled backup through the pinned clickhouse-backup v2.8.1 API.
 
-The CronJob runs every four hours with concurrencyPolicy: Forbid and backoffLimit: 0.
+The default CronJob schedule runs every four hours.
 The first successful run of each UTC day creates a full backup; later runs use
 that day's latest full backup as their base. This avoids a chain of incrementals
 when moving between copies. Both copies must share the same native S3 backup disk.
@@ -81,7 +81,9 @@ def full_base(catalog, now):
     """Only use this schedule's complete embedded full backups from today.
 
     The API puts broken-backup errors in `desc`, replacing the format. Requiring
-    the exact healthy format (compression_format: none) excludes those entries.
+    the exact healthy value excludes those entries. Its "directory" format
+    depends on s3.compression_format: none in templates/_backup.tpl; keep that
+    setting and this check (including the completed-backup check below) in sync.
     A full backup must also have no `required` dependency.
     """
     candidates = []
@@ -114,12 +116,14 @@ class Scheduler:
             raise BackupError("Backup wait timed out; the server may still be working. No retry was sent.")
 
     def choose_copy(self):
-        # Check both copies before choosing one. A running command on either
-        # copy may belong to an earlier Job that stopped waiting for its result.
+        # Check every reachable copy before choosing one. A running command may
+        # belong to an earlier Job that stopped waiting for its result. v2.8.1
+        # /status shows only the last command, which can be a later list call;
+        # /actions still includes any earlier command that remains in progress.
         healthy = []
         for index, api in enumerate(self.apis):
             try:
-                rows = api.request("GET", "/backup/status")
+                rows = api.request("GET", "/backup/actions")
             except BackupError:
                 continue
             if any(row.get("status") == "in progress" for row in rows):
@@ -177,7 +181,8 @@ class Scheduler:
         row = local_entry()
         if row is None:
             # On the native S3 disk this downloads pointers and the .backup
-            # manifest, not the database payload. schema=1 omits that manifest.
+            # manifest, not the database payload. Don't add schema=1: it skips
+            # that manifest, which the incremental backup needs.
             self.operation(api, "download", name, "/backup/download/" + name)
             row = local_entry()
         if (not row or row.get("desc") != "embedded"

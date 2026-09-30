@@ -7,6 +7,7 @@
    this file from silently emitting a wrong/absent appProtocol for an invalid provider. */ -}}
 {{- include "ao-data-platform.gatewayValidate" . -}}
 {{- include "ao-data-platform.backupValidate" . -}}
+{{- $ports := include "ao-data-platform.clickhousePorts" . | fromJson -}}
 apiVersion: "clickhouse.altinity.com/v1"
 kind: "ClickHouseInstallation"
 metadata:
@@ -16,7 +17,7 @@ metadata:
 spec:
   configuration:
     clusters:
-      - name: "otel"
+      - name: {{ include "ao-data-platform.clickhouseClusterName" . | quote }}
         # Auto-generated cluster secret for intra-cluster (replica→replica) query hops.
         # Without it, distributed queries such as clusterAllReplicas() authenticate the
         # remote hop as the `default` user — which this chart removes — and fail
@@ -383,8 +384,8 @@ spec:
       # retention via `ALTER TABLE system.<log> MODIFY TTL` instead; see
       # templates/schema-job.yaml.
       {{- if .Values.tls.enabled }}
-      tcp_port_secure: "9440"
-      https_port: "8443"
+      tcp_port_secure: {{ $ports.tcpSecure | toString | quote }}
+      https_port: {{ $ports.https | toString | quote }}
       openSSL/server/certificateFile: /etc/clickhouse-server/secrets.d/server.crt/clickhouse-server-tls/tls.crt
       openSSL/server/privateKeyFile: /etc/clickhouse-server/secrets.d/server.key/clickhouse-server-tls/tls.key
       openSSL/server/caConfig: /etc/clickhouse-server/secrets.d/ca.crt/clickhouse-server-tls/ca.crt
@@ -428,10 +429,10 @@ spec:
                 httpGet:
                   path: /ping
                   {{- if .Values.tls.enabled }}
-                  port: 8443
+                  port: {{ int $ports.https }}
                   scheme: HTTPS
                   {{- else }}
-                  port: 8123
+                  port: {{ int $ports.http }}
                   {{- end }}
                 failureThreshold: 30
                 periodSeconds: 10
@@ -450,10 +451,10 @@ spec:
                 httpGet:
                   path: /ready
                   {{- if .Values.tls.enabled }}
-                  port: 8443
+                  port: {{ int $ports.https }}
                   scheme: HTTPS
                   {{- else }}
-                  port: 8123
+                  port: {{ int $ports.http }}
                   {{- end }}
                 periodSeconds: 10
                 timeoutSeconds: 5
@@ -517,7 +518,7 @@ spec:
           ports:
             {{- if .Values.tls.enabled }}
             - name: https
-              port: 8443
+              port: {{ int $ports.https }}
               {{- if and .Values.gateway.enabled (eq .Values.gateway.provider "gke") }}
               # GKE keys backend re-encryption + the LB health-check scheme off appProtocol,
               # so mark the ClickHouse HTTPS port: the Gateway's BackendTLSPolicy re-encrypts
@@ -525,12 +526,12 @@ spec:
               appProtocol: HTTPS
               {{- end }}
             - name: tcp-secure
-              port: 9440
+              port: {{ int $ports.tcpSecure }}
             {{- else }}
             - name: http
-              port: 8123
+              port: {{ int $ports.http }}
             - name: tcp
-              port: 9000
+              port: {{ int $ports.tcp }}
             {{- end }}
     volumeClaimTemplates:
       - name: data

@@ -13,7 +13,25 @@
 {{- if not $b.api.existingSecret -}}{{- fail "clickhouse.backup.api.existingSecret must name a separate Secret containing the API password." -}}{{- end -}}
 {{- if eq $b.api.existingSecret $b.secret -}}{{- fail "The backup API secret must be separate from the rotating ClickHouse password secret." -}}{{- end -}}
 {{- if lt (int $b.schedule.timeoutSeconds) 60 -}}{{- fail "clickhouse.backup.schedule.timeoutSeconds must be at least 60." -}}{{- end -}}
+{{- range $port := $b.networkPolicy.additionalPorts -}}
+{{- if or (not (regexMatch "^[0-9]+$" (toString $port))) (lt (int $port) 1) (gt (int $port) 65535) (eq (int $port) 7171) -}}
+{{- fail "clickhouse.backup.networkPolicy.additionalPorts must contain TCP ports from 1 to 65535, excluding the protected backup port 7171." -}}
 {{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Match the single-shard CHI layout; every configured replica can be a source. */}}
+{{- define "ao-data-platform.backupReplicas" -}}
+{{- until (int .Values.clickhouse.replicasCount) | toJson -}}
+{{- end -}}
+
+{{- define "ao-data-platform.backupEndpoints" -}}
+{{- $endpoints := list -}}
+{{- range $replica := (include "ao-data-platform.backupReplicas" . | fromJsonArray) -}}
+{{- $endpoints = append $endpoints (printf "http://%s-backup-%d:7171" (include "ao-data-platform.chiName" $) (int $replica)) -}}
+{{- end -}}
+{{- toJson $endpoints -}}
 {{- end -}}
 
 {{- define "ao-data-platform.backupDisk" -}}
@@ -27,6 +45,8 @@
         <use_environment_credentials>1</use_environment_credentials>
         <cache_enabled>false</cache_enabled>
         <send_metadata>false</send_metadata>
+        <!-- Backup storage trouble must fail backups, not ClickHouse startup. -->
+        <skip_access_check>true</skip_access_check>
       </backups_s3>
     </disks>
   </storage_configuration>
@@ -48,10 +68,11 @@ clickhouse:
   port: 9000
   username: backup
   password: {{ "{{ .password | quote }}" }}
-  timeout: 4h
+  timeout: {{ printf "%ds" (int .Values.clickhouse.backup.schedule.timeoutSeconds) | quote }}
   use_embedded_backup_restore: true
   embedded_backup_disk: backups_s3
-  # ON CLUSTER here would back up both copies. Restores use separate admin config.
+  # A local backup can run while another replica is down. ON CLUSTER requires
+  # every replica; the embedded cluster-restore path has not been verified.
   use_embedded_backup_restore_cluster: ""
 s3:
   bucket: {{ .Values.clickhouse.backup.aws.bucket | quote }}
@@ -73,6 +94,8 @@ api:
   env:
     - name: API_USERNAME
       value: backup
+    - name: GOMEMLIMIT
+      value: {{ .Values.clickhouse.backup.goMemoryLimit | quote }}
     - name: API_PASSWORD
       valueFrom:
         secretKeyRef:

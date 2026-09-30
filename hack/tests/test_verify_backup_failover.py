@@ -1,8 +1,7 @@
 """Run the failover helper against fake kubectl/API responses, never a cluster."""
 
 import argparse
-from contextlib import redirect_stdout
-import copy
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 import hashlib
 import importlib
@@ -31,6 +30,12 @@ helper = load("verify_failover", "hack/verify-backup-failover.py")
 scheduler = load("run_backup", "charts/ao-data-platform/files/clickhouse-backup/run_backup.py")
 FULL = "ao-otel-full-20260929T000000Z-12345678"
 NOW = datetime(2026, 9, 29, 0, 30, tzinfo=timezone.utc)
+
+
+class FrozenDateTime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return NOW
 
 
 def metadata(name=FULL, location="remote", required=""):
@@ -82,11 +87,6 @@ class PodTests(unittest.TestCase):
         self.copies = [CopyAPI(self.remote, first=True), CopyAPI(self.remote)]
 
     def run_pod(self, expected=FULL):
-        class FrozenDateTime(datetime):
-            @classmethod
-            def now(cls, tz=None):
-                return NOW
-
         fake_datetime = types.ModuleType("datetime")
         fake_datetime.__dict__.update(vars(importlib.import_module("datetime")))
         fake_datetime.datetime = FrozenDateTime
@@ -111,6 +111,12 @@ class PodTests(unittest.TestCase):
         self.assertEqual(len(lines), 1)
         return json.loads(lines[0].removeprefix("EVIDENCE "))
 
+    def assert_inconclusive(self, result, reason, requests_sent=0):
+        self.assertEqual(result["status"], "inconclusive")
+        self.assertEqual(result["reason"], reason)
+        self.assertEqual(result["requests_sent"], requests_sent)
+        self.assertEqual(result["instruction"], "Stop and inspect; do not rerun automatically.")
+
     def test_real_scheduler_downloads_then_creates_on_copy_one_only(self):
         result = self.run_pod()
         self.assertEqual(result["status"], "passed")
@@ -121,7 +127,9 @@ class PodTests(unittest.TestCase):
         self.assertEqual([p[0] for p in self.copies[1].posts], ["/backup/download/" + FULL, "/backup/create_remote"])
 
     def test_wrong_full_fails_before_any_post(self):
-        self.assertEqual(self.run_pod("ao-otel-full-20260929T001500Z-12345678")["status"], "inconclusive")
+        self.assert_inconclusive(
+            self.run_pod("ao-otel-full-20260929T001500Z-12345678"),
+            "The expected full backup is not today's latest healthy full backup.")
         self.assertEqual(self.copies[0].posts + self.copies[1].posts, [])
 
     def test_active_operation_hidden_by_later_list_still_blocks(self):
@@ -129,32 +137,39 @@ class PodTests(unittest.TestCase):
             {"command":"create_remote another", "status":"in progress", "operation_id":"busy"},
             {"command":"list remote", "status":"success", "operation_id":""},
         ])
-        self.assertEqual(self.run_pod()["status"], "inconclusive")
+        self.assert_inconclusive(self.run_pod(), "A backup command is already running; stop and inspect it.")
         self.assertEqual(self.copies[0].posts + self.copies[1].posts, [])
 
     def test_existing_copy_one_metadata_does_not_fake_download_proof(self):
         self.copies[1].local[FULL] = metadata(location="local")
-        self.assertEqual(self.run_pod()["status"], "inconclusive")
+        self.assert_inconclusive(
+            self.run_pod(), "Copy 1 already has this full backup; use a future full to test downloading it.")
         self.assertEqual(self.copies[1].posts, [])
 
     def test_uncertain_download_is_not_retried_and_never_creates_backup(self):
         self.copies[1].fail_post = True
-        self.assertEqual(self.run_pod()["status"], "inconclusive")
+        self.assert_inconclusive(
+            self.run_pod(),
+            "The download request was not confirmed. It may still run; no retry or switch was sent.",
+            requests_sent=1)
         self.assertEqual(len(self.copies[1].posts), 1)
         self.assertEqual(self.copies[0].posts, [])
 
     def test_operation_starting_after_preflight_is_caught_before_post(self):
-        original = self.copies[1].request
-        reads = 0
-        def request(method, path, query=None):
-            nonlocal reads
-            if path == "/backup/actions":
-                reads += 1
-                if reads == 3:
-                    self.copies[1].history.append({"command":"create_remote concurrent", "status":"in progress", "operation_id":"concurrent"})
-            return original(method, path, query)
-        self.copies[1].request = request
-        self.assertEqual(self.run_pod()["status"], "inconclusive")
+        original = scheduler.Scheduler.prepare_base
+        def prepare_base(instance, api, name):
+            self.copies[1].history.append({"command":"create_remote concurrent", "status":"in progress", "operation_id":"concurrent"})
+            return original(instance, api, name)
+        with mock.patch.object(scheduler.Scheduler, "prepare_base", prepare_base):
+            result = self.run_pod()
+        self.assert_inconclusive(result, "A backup command is already running; stop and inspect it.")
+        self.assertEqual(self.copies[0].posts + self.copies[1].posts, [])
+
+    def test_unexpected_exception_uses_generic_reason_without_error_details(self):
+        with mock.patch.object(scheduler, "full_base", side_effect=ValueError("private error details")):
+            result = self.run_pod()
+        self.assert_inconclusive(result, "Verification failed; inspect the Job before continuing.")
+        self.assertNotIn("private error details", json.dumps(result))
         self.assertEqual(self.copies[0].posts + self.copies[1].posts, [])
 
 
@@ -168,15 +183,54 @@ class CLITests(unittest.TestCase):
                 "spec":{"restartPolicy":"Never", "containers":[{"name":"backup", "env":[]}],
                         "volumes":[{"name":"script", "configMap":{"name":"live-scheduler"}}]}}}}}}
         self.jobs = []
+        self.calls = []
+        self.terminal = {"status":{
+            "conditions":[{"type":"Complete", "status":"True"}], "succeeded":1,
+            "startTime":"2026-09-29T00:30:00Z", "completionTime":"2026-09-29T00:31:00Z"}}
+        self.evidence = {"status":"passed", "selected_copy":1,
+                         "backup":"ao-otel-incremental-20260929T003000Z-87654321",
+                         "required":FULL, "remote_before":1, "remote_after":2,
+                         "downloaded_full_metadata":True, "copy0_mutations":0}
+        self.logs = "EVIDENCE " + json.dumps(self.evidence) + "\n"
 
     def kubectl(self, args, *command):
+        self.calls.append(command)
         if command[:2] == ("get", "cronjob"):
             return json.dumps(self.cron)
         if command[:2] == ("get", "jobs"):
             return json.dumps({"items":self.jobs})
         if command[:2] == ("get", "configmap"):
             return json.dumps({"data":{"run_backup.py":"installed scheduler"}})
+        if command[:2] == ("create", "-f"):
+            manifest = json.loads(Path(command[2]).read_text())
+            self.assertEqual(manifest["kind"], "Job")
+            self.assertEqual(manifest["metadata"]["name"], self.args.job_name)
+            return "created"
+        if command[:2] == ("get", "job"):
+            return json.dumps(self.terminal)
+        if command[0] == "logs":
+            return self.logs
         raise AssertionError(command)
+
+    def run_cli(self, directory, *, run=True, overrides=None):
+        values = {"context":"test", "namespace":"montecarlo", "cronjob":"otel-backup",
+                  "expected-full":FULL, "job-name":"verify-one", "output-dir":str(directory)}
+        values.update(overrides or {})
+        argv = ["verify"]
+        for key, value in values.items():
+            argv.extend(["--" + key, str(value)])
+        if run:
+            argv.append("--run")
+        output, errors = io.StringIO(), io.StringIO()
+        with mock.patch.object(helper, "kubectl", side_effect=self.kubectl), \
+                mock.patch.object(helper, "datetime", FrozenDateTime), \
+                mock.patch.object(sys, "argv", argv), \
+                redirect_stdout(output), redirect_stderr(errors):
+            result = helper.main()
+        return result, output.getvalue(), errors.getvalue()
+
+    def assert_no_create(self):
+        self.assertFalse(any(command[0] == "create" for command in self.calls), self.calls)
 
     def test_prepare_only_reads_and_preserves_network_labels(self):
         with mock.patch.object(helper, "kubectl", side_effect=self.kubectl):
@@ -189,35 +243,100 @@ class CLITests(unittest.TestCase):
     def test_pending_job_with_no_active_count_blocks(self):
         self.jobs = [{"metadata":{"name":"pending"}, "status":{},
                       "spec":{"template":{"metadata":{"labels":{"component":"backup-job"}}}}}]
-        with mock.patch.object(helper, "kubectl", side_effect=self.kubectl), self.assertRaises(helper.CheckFailed):
+        with mock.patch.object(helper, "kubectl", side_effect=self.kubectl), self.assertRaisesRegex(
+                helper.CheckFailed, "^A related backup Job is still pending or running\\. Stop and inspect it first\\.$"):
             helper.prepare(self.args, NOW)
 
     def test_job_template_cannot_start_parallel_backup_pods(self):
         self.cron["spec"]["jobTemplate"]["spec"]["parallelism"] = 2
-        with mock.patch.object(helper, "kubectl", side_effect=self.kubectl), self.assertRaises(helper.CheckFailed):
+        with mock.patch.object(helper, "kubectl", side_effect=self.kubectl), self.assertRaisesRegex(
+                helper.CheckFailed, "^The test requires exactly one Pod and one completion\\.$"):
             helper.prepare(self.args, NOW)
 
     def test_schedule_start_margin_blocks_late_cronjob_window(self):
-        with mock.patch.object(helper, "kubectl", side_effect=self.kubectl), self.assertRaises(helper.CheckFailed):
+        with mock.patch.object(helper, "kubectl", side_effect=self.kubectl), self.assertRaisesRegex(
+                helper.CheckFailed,
+                "^Choose a time at least 15 minutes after the last run and 15 minutes before the next, including the test timeout\\.$"):
             helper.prepare(self.args, NOW.replace(minute=14))
 
+    def test_run_success_returns_zero_and_writes_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result, output, errors = self.run_cli(directory)
+            self.assertEqual((result, errors), (0, ""))
+            evidence_path = Path(directory) / "verify-one.evidence.json"
+            evidence = json.loads(evidence_path.read_text())
+            expected = dict(self.evidence, job="verify-one", context="test", namespace="montecarlo",
+                            started="2026-09-29T00:30:00Z", completed="2026-09-29T00:31:00Z",
+                            scheduler_sha256=hashlib.sha256(b"installed scheduler").hexdigest())
+            self.assertEqual(evidence, expected)
+            self.assertEqual(json.loads(output.splitlines()[-1]), expected)
+            self.assertEqual([c for c in self.calls if c[0] == "create"],
+                             [("create", "-f", str(Path(directory) / "verify-one.run.json"))])
+
+    def test_changed_prepared_file_refuses_run_without_creating_job(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(self.run_cli(directory, run=False)[0], 0)
+            self.assert_no_create()
+            prepared = Path(directory) / "verify-one.prepared.json"
+            manifest = json.loads(prepared.read_text())
+            manifest["spec"]["template"]["spec"]["containers"][0]["image"] = "changed-after-review"
+            prepared.write_text(json.dumps(manifest))
+            self.calls.clear()
+            result, _, errors = self.run_cli(directory)
+            self.assertEqual(result, 1)
+            self.assertEqual(errors.strip(),
+                             "The live Job template or scheduler changed after preparation. Stop and review it.")
+            self.assert_no_create()
+            self.assertFalse((Path(directory) / "verify-one.run.json").exists())
+
+    def test_missing_or_duplicate_evidence_refuses_success(self):
+        for count in (0, 2):
+            with self.subTest(evidence_lines=count), tempfile.TemporaryDirectory() as directory:
+                self.calls.clear()
+                self.logs = "ordinary log output\n" + ("EVIDENCE " + json.dumps(self.evidence) + "\n") * count
+                result, _, errors = self.run_cli(directory)
+                self.assertEqual(result, 1)
+                self.assertEqual(errors.strip(), "No single final evidence record was found. Stop and inspect the Job.")
+                self.assertFalse((Path(directory) / "verify-one.evidence.json").exists())
+                self.assertEqual(sum(c[0] == "create" for c in self.calls), 1)
+
+    def test_existing_terminal_job_name_refuses_run(self):
+        self.jobs = [{"metadata":{"name":"verify-one"},
+                      "status":{"conditions":[{"type":"Complete", "status":"True"}]},
+                      "spec":{"template":{"metadata":{"labels":{"component":"unrelated"}}}}}]
+        with tempfile.TemporaryDirectory() as directory:
+            result, _, errors = self.run_cli(directory)
+            self.assertEqual(result, 1)
+            self.assertEqual(errors.strip(),
+                             "That Job name already exists. Inspect it; do not create a replacement automatically.")
+            self.assert_no_create()
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_invalid_arguments_fail_before_any_kubectl_call(self):
+        cases = [
+            ({"job-name":"Invalid-Name"}, "Use a Kubernetes Job name of at most 63 lowercase letters, digits, and hyphens."),
+            ({"job-name":"a" * 64}, "Use a Kubernetes Job name of at most 63 lowercase letters, digits, and hyphens."),
+            ({"expected-full":"latest"}, "Expected-full must be an exact full-backup name from this scheduler."),
+            ({"timeout-seconds":59}, "Timeout must be between 60 and 3600 seconds."),
+            ({"timeout-seconds":3601}, "Timeout must be between 60 and 3600 seconds."),
+        ]
+        for overrides, reason in cases:
+            with self.subTest(overrides=overrides), tempfile.TemporaryDirectory() as directory:
+                self.calls.clear()
+                result, _, errors = self.run_cli(directory, overrides=overrides)
+                self.assertEqual(result, 1)
+                self.assertEqual(errors.strip(), reason)
+                self.assertEqual(self.calls, [])
+                self.assertEqual(list(Path(directory).iterdir()), [])
+
     def test_failed_job_cannot_pass_because_it_printed_passed_evidence(self):
-        terminal = {"status":{"conditions":[{"type":"Failed", "status":"True"}], "succeeded":0}}
-        manifest = {"spec":{"template":{"spec":{"containers":[{"env":[{"name":"VERIFY_SCRIPT_SHA256", "value":"abc"}]}]}}}}
-        def kubectl(args, *command):
-            if command[0] == "create": return "created"
-            if command[0] == "get": return json.dumps(terminal)
-            if command[0] == "logs": return 'EVIDENCE {"status":"passed"}\n'
-            raise AssertionError(command)
-        with tempfile.TemporaryDirectory() as directory, \
-                mock.patch.object(helper, "prepare", return_value=manifest), \
-                mock.patch.object(helper, "kubectl", side_effect=kubectl), \
-                mock.patch.object(sys, "argv", ["verify", "--context", "test", "--namespace", "montecarlo",
-                    "--cronjob", "otel-backup", "--expected-full", FULL, "--job-name", "verify-one",
-                    "--output-dir", directory, "--run"]), redirect_stdout(io.StringIO()):
-            self.assertEqual(helper.main(), 1)
+        self.terminal = {"status":{"conditions":[{"type":"Failed", "status":"True"}], "succeeded":0}}
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(self.run_cli(directory)[0], 1)
             result = json.loads((Path(directory) / "verify-one.evidence.json").read_text())
             self.assertEqual(result["status"], "inconclusive")
+            self.assertEqual(result["reason"],
+                             "The Job did not finish successfully. Stop and inspect; do not rerun automatically.")
             self.assertEqual(result["context"], "test")
 
 

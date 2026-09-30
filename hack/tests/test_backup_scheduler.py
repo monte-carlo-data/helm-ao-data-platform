@@ -1,7 +1,7 @@
 """Exercise scheduling and uncertain API outcomes without AWS or ClickHouse."""
 
 import base64
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 import importlib.util
 import io
@@ -37,14 +37,19 @@ class Clock:
 
 
 class FakeAPI:
-    def __init__(self, catalog=None, local=None):
+    def __init__(self, catalog=None, local=None, history=None, created_required=""):
         self.catalog = list(catalog or [])
         self.local = list(local or [])
+        self.history = list(history or [])
+        # The server's completed dependency is independent of the submitted
+        # diff-from-remote value, so verification must compare the two.
+        self.created_required = created_required
         self.calls = []
         self.unavailable = False
-        self.busy = False
         self.table_failure = False
         self.post_failure = False
+        self.acknowledgement_changes = {}
+        self.acknowledgement_count = 1
         self.statuses = ["success"]
         self.status_read_failures = 0
         self.publish_remote = True
@@ -64,11 +69,17 @@ class FakeAPI:
             operation = "download" if path.startswith("/backup/download/") else "create_remote"
             name = path.rsplit("/", 1)[1] if operation == "download" else query["name"]
             self.operation = (operation, name, query or {})
-            return [{"status": "acknowledged", "operation": operation,
-                     "backup_name": name, "operation_id": "id-1"}]
+            self.operation_id = "id-" + str(len(self.history) + 1)
+            acknowledgement = {"status": "acknowledged", "operation": operation,
+                               "backup_name": name, "operation_id": self.operation_id}
+            self.history.append(dict(acknowledgement, status="in progress"))
+            acknowledgement.update(self.acknowledgement_changes)
+            return [acknowledgement] * self.acknowledgement_count
+        if path == "/backup/actions":
+            return list(self.history)
         if path == "/backup/status":
             if not query:
-                return [{"status": "in progress"}] if self.busy else []
+                return self.history[-1:]
             if self.status_read_failures:
                 self.status_read_failures -= 1
                 raise backup.BackupError("read timed out")
@@ -76,19 +87,25 @@ class FakeAPI:
             if len(self.statuses) > 1:
                 self.statuses.pop(0)
             if status == "success":
-                operation, name, parameters = self.operation
+                operation, name, _ = self.operation
                 if operation == "download":
                     self.local.append(dict(name=name, location="local", desc="embedded", required=""))
                 elif self.publish_remote:
-                    self.catalog.append(remote(name, parameters.get("diff-from-remote", "")))
-            return [{"status": status, "operation_id": "id-1", "error": "private error detail"}]
+                    self.catalog.append(remote(name, self.created_required))
+            for row in self.history:
+                if row.get("operation_id") == self.operation_id:
+                    row["status"] = status
+            return [{"status": status, "operation_id": self.operation_id, "error": "private error detail"}]
         if path == "/backup/tables":
             if self.table_failure:
                 raise backup.BackupError("ClickHouse is down")
+            self.history.append({"command": "tables", "status": "success"})
             return [{"database": "otel_traces", "name": "spans"}]
         if path == "/backup/list/remote":
+            self.history.append({"command": "list remote", "status": "success"})
             return self.catalog
         if path == "/backup/list/local":
+            self.history.append({"command": "list local", "status": "success"})
             return self.local
         raise AssertionError((method, path, query))
 
@@ -111,7 +128,7 @@ class SchedulerTests(unittest.TestCase):
     def test_daily_full_is_used_even_if_newer_increment_exists(self):
         full = remote()
         inc = remote("ao-otel-incremental-20260929T040000Z-abcdefgh", FULL)
-        first = FakeAPI([full, inc], [dict(full, location="local", desc="embedded")])
+        first = FakeAPI([full, inc], [dict(full, location="local", desc="embedded")], created_required=FULL)
         name = self.run_scheduler(first)
         self.assertIn("incremental", name)
         self.assertEqual(len(first.posts), 1)
@@ -137,7 +154,7 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(backup.full_base([remote(), remote(latest)], NOW), latest)
 
     def test_fallback_downloads_full_metadata_from_shared_remote_catalog(self):
-        first, second = FakeAPI(), FakeAPI([remote()])
+        first, second = FakeAPI(), FakeAPI([remote()], created_required=FULL)
         first.unavailable = True
         self.run_scheduler(first, second)
         self.assertEqual(first.posts, [])
@@ -154,8 +171,20 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(len(second.posts), 1)
 
     def test_active_operation_on_either_copy_prevents_new_backup(self):
-        first, second = FakeAPI(), FakeAPI()
-        second.busy = True
+        for busy_index in (0, 1):
+            with self.subTest(copy=busy_index):
+                apis = [FakeAPI(), FakeAPI()]
+                apis[busy_index].history = [{"command": "create_remote", "status": "in progress"}]
+                with self.assertRaisesRegex(backup.BackupError, "already running"):
+                    self.run_scheduler(*apis)
+                self.assertEqual(apis[0].posts + apis[1].posts, [])
+
+    def test_successful_list_does_not_hide_an_earlier_running_backup(self):
+        first, second = FakeAPI(), FakeAPI(history=[
+            {"command": "create_remote", "status": "in progress"},
+            {"command": "list remote", "status": "success"},
+        ])
+        self.assertEqual(second.request("GET", "/backup/status"), second.history[-1:])
         with self.assertRaisesRegex(backup.BackupError, "already running"):
             self.run_scheduler(first, second)
         self.assertEqual(first.posts + second.posts, [])
@@ -178,6 +207,36 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(len(first.posts), 1)
         self.assertEqual(second.posts, [])
 
+    def test_cancel_and_unknown_status_stop_without_retry_or_switch(self):
+        for status, message in [("cancel", "operation failed"), ("unexpected", "unknown operation status")]:
+            with self.subTest(status=status):
+                first, second = FakeAPI(), FakeAPI()
+                first.statuses = [status]
+                with self.assertRaisesRegex(backup.BackupError, message) as caught:
+                    self.run_scheduler(first, second)
+                self.assertNotIn("private error detail", str(caught.exception))
+                self.assertEqual(len(first.posts), 1)
+                self.assertEqual(second.posts, [])
+                polls = [call for call in first.calls if call[1] == "/backup/status"]
+                self.assertEqual(len(polls), 1)
+
+    def test_malformed_acknowledgement_is_never_retried_or_moved(self):
+        cases = [
+            ({}, 0), ({}, 2), ({"status": "success"}, 1),
+            ({"operation": "download"}, 1), ({"backup_name": "another-backup"}, 1),
+            ({"operation_id": ""}, 1), ({"operation_id": None}, 1),
+        ]
+        for changes, count in cases:
+            with self.subTest(changes=changes, count=count):
+                first, second = FakeAPI(), FakeAPI()
+                first.acknowledgement_changes = changes
+                first.acknowledgement_count = count
+                with self.assertRaisesRegex(backup.BackupError, "not confirmed; no retry or switch"):
+                    self.run_scheduler(first, second)
+                self.assertEqual(len(first.posts), 1)
+                self.assertEqual(second.posts, [])
+                self.assertFalse(any(call[1] == "/backup/status" for call in first.calls))
+
     def test_wait_timeout_does_not_resubmit(self):
         first, second = FakeAPI(), FakeAPI()
         first.statuses = ["in progress"]
@@ -197,6 +256,27 @@ class SchedulerTests(unittest.TestCase):
         first.publish_remote = False
         with self.assertRaisesRegex(backup.BackupError, "not found in S3"):
             self.run_scheduler(first)
+
+    def test_completed_incremental_must_record_the_requested_full_dependency(self):
+        for recorded in ("", "another-full-backup"):
+            with self.subTest(recorded=recorded):
+                full = remote()
+                first = FakeAPI([full], [dict(full, location="local", desc="embedded")],
+                                created_required=recorded)
+                second = FakeAPI()
+                with self.assertRaisesRegex(backup.BackupError, "not found in S3"):
+                    self.run_scheduler(first, second)
+                self.assertEqual(len(first.posts), 1)
+                self.assertEqual(first.posts[0][2]["diff-from-remote"], FULL)
+                self.assertEqual(first.catalog[-1]["required"], recorded)
+                self.assertEqual(second.posts, [])
+
+    def test_completed_full_must_not_record_a_dependency(self):
+        first, second = FakeAPI(created_required=FULL), FakeAPI()
+        with self.assertRaisesRegex(backup.BackupError, "not found in S3"):
+            self.run_scheduler(first, second)
+        self.assertEqual(len(first.posts), 1)
+        self.assertEqual(second.posts, [])
 
     def test_download_failure_never_starts_incremental(self):
         first = FakeAPI([remote()])
@@ -271,13 +351,73 @@ class APITests(unittest.TestCase):
 
     def test_main_reads_password_from_file_without_logging_it(self):
         settings = {"BACKUP_ENDPOINTS": json.dumps([self.url]), "BACKUP_PASSWORD_FILE": "/credentials/password"}
+        stdout, stderr = io.StringIO(), io.StringIO()
         with mock.patch.dict(backup.os.environ, settings, clear=True), \
                 mock.patch.object(backup.Path, "read_text", return_value="private-password") as read, \
                 mock.patch.object(backup.Scheduler, "run"), \
-                mock.patch.object(backup, "API") as api:
+                mock.patch.object(backup, "API") as api, \
+                redirect_stdout(stdout), redirect_stderr(stderr):
             self.assertEqual(backup.main(), 0)
             read.assert_called_once_with()
             api.assert_called_once_with(self.url, "backup", "private-password")
+        self.assertNotIn("private-password", stdout.getvalue() + stderr.getvalue())
+
+    def test_main_failures_return_one_and_keep_credentials_out_of_output(self):
+        cases = [
+            ("backup failure", {}, "private-password", backup.BackupError("The backup operation failed."),
+             "backup operation failed"),
+            ("empty password", {}, "", None, "mounted backup password is empty"),
+            ("missing endpoints", {"BACKUP_ENDPOINTS": None}, "private-password", None, "check scheduler settings"),
+            ("empty endpoints", {"BACKUP_ENDPOINTS": "[]"}, "private-password", None, "nonempty JSON list"),
+            ("object endpoints", {"BACKUP_ENDPOINTS": "{}"}, "private-password", None, "nonempty JSON list"),
+            ("nonstring endpoint", {"BACKUP_ENDPOINTS": "[1]"}, "private-password", None, "nonempty JSON list"),
+            ("invalid endpoints", {"BACKUP_ENDPOINTS": "not json"}, "private-password", None, "check scheduler settings"),
+            ("zero timeout", {"BACKUP_TIMEOUT_SECONDS": "0"}, "private-password", None, "must be positive"),
+            ("negative timeout", {"BACKUP_TIMEOUT_SECONDS": "-1"}, "private-password", None, "must be positive"),
+            ("invalid timeout", {"BACKUP_TIMEOUT_SECONDS": "abc"}, "private-password", None, "check scheduler settings"),
+            ("zero poll", {"BACKUP_POLL_SECONDS": "0"}, "private-password", None, "must be positive"),
+            ("negative poll", {"BACKUP_POLL_SECONDS": "-1"}, "private-password", None, "must be positive"),
+            ("invalid poll", {"BACKUP_POLL_SECONDS": "abc"}, "private-password", None, "check scheduler settings"),
+        ]
+        for label, changes, password, failure, message in cases:
+            with self.subTest(case=label):
+                settings = {"BACKUP_ENDPOINTS": json.dumps([self.url]), "BACKUP_PASSWORD_FILE": "/credentials/password"}
+                settings.update(changes)
+                settings = {key: value for key, value in settings.items() if value is not None}
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with mock.patch.dict(backup.os.environ, settings, clear=True), \
+                        mock.patch.object(backup.Path, "read_text", return_value=password), \
+                        mock.patch.object(backup.Scheduler, "run", side_effect=failure) as run, \
+                        mock.patch.object(backup, "API"), \
+                        redirect_stdout(stdout), redirect_stderr(stderr):
+                    self.assertEqual(backup.main(), 1)
+                self.assertIn(message, stderr.getvalue())
+                self.assertNotIn("private-password", stdout.getvalue() + stderr.getvalue())
+                self.assertNotIn("private server body", stdout.getvalue() + stderr.getvalue())
+                if failure is None:
+                    run.assert_not_called()
+
+    def test_main_does_not_print_unreadable_password_file_details(self):
+        settings = {"BACKUP_ENDPOINTS": json.dumps([self.url])}
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.dict(backup.os.environ, settings, clear=True), \
+                mock.patch.object(backup.Path, "read_text", side_effect=OSError("private-password private server body")), \
+                redirect_stdout(stdout), redirect_stderr(stderr):
+            self.assertEqual(backup.main(), 1)
+        self.assertIn("check scheduler settings", stderr.getvalue())
+        self.assertNotIn("private", stdout.getvalue() + stderr.getvalue())
+
+    def test_main_api_failure_does_not_print_password_or_server_body(self):
+        type(self).response = (500, {}, b"private server body")
+        settings = {"BACKUP_ENDPOINTS": json.dumps([self.url])}
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.dict(backup.os.environ, settings, clear=True), \
+                mock.patch.object(backup.Path, "read_text", return_value="private-password"), \
+                redirect_stdout(stdout), redirect_stderr(stderr):
+            self.assertEqual(backup.main(), 1)
+        self.assertIn("could list the trace tables and remote backups", stderr.getvalue())
+        self.assertNotIn("private-password", stdout.getvalue() + stderr.getvalue())
+        self.assertNotIn("private server body", stdout.getvalue() + stderr.getvalue())
 
 
 if __name__ == "__main__":

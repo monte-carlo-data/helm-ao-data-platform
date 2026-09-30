@@ -1,6 +1,6 @@
 {{- include "ao-data-platform.backupValidate" . -}}
 {{- if .Values.clickhouse.backup.enabled }}
-{{- range $replica := until (int (min 2 $.Values.clickhouse.replicasCount)) }}
+{{- range $replica := (include "ao-data-platform.backupReplicas" . | fromJsonArray) }}
 ---
 apiVersion: v1
 kind: Service
@@ -12,7 +12,8 @@ spec:
   type: ClusterIP
   selector:
     clickhouse.altinity.com/chi: {{ include "ao-data-platform.chiName" $ }}
-    clickhouse.altinity.com/cluster: otel
+    clickhouse.altinity.com/cluster: {{ include "ao-data-platform.clickhouseClusterName" $ }}
+    # The CHI layout has one shard; this is its zero-based operator label.
     clickhouse.altinity.com/shard: "0"
     clickhouse.altinity.com/replica: {{ $replica | quote }}
   ports:
