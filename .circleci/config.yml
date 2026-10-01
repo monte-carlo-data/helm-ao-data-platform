@@ -1,5 +1,13 @@
 version: 2.1
 
+parameters:
+  run_backup_runtime:
+    type: boolean
+    default: false
+  publish_dev_chart:
+    type: boolean
+    default: false
+
 defaults:
   - &dockerhub_context
     - docker
@@ -30,6 +38,17 @@ commands:
             echo "$DOCKER_PASSWORD" \
               | helm registry login registry-1.docker.io --username "$DOCKER_LOGIN" --password-stdin
 
+  build-and-publish-dev-version:
+    steps:
+      - run:
+          name: Build and publish the exact dev chart version
+          command: |
+            DEV_VERSION=$(bash hack/dev-chart-version.sh)
+            helm dependency build charts/ao-data-platform
+            helm package charts/ao-data-platform --version "$DEV_VERSION"
+            helm push "ao-data-platform-${DEV_VERSION}.tgz" "oci://registry-1.docker.io/montecarlodata"
+            echo "Published ${DEV_VERSION}"
+
 jobs:
   lint:
     docker:
@@ -37,18 +56,18 @@ jobs:
     steps:
       - checkout
       - run:
-          name: Shell syntax check (hack/)
+          name: Shell syntax check
           # 700+ lines of `set -euo pipefail` deploy-verification shell only run against a
           # live cluster, so a parse error would otherwise surface mid-deploy. Fail fast on
           # any syntax error (noexec parse — no cluster or side effects).
           command: |
-            for f in hack/*.sh hack/lib/*.sh; do
+            for f in hack/*.sh hack/lib/*.sh charts/ao-data-platform/files/clickhouse-backup/*.sh; do
               [ -e "$f" ] || continue
               bash -n "$f" || { echo "syntax error in $f"; exit 1; }
             done
-            echo "hack/ shell syntax OK."
+            echo "Shell syntax OK."
       - run:
-          name: Shellcheck (hack/)
+          name: Shellcheck
           # bash -n only catches parse errors; shellcheck catches the runtime classes
           # these scripts have actually shipped — e.g. a command substitution without
           # `|| true` dying under `set -euo pipefail` before its diagnostic prints.
@@ -58,8 +77,8 @@ jobs:
           command: |
             sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
             shellcheck --version
-            shellcheck -x -P SCRIPTDIR hack/*.sh hack/lib/*.sh
-            echo "hack/ shellcheck OK."
+            shellcheck -x -P SCRIPTDIR hack/*.sh hack/lib/*.sh charts/ao-data-platform/files/clickhouse-backup/*.sh
+            echo "Shellcheck OK."
       - install-helm
       - add-helm-repos
       - run:
@@ -68,6 +87,13 @@ jobs:
       - run:
           name: Lint chart
           command: helm lint charts/ao-data-platform
+      - run:
+          name: Test scheduled backups and chart access rules
+          command: |
+            sudo apt-get update -qq && sudo apt-get install -y -qq python3-venv
+            python3 -m venv /tmp/ao-backup-tests
+            /tmp/ao-backup-tests/bin/pip install PyYAML==6.0.3
+            PYTHONDONTWRITEBYTECODE=1 /tmp/ao-backup-tests/bin/python -m unittest discover -s hack/tests -v
       - run:
           name: Kubernetes 1.29 render fails the kubeVersion floor
           # Chart.yaml declares kubeVersion: ">=1.30.0-0" so minDomains (GA in 1.30)
@@ -959,6 +985,55 @@ jobs:
             assert_marker vertex  gcp   --set llmWorker.vertex.project=p
             echo "schema-job seeds the correct cloud/provider marker for every provider."
 
+  backup-runtime:
+    # Bind-mounted fixtures must share a filesystem with the Docker daemon.
+    machine:
+      image: ubuntu-2404:2026.05.1
+    resource_class: medium
+    environment:
+      FORCE_BACKUP_RUNTIME: "<< pipeline.parameters.run_backup_runtime >>"
+      PUBLISH_BACKUP_CHART: "<< pipeline.parameters.publish_dev_chart >>"
+    steps:
+      - checkout
+      - run:
+          name: Select backup runtime checks
+          command: |
+            if [ "$FORCE_BACKUP_RUNTIME" = true ] || [ "$PUBLISH_BACKUP_CHART" = true ] || [ -n "${CIRCLE_TAG:-}" ]; then
+              exit 0
+            fi
+            if [ "${CIRCLE_BRANCH:-}" = main ] || [ "${CIRCLE_BRANCH:-}" = dev ]; then
+              exit 0
+            fi
+            # Check the whole branch diff. If history is unavailable, run the
+            # checks instead of silently treating a shallow checkout as safe.
+            git fetch --quiet origin main --depth=200 || exit 0
+            base=$(git merge-base HEAD origin/main) || exit 0
+            if [ "$base" = "$(git rev-parse HEAD)" ]; then
+              base=$(git rev-parse HEAD^) || exit 0
+            fi
+            if ! git diff --name-only "$base" HEAD | grep -Eq '^(\.circleci/|charts/ao-data-platform/|hack/tests/|hack/verify-backup-failover\.py)'; then
+              echo "No backup chart, script, or test changes; skipping Docker checks."
+              circleci-agent step halt
+            fi
+      - install-helm
+      - add-helm-repos
+      - run:
+          name: Prepare public runtime-test dependencies
+          command: |
+            sudo apt-get update -qq && sudo apt-get install -y -qq python3-venv
+            python3 -m venv /tmp/backup-runtime-tests
+            /tmp/backup-runtime-tests/bin/pip install PyYAML==6.0.3
+            helm dependency build charts/ao-data-platform
+            docker pull clickhouse/clickhouse-server:26.4.3
+            docker pull altinity/clickhouse-backup:2.8.1@sha256:08016b048f7e6035c048501315c2a788e5a782f15f168e042c7bd48d5a388cc4
+            docker pull python:3.12-slim-bookworm@sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e
+      - run:
+          name: Test stock backup startup, secrets, S3 isolation, and replica queries
+          no_output_timeout: 15m
+          command: |
+            RUN_BACKUP_RUNTIME=1 PYTHONDONTWRITEBYTECODE=1 /tmp/backup-runtime-tests/bin/python \
+              -m unittest discover -s hack/tests/runtime -p test_backup_runtime.py -v
+
   publish-dev:
     docker:
       - image: cimg/base:current
@@ -967,17 +1042,23 @@ jobs:
       - install-helm
       - login-dockerhub
       - add-helm-repos
+      - build-and-publish-dev-version
       - run:
-          name: Build and publish dev chart (latest + per-commit)
+          name: Update the shared dev chart
           command: |
-            SHORT_SHA=$(git rev-parse --short=7 HEAD)
-            DEV_VERSION="0.0.0-dev.g${SHORT_SHA}"
-            helm dependency build charts/ao-data-platform
-            helm package charts/ao-data-platform --version "$DEV_VERSION"
-            helm push "ao-data-platform-${DEV_VERSION}.tgz" "oci://registry-1.docker.io/montecarlodata"
             helm package charts/ao-data-platform --version "0.0.0-latest"
             helm push "ao-data-platform-0.0.0-latest.tgz" "oci://registry-1.docker.io/montecarlodata"
-            echo "Published ${DEV_VERSION} and 0.0.0-latest"
+            echo "Published 0.0.0-latest"
+
+  publish-dev-commit:
+    docker:
+      - image: cimg/base:current
+    steps:
+      - checkout
+      - install-helm
+      - login-dockerhub
+      - add-helm-repos
+      - build-and-publish-dev-version
 
   publish-tag:
     docker:
@@ -1017,14 +1098,21 @@ jobs:
 
 workflows:
   build:
+    when:
+      not: << pipeline.parameters.publish_dev_chart >>
     jobs:
       - lint:
+          filters:
+            tags:
+              only: /^v.*/
+      - backup-runtime:
           filters:
             tags:
               only: /^v.*/
       - publish-dev:
           requires:
             - lint
+            - backup-runtime
           context: *dockerhub_context
           filters:
             branches:
@@ -1032,9 +1120,35 @@ workflows:
       - publish-tag:
           requires:
             - lint
+            - backup-runtime
           context: *dockerhub_context
           filters:
             branches:
               ignore: /.*/
             tags:
               only: /^v.*/
+  publish-branch-chart:
+    when: << pipeline.parameters.publish_dev_chart >>
+    jobs:
+      - lint:
+          filters:
+            branches:
+              ignore: [main, dev]
+            tags:
+              ignore: /.*/
+      - backup-runtime:
+          filters:
+            branches:
+              ignore: [main, dev]
+            tags:
+              ignore: /.*/
+      - publish-dev-commit:
+          requires:
+            - lint
+            - backup-runtime
+          context: *dockerhub_context
+          filters:
+            branches:
+              ignore: [main, dev]
+            tags:
+              ignore: /.*/
