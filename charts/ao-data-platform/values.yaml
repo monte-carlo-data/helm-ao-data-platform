@@ -28,6 +28,11 @@ clickhouse:
   backup:
     enabled: false
     provider: aws
+    migration:
+      # Temporary first upgrade step for an existing shared backup credential.
+      # Requires backups enabled and the schedule paused. Clear only after
+      # hack/check-backup-upgrade.py confirms both replacement Pods are ready.
+      keepSharedCredentials: false
     sidecar:
       # Required when enabled: digest-pinned build from images/clickhouse-backup.
       image: ""

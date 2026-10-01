@@ -13,6 +13,9 @@ REPLICA_COUNT=2
 ```
 
 The names below use the chart's `otel` ClickHouse installation and cluster.
+When upgrading from a shared backup credential, first complete the
+[two paused migration steps](clickhouse-backups.md#upgrade-an-existing-shared-backup-user),
+including `hack/check-backup-upgrade.py`, before resuming this verification flow.
 The access checks work with any replica count. The copy-switch helper requires
 **exactly two replicas** and an idle, **unsuspended** CronJob with schedule
 `0 */4 * * *`, UTC timezone, and `concurrencyPolicy: Forbid`. Finish the initial

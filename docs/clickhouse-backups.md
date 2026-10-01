@@ -43,12 +43,15 @@ Create these before setting `clickhouse.backup.enabled: true`:
 - Separate database backup and freshness-probe passwords in your external secret
   store, with a working SecretStore or ClusterSecretStore that can read each key.
   Their ExternalSecrets and ClickHouse user definitions are separate from other
-  database users; a failed lookup cannot stall those users' password updates.
+  database users in the final configuration; a failed lookup cannot stall those
+  users' password updates. The temporary migration below retains the old shared
+  dependency until both Pods have been replaced.
 - A separate API Secret in the release namespace containing `password` and
   `revision`, or `api.externalSecret` as described below. Set `api.passwordRevision`
   to that same revision. It is an identifier such as `1`, not a password.
 
-Missing database backup credentials leave that user absent and the helper waiting;
+With `migration.keepSharedCredentials: false`, missing database backup credentials
+leave that user absent and the helper waiting;
 missing probe credentials leave the probe user absent and cause backup Jobs to fail.
 ClickHouse can still start in either case. Empty credentials do not create
 passwordless users. After fixing Secret delivery, reload the database configuration
@@ -62,6 +65,61 @@ https://github.com/monte-carlo-data/terraform-aws-ao-data-platform
 
 AWS IRSA setup:
 https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts.html
+
+## Upgrade an existing shared backup user
+
+If the installed chart puts `backup_auth_methods` in the shared ClickHouse auth
+Secret, use two paused upgrades to move it into its separate Secret. A direct
+upgrade can leave an old Pod with new shared files but without the new mounts;
+if its ClickHouse container restarts in that state, ordinary users lose that
+replica. Fresh installations leave `migration.keepSharedCredentials: false`.
+
+1. Pause the existing backup CronJob and let running backup and cleanup work
+   finish. Keep its database and API passwords unchanged during this migration.
+   Check manually started backup API and native backup/restore operations too;
+   the read-only migration check below checks Jobs, not those operations.
+   For the first upgrade, set these values alongside the normal backup settings:
+
+   ```yaml
+   clickhouse:
+     backup:
+       enabled: true
+       migration:
+         keepSharedCredentials: true
+       schedule:
+         suspend: true
+   ```
+
+   This keeps the old backup password subtree in the shared auth Secret while
+   the operator replaces the Pods. The new user-store configuration is mounted
+   only in replacement Pods, together with the files it needs. The shared helper
+   configuration keeps a `4h` timeout for the old image; new helpers use
+   `CLICKHOUSE_TIMEOUT` set from `schedule.timeoutSeconds`.
+2. Wait for both replacement copies, then run the read-only check:
+
+   ```bash
+   python3 hack/check-backup-upgrade.py \
+     --context "<your-context>" --namespace "<release-namespace>" \
+     --chi otel --cronjob otel-backup
+   ```
+
+   The check requires a paused, idle schedule, completed operator work, two
+   current Ready Pods, and the actual new files and mounts in each container.
+   It also confirms that neither Pod still uses the old backup include. It
+   prints no passwords and makes no changes. Helm success or Pod Ready alone
+   does not establish those conditions.
+3. After the check passes, apply `migration.keepSharedCredentials: false` while
+   keeping `schedule.suspend: true`. This removes the old shared password source
+   and restores the configured timeout in the helper Secret. It does not change
+   the ClickHouse Pod template or require another Pod roll. Wait for the shared
+   and backup ExternalSecrets to sync, verify ordinary users, backup APIs, probe
+   credentials, replica freshness, and both per-copy TLS endpoints. Then resume
+   scheduling and check a successful backup using the steps below.
+
+Keep the first step brief: until `keepSharedCredentials` is cleared, the old
+backup password source remains a dependency of the shared auth Secret. Do not
+clear it before the read-only check passes or enable scheduling while it is true;
+the chart rejects that combination. The supplied check supports two replicas.
 
 ## Install with the schedule paused
 

@@ -6,6 +6,11 @@ Optional scheduled ClickHouse backups are available in chart 5.2.0. See
 [backup setup and checks](docs/clickhouse-backups.md). They are disabled by default;
 restore is not yet documented.
 
+Existing backup installations that use the shared ClickHouse auth Secret need
+[two paused upgrades](docs/clickhouse-backups.md#upgrade-an-existing-shared-backup-user)
+to move credentials safely. Keep `backup.migration.keepSharedCredentials: true`
+for the first roll, run the read-only check, then clear it before resuming backups.
+
 ## Chart
 
 ### ao-data-platform
@@ -924,6 +929,7 @@ helm upgrade ao-data-platform oci://registry-1.docker.io/montecarlodata/ao-data-
 | `clickhouse.backup.api.externalSecret` | `null` | Optional `secretStoreRef`, `remoteRef`, and `refreshInterval` (`1h` default). Source JSON must contain both `password` and `revision`; omit `remoteRef.property`. Creates `otel-backup-api`, independently of database credentials. |
 | `clickhouse.backup.schedule.cron` | `0 */4 * * *` | UTC schedule. The first successful run each day is full; later runs use that full as their base. |
 | `clickhouse.backup.schedule.suspend` | `false` | Pause new scheduled Jobs. Does not stop existing work or prevent the installation's pod roll; set `true` for initial setup. |
+| `clickhouse.backup.migration.keepSharedCredentials` | `false` | Temporary first step when upgrading from shared backup auth. Requires backups enabled and scheduling paused; preserves the old password subtree until both replacement Pods pass `hack/check-backup-upgrade.py`. Clear while still paused to finish the migration without another Pod roll. Fresh installs leave it false. |
 | `clickhouse.backup.schedule.timeoutSeconds` | `10800` | Job wait and backup tool's ClickHouse timeout, in seconds; minimum 60. Leave time before the next run or `Forbid` can skip scheduled Jobs. |
 | `clickhouse.backup.schedule.startingDeadlineSeconds` | `900` | Latest allowed start after a missed scheduled time, in seconds. |
 | `clickhouse.backup.schedule.image` | `python:3.14.3-alpine3.23` | Backup Job runner image; changing it does not roll ClickHouse pods. |

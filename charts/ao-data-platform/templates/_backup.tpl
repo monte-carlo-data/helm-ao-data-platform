@@ -1,5 +1,8 @@
 {{- define "ao-data-platform.backupValidate" -}}
 {{- $b := .Values.clickhouse.backup -}}
+{{- if and $b.migration.keepSharedCredentials (or (not $b.enabled) (not $b.schedule.suspend)) -}}
+{{- fail "clickhouse.backup.migration.keepSharedCredentials requires backup.enabled=true and backup.schedule.suspend=true." -}}
+{{- end -}}
 {{- if $b.enabled -}}
 {{- if ne $b.provider "aws" -}}{{- fail "clickhouse.backup.provider currently supports only aws." -}}{{- end -}}
 {{- range $key := list "bucket" "region" "roleArn" "path" -}}
@@ -92,7 +95,9 @@ clickhouse:
   port: 9000
   username: backup
   password: {{ "{{ .password | quote }}" }}
-  timeout: {{ printf "%ds" (int .Values.clickhouse.backup.schedule.timeoutSeconds) | quote }}
+  # Existing helpers can read this Secret until their Pods are replaced.
+  # New helpers use CLICKHOUSE_TIMEOUT from their Pod environment in both steps.
+  timeout: {{ ternary "4h" (printf "%ds" (int .Values.clickhouse.backup.schedule.timeoutSeconds)) .Values.clickhouse.backup.migration.keepSharedCredentials | quote }}
   use_embedded_backup_restore: true
   embedded_backup_disk: backups_s3
   # A local backup can run while another replica is down. ON CLUSTER requires
@@ -120,6 +125,8 @@ api:
       value: backup
     - name: GOMEMLIMIT
       value: {{ .Values.clickhouse.backup.sidecar.goMemoryLimit | quote }}
+    - name: CLICKHOUSE_TIMEOUT
+      value: {{ printf "%ds" (int .Values.clickhouse.backup.schedule.timeoutSeconds) | quote }}
     - name: BACKUP_PASSWORD_REVISION
       value: {{ .Values.clickhouse.backup.api.passwordRevision | quote }}
     - name: AWS_REGION

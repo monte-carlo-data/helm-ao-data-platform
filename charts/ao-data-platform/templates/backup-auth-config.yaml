@@ -7,6 +7,15 @@ metadata:
   labels:
     {{- include "ao-data-platform.labels" . | nindent 4 }}
 data:
+  # Only new Pods mount this file; old Pods must never see paths to volumes
+  # that their Pod template does not contain.
+  backup-users.xml: |
+    <clickhouse>
+      <user_directories>
+        <users_xml name="backup"><name>backup</name><path>/etc/clickhouse-backup-auth/user/users.xml</path></users_xml>
+        <users_xml name="backup_probe"><name>backup_probe</name><path>/etc/clickhouse-backup-auth/probe/users.xml</path></users_xml>
+      </user_directories>
+    </clickhouse>
   # Optional Secrets overlay this fallback. Missing credentials omit the whole
   # user, so database startup and unrelated users do not depend on backup ESO.
   empty-auth.xml: <clickhouse/>

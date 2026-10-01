@@ -289,6 +289,10 @@ templates/clickhouse-installation.yaml, and the user lists in .circleci/config.y
 {{- if .Values.clickhouse.readonlyUser.enabled -}}
 {{- $users = append $users (dict "ch" "readonly_user" "cfg" .Values.clickhouse.readonlyUser) -}}
 {{- end -}}
+{{- if and .Values.clickhouse.backup.enabled .Values.clickhouse.backup.migration.keepSharedCredentials -}}
+{{- /* Old Pod user fragments may still reference this subtree during the roll. */ -}}
+{{- $users = append $users (dict "ch" "backup" "cfg" .Values.clickhouse.backup.user) -}}
+{{- end -}}
 {{- toJson $users -}}
 {{- end }}
 

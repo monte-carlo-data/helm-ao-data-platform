@@ -138,6 +138,7 @@ class BackupChartTests(unittest.TestCase):
         self.assertTrue(mounts["/etc/clickhouse-backup"]["readOnly"])
         env = {item["name"]: item for item in sidecar["env"]}
         self.assertEqual(env["GOMEMLIMIT"]["value"], "400MiB")
+        self.assertEqual(env["CLICKHOUSE_TIMEOUT"]["value"], "10800s")
         self.assertNotIn("API_PASSWORD", env)
         self.assertEqual(env["BACKUP_PASSWORD_REVISION"]["value"], "revision-1")
         self.assertEqual(mounts["/etc/clickhouse-backup-api"]["name"], "backup-api-credentials")
@@ -209,9 +210,61 @@ class BackupChartTests(unittest.TestCase):
                 self.assertEqual(sources[0]["configMap"]["items"], [{"key": kind + ".xml", "path": "users.xml"}, {"key": "empty-auth.xml", "path": "auth.xml"}])
                 self.assertTrue(sources[1]["secret"]["optional"])
                 self.assertEqual(sources[1]["secret"]["items"], [{"key": "auth.xml", "path": "auth.xml"}])
-        stores = xml_tree(self.chi["spec"]["configuration"]["files"]["config.d/backup-users.xml"])
+        shared_store_file = self.chi["spec"]["configuration"]["files"]["config.d/backup-users.xml"]
+        self.assertEqual(ET.tostring(xml_tree(shared_store_file)), b"<clickhouse />")
+        stores = xml_tree(config["backup-users.xml"])
         self.assertEqual({n.findtext("path") for n in stores.findall("user_directories/users_xml")},
                          {f"/etc/clickhouse-backup-auth/{k}/users.xml" for k in ("user", "probe")})
+        self.assertEqual(volumes["backup-auth-config"]["configMap"], {
+            "name": self.name + "-backup-auth",
+            "items": [{"key": "backup-users.xml", "path": "backup-users.xml"}],
+        })
+        database = next(c for c in pod(self.chi)["containers"] if c["name"] == "clickhouse")
+        self.assertIn({"name": "backup-auth-config",
+                       "mountPath": "/etc/clickhouse-server/config.d/backup-users.xml",
+                       "subPath": "backup-users.xml", "readOnly": True}, database["volumeMounts"])
+
+    def test_migration_retains_old_auth_until_pods_have_new_mounts(self):
+        bridge = render("clickhouse.backup.schedule.suspend=true",
+                        "clickhouse.backup.migration.keepSharedCredentials=true")
+        final = render("clickhouse.backup.schedule.suspend=true")
+        # Finishing the migration changes only the two credential templates,
+        # never the CHI, Pod template, mounted auth ConfigMap, or other users.
+        before = {(d["kind"], d["metadata"]["name"]): d for d in bridge}
+        after = {(d["kind"], d["metadata"]["name"]): d for d in final}
+        self.assertEqual(before.keys(), after.keys())
+        self.assertEqual({key for key in before if before[key] != after[key]}, {
+            ("ExternalSecret", "ao-clickhouse-auth-methods"),
+            ("ExternalSecret", "ao-clickhouse-backup-credentials"),
+        })
+        shared = one(bridge, "ExternalSecret", "ao-clickhouse-auth-methods")
+        references = {v["secretKey"]: v["remoteRef"] for v in shared["spec"]["data"]}
+        self.assertEqual(references["backup_password"], {
+            "key": "ci-backup-current", "property": "password", "version": "AWSCURRENT"})
+        self.assertEqual(references["backup_previous"], {
+            "key": "ci-backup-previous", "property": "password", "version": "AWSCURRENT"})
+        template = shared["spec"]["target"]["template"]["data"]["auth.xml"]
+        passwords = {key: "fake-password" for key in references}
+        passwords["backup_previous"] = "-"
+        auth = xml_tree(render_secret_template(template, passwords))
+        self.assertEqual(auth.findtext("backup_auth_methods/current/password"), "fake-password")
+        self.assertIsNone(auth.find("backup_auth_methods/previous"))
+        files = one(bridge, "ClickHouseInstallation")["spec"]["configuration"]["files"]
+        self.assertIsNone(xml_tree(files["users.d/auth-methods.xml"]).find("users/backup"))
+        for docs, expected_timeout in ((bridge, "4h"), (final, "10800s")):
+            config = one(docs, "ExternalSecret", "ao-clickhouse-backup-credentials")["spec"]["target"]["template"]["data"]["config.yml"]
+            parsed = yaml.safe_load(render_secret_template(config, {"password": "fake-password"}))
+            self.assertEqual(parsed["clickhouse"]["timeout"], expected_timeout)
+            sidecar = next(c for c in pod(one(docs, "ClickHouseInstallation"))["containers"]
+                           if c["name"] == "clickhouse-backup")
+            env = {e["name"]: e.get("value") for e in sidecar["env"]}
+            self.assertEqual(env["CLICKHOUSE_TIMEOUT"], "10800s")
+
+    def test_migration_requires_enabled_backups_and_a_paused_schedule(self):
+        for overrides in ([], ["clickhouse.backup.enabled=false", "clickhouse.backup.schedule.suspend=true"]):
+            with self.subTest(overrides=overrides):
+                with self.assertRaisesRegex(AssertionError, "keepSharedCredentials requires"):
+                    render("clickhouse.backup.migration.keepSharedCredentials=true", *overrides)
 
     def test_api_revision_rolls_pods_and_job_can_only_read_pods(self):
         documents = render("clickhouse.backup.api.passwordRevision=revision-2")

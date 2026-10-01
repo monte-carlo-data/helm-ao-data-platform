@@ -325,13 +325,10 @@ spec:
           </http_handlers>
         </clickhouse>
       {{- if .Values.clickhouse.backup.enabled }}
-      config.d/backup-users.xml: |
-        <clickhouse>
-          <user_directories>
-            <users_xml name="backup"><name>backup</name><path>/etc/clickhouse-backup-auth/user/users.xml</path></users_xml>
-            <users_xml name="backup_probe"><name>backup_probe</name><path>/etc/clickhouse-backup-auth/probe/users.xml</path></users_xml>
-          </user_directories>
-        </clickhouse>
+      # The operator mounts config.d as a read-only directory. New Pods need
+      # this empty mount target; old Pods can reload or restart with it safely.
+      # Only the new Pod's file mount contains the backup user-store paths.
+      config.d/backup-users.xml: <clickhouse/>
       config.d/backup.xml: |
         {{- include "ao-data-platform.backupDisk" . | nindent 8 }}
       {{- end }}
@@ -406,6 +403,11 @@ spec:
           serviceAccountName: {{ .Values.clickhouse.backup.serviceAccount.name }}
           automountServiceAccountToken: false
           volumes:
+            - name: backup-auth-config
+              configMap:
+                name: {{ include "ao-data-platform.chiName" . }}-backup-auth
+                items:
+                  - {key: backup-users.xml, path: backup-users.xml}
             - name: backup-config
               secret:
                 secretName: {{ .Values.clickhouse.backup.user.secret }}
@@ -437,6 +439,10 @@ spec:
               image: {{ .Values.clickhouse.image }}
               {{- if .Values.clickhouse.backup.enabled }}
               volumeMounts:
+                - name: backup-auth-config
+                  mountPath: /etc/clickhouse-server/config.d/backup-users.xml
+                  subPath: backup-users.xml
+                  readOnly: true
                 - name: backup-user-auth
                   mountPath: /etc/clickhouse-backup-auth/user
                   readOnly: true
