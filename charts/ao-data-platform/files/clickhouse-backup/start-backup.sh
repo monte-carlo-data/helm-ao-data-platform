@@ -73,5 +73,7 @@ while :; do
         continue
     fi
     echo 'Backup credentials are ready; starting the authenticated API.'
+    # Successful startup intentionally replaces this waiting loop.
+    # shellcheck disable=SC2093
     exec /bin/clickhouse-backup --config "$snapshot" server
 done
