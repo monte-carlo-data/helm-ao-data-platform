@@ -53,8 +53,9 @@ Create these before setting `clickhouse.backup.enabled: true`:
 With `migration.keepSharedCredentials: false`, missing database backup credentials
 leave that user absent and the helper waiting;
 missing probe credentials leave the probe user absent and cause backup Jobs to fail.
-ClickHouse can still start in either case. Empty credentials do not create
-passwordless users. After fixing Secret delivery, reload the database configuration
+ClickHouse can still start in either case. Each separate user store has an
+always-present empty `users.xml`; its optional Secret supplies the full user
+definition at `users.d/auth.xml`. Empty credentials do not create passwordless users. After fixing Secret delivery, reload the database configuration
 using your normal credential-change process and verify the users before resuming
 backups. The helper itself waits for valid configuration, nonempty database/API
 passwords, and a matching API revision.
@@ -92,7 +93,9 @@ replica. Fresh installations leave `migration.keepSharedCredentials: false`.
 
    This keeps the old backup password subtree in the shared auth Secret while
    the operator replaces the Pods. The new user-store configuration is mounted
-   only in replacement Pods, together with the files it needs. The shared helper
+   only in replacement Pods, together with the files it needs. Their whole
+   `config.d/` mount combines the operator's shared ConfigMap with the new user-store
+   file; no nested file mount is used. The shared helper
    configuration keeps a `4h` timeout for the old image; new helpers use
    `CLICKHOUSE_TIMEOUT` set from `schedule.timeoutSeconds`.
 2. Wait for both replacement copies, then run the read-only check:

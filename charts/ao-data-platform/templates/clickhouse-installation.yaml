@@ -325,10 +325,6 @@ spec:
           </http_handlers>
         </clickhouse>
       {{- if .Values.clickhouse.backup.enabled }}
-      # The operator mounts config.d as a read-only directory. New Pods need
-      # this empty mount target; old Pods can reload or restart with it safely.
-      # Only the new Pod's file mount contains the backup user-store paths.
-      config.d/backup-users.xml: <clickhouse/>
       config.d/backup.xml: |
         {{- include "ao-data-platform.backupDisk" . | nindent 8 }}
       {{- end }}
@@ -403,11 +399,19 @@ spec:
           serviceAccountName: {{ .Values.clickhouse.backup.serviceAccount.name }}
           automountServiceAccountToken: false
           volumes:
+            # Replace the whole operator config.d mount in new Pods. Combining
+            # the two ConfigMaps avoids nested file mounts over kubelet symlinks.
+            # Keep backup-users.xml out of the shared operator ConfigMap so old
+            # Pods never receive paths to auth volumes they do not have.
             - name: backup-auth-config
-              configMap:
-                name: {{ include "ao-data-platform.chiName" . }}-backup-auth
-                items:
-                  - {key: backup-users.xml, path: backup-users.xml}
+              projected:
+                sources:
+                  - configMap:
+                      name: chi-{{ include "ao-data-platform.chiName" . }}-common-configd
+                  - configMap:
+                      name: {{ include "ao-data-platform.chiName" . }}-backup-auth
+                      items:
+                        - {key: backup-users.xml, path: backup-users.xml}
             - name: backup-config
               secret:
                 secretName: {{ .Values.clickhouse.backup.user.secret }}
@@ -424,12 +428,11 @@ spec:
                       name: {{ include "ao-data-platform.chiName" $ }}-backup-auth
                       items:
                         - {key: {{ printf "%s.xml" $kind | quote }}, path: users.xml}
-                        - {key: empty-auth.xml, path: auth.xml}
                   - secret:
                       name: {{ (index $.Values.clickhouse.backup $kind).secret }}
                       optional: true
                       items:
-                        - {key: auth.xml, path: auth.xml}
+                        - {key: auth.xml, path: users.d/auth.xml}
             {{- end }}
           {{- end }}
           # `image` is required whenever this podTemplate emits a containers[]
@@ -440,8 +443,8 @@ spec:
               {{- if .Values.clickhouse.backup.enabled }}
               volumeMounts:
                 - name: backup-auth-config
-                  mountPath: /etc/clickhouse-server/config.d/backup-users.xml
-                  subPath: backup-users.xml
+                  # Match the operator's path exactly so it keeps this mount.
+                  mountPath: /etc/clickhouse-server/config.d/
                   readOnly: true
                 - name: backup-user-auth
                   mountPath: /etc/clickhouse-backup-auth/user

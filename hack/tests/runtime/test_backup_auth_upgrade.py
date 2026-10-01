@@ -52,15 +52,28 @@ def replace(path, value):
     staged.replace(path)
 
 
+def atomic_directory(directory):
+    """Model the symlink layout Kubernetes writes for ConfigMap projections."""
+    keys = list(directory.iterdir())
+    generation = directory / "..generation"
+    generation.mkdir()
+    for key in keys:
+        key.rename(generation / key.name)
+    (directory / "..data").symlink_to("..generation", target_is_directory=True)
+    for key in keys:
+        (directory / key.name).symlink_to("..data/" + key.name, target_is_directory=(generation / key.name).is_dir())
+
+
 class Database:
     def __init__(self, root, files, users, shared, optional=None):
         self.root = root
         self.name = "backup-upgrade-" + uuid.uuid4().hex[:10]
-        for name in ("config", "users", "shared", "user", "probe", "new-config", "backup-config"):
+        for name in ("config", "users", "shared", "user", "probe", "backup-config"):
             (root / name).mkdir(parents=True, exist_ok=True)
         replace(root / "config/base.xml", BASE)
-        # Model the operator's read-only common ConfigMap mount exactly. In
-        # particular, do not silently put new store paths into the old mount.
+        # Old Pods mount only the common ConfigMap. New Pods project its keys
+        # together with backup-users.xml into one read-only directory. Never put
+        # new store paths in the common files received by old Pods.
         for name, contents in files.items():
             if name == "config.d/backup-users.xml":
                 replace(root / "config/backup-users.xml", contents)
@@ -72,12 +85,15 @@ class Database:
         if optional:
             for key in ("user", "probe"):
                 replace(root / key / "users.xml", optional[key]["users"])
-                replace(root / key / "auth.xml", optional[key]["auth"])
+                if optional[key]["auth"] is not None:
+                    auth_path = root / key / optional[key].get("path", "auth.xml")
+                    auth_path.parent.mkdir(parents=True, exist_ok=True)
+                    replace(auth_path, optional[key]["auth"])
                 mounts.append((root / key, "/etc/clickhouse-backup-auth/" + key))
-            replace(root / "new-config/backup-users.xml", optional["stores"])
-            # A nested file bind into the read-only common directory reproduces
-            # the new Pod template's ConfigMap subPath mount.
-            mounts.append((root / "new-config/backup-users.xml", "/etc/clickhouse-server/config.d/backup-users.xml"))
+            replace(root / "config/backup-users.xml", optional["stores"])
+        # A whole projection avoids Kubernetes subPath mounts onto AtomicWriter
+        # symlinks. Model the actual ..data/key links, not regular placeholder files.
+        atomic_directory(root / "config")
         command = ["run", "-d", "--name", self.name, "--network", "none", "--hostname", "localhost",
                    "--cpus", "2", "--memory", "2g", "--env", "CLICKHOUSE_SKIP_USER_SETUP=1",
                    "--tmpfs", "/var/lib/clickhouse:rw,size=536870912",
@@ -141,11 +157,33 @@ class AuthUpgradeTests(unittest.TestCase):
     def optional(cls, documents, missing=False):
         cm = one(documents, "ConfigMap", "otel-backup-auth")["data"]
         result = {"stores": cm["backup-users.xml"]}
+        spec = pod(one(documents, "ClickHouseInstallation"))
+        volumes = {v["name"]: v for v in spec["volumes"]}
+        database = next(c for c in spec["containers"] if c["name"] == "clickhouse")
+        mounts = [m for m in database["volumeMounts"] if m["mountPath"].startswith("/etc/clickhouse-server/config.d")]
+        if len(mounts) != 1 or mounts[0]["mountPath"] != "/etc/clickhouse-server/config.d/" or "subPath" in mounts[0]:
+            raise AssertionError("Use one whole config.d/ projection; nested subPath is unsafe with ConfigMap symlinks")
+        config_sources = volumes[mounts[0]["name"]]["projected"]["sources"]
+        common_name = "chi-" + one(documents, "ClickHouseInstallation")["metadata"]["name"] + "-common-configd"
+        if not any(s.get("configMap") == {"name": common_name} for s in config_sources):
+            raise AssertionError("New config projection must include every common ConfigMap key")
+        if not any(s.get("configMap", {}).get("items") == [{"key": "backup-users.xml", "path": "backup-users.xml"}]
+                   for s in config_sources):
+            raise AssertionError("New config projection must include the isolated user-store file")
         for kind, username, secret in (("user", "backup", "ao-clickhouse-backup-credentials"),
                                        ("probe", "backup_probe", "ao-clickhouse-backup-probe-credentials")):
+            sources = volumes["backup-" + kind + "-auth"]["projected"]["sources"]
+            paths = [item["path"] for source in sources for projection in source.values()
+                     for item in projection.get("items", [])]
+            if len(paths) != len(set(paths)):
+                raise AssertionError("Kubernetes rejects overlapping projected-volume paths")
+            secret_source = next(source["secret"] for source in sources if "secret" in source)
+            path = next(item["path"] for item in secret_source["items"] if item["key"] == "auth.xml")
+            if path != "users.d/auth.xml":
+                raise AssertionError("Optional auth must merge from users.d without a required include_from file")
             template = one(documents, "ExternalSecret", secret)["spec"]["target"]["template"]["data"]["auth.xml"]
-            result[kind] = {"users": cm[kind + ".xml"],
-                            "auth": cm["empty-auth.xml"] if missing else render_secret_template(template, {"password": cls.passwords[username]})}
+            result[kind] = {"users": cm[kind + ".xml"], "path": path,
+                            "auth": None if missing else render_secret_template(template, {"password": cls.passwords[username]})}
         return result
 
     @classmethod
@@ -239,6 +277,37 @@ class AuthUpgradeTests(unittest.TestCase):
             for username in ("backup", "backup_probe"):
                 self.assertNotEqual(database.query(user=username).returncode, 0)
             database.restart()
+
+    def test_optional_credentials_arrive_disappear_and_reject_invalid_passwords(self):
+        database = self.db(missing=True)
+        for phase in ("valid", "empty", "previous_sentinel", "special", "missing"):
+            with self.subTest(phase=phase):
+                expected = {}
+                for kind, username, secret in (("user", "backup", "ao-clickhouse-backup-credentials"),
+                                               ("probe", "backup_probe", "ao-clickhouse-backup-probe-credentials")):
+                    path = database.root / kind / "users.d/auth.xml"
+                    path.parent.mkdir(exist_ok=True)
+                    if phase == "missing":
+                        path.unlink()
+                        expected[username] = None
+                    else:
+                        password = {"valid": self.passwords[username], "empty": "", "previous_sentinel": self.passwords[username],
+                                    "special": "dummy <xml> & quoted \"password\""}[phase]
+                        template = one(self.bridge, "ExternalSecret", secret)["spec"]["target"]["template"]["data"]["auth.xml"]
+                        replace(path, render_secret_template(template, {"password": password, "previous": "old-dummy" if phase == "empty" else "-"}))
+                        expected[username] = password if phase in ("valid", "previous_sentinel", "special") else None
+                self.assertEqual(database.query("SYSTEM RELOAD CONFIG").returncode, 0)
+                for restart in (False, True):
+                    if restart:
+                        database.restart()
+                    self.ordinary(database)
+                    for username, password in expected.items():
+                        count = database.query("SELECT count() FROM system.users WHERE name='" + username + "'")
+                        self.assertEqual(count.stdout.strip(), "1" if password else "0")
+                        self.assertNotEqual(database.query(user=username).returncode, 0)
+                        self.assertNotEqual(database.query(user=username, password="-").returncode, 0)
+                        if password:
+                            self.assertEqual(database.query(user=username, password=password).returncode, 0)
 
     def test_old_helper_retries_missing_user_and_new_image_overrides_timeout(self):
         database = self.db(old=True)

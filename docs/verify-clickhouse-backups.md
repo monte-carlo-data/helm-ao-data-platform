@@ -127,3 +127,24 @@ uses, and access-check results in your change record. Do not mark the checks
 complete until the scheduled incremental run also succeeds. These checks do not
 test retention or prove that backups can restore data; see the
 [current limitations](clickhouse-backups.md#current-limitations).
+
+## Before publishing changes to backup mounts
+
+Run both mount checks. The first asks the Kubernetes API to validate the rendered
+StatefulSet, including its volumes; it creates no objects and uses fake credentials.
+Its negative control confirms Kubernetes rejects duplicate projected file paths.
+The second starts temporary local Docker containers and tests ClickHouse with
+Kubernetes-style configuration symlinks, missing credentials, and both upgrade stages.
+API validation alone does not check whether a container can mount or read its files.
+
+```bash
+BACKUP_KUBERNETES_CONTEXT="<your-context>" \
+BACKUP_KUBERNETES_NAMESPACE="<existing-namespace>" \
+python3 hack/tests/runtime/test_backup_kubernetes.py
+
+RUN_BACKUP_AUTH_UPGRADE=1 python3 hack/tests/runtime/test_backup_auth_upgrade.py -v
+```
+
+Both commands require PyYAML and Helm on PATH (or `HELM=/path/to/helm`). The Docker
+check also needs the ClickHouse, old backup, and locally built patched backup images
+listed at the top of its test file; set `BACKUP_NEW_IMAGE` to the build being released.

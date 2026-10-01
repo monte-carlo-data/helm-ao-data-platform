@@ -117,7 +117,7 @@ class BackupChartTests(unittest.TestCase):
         ):
             with self.subTest(secret=name):
                 auth = one(self.enabled, "ExternalSecret", name)["spec"]["target"]["template"]["data"]["auth.xml"]
-                user = xml_tree(render_secret_template(auth, {"password": "fake", "previous": "-"})).find("user")
+                user = xml_tree(render_secret_template(auth, {"password": "fake", "previous": "-"})).find("users/" + ("backup_probe" if "probe" in name else "backup"))
                 self.assertEqual({n.text for n in user.findall("grants/query")}, expected)
                 if name == "ao-clickhouse-backup-credentials":
                     self.assertEqual({n.text for n in user.findall("networks/ip")}, {"127.0.0.1", "::1"})
@@ -189,40 +189,53 @@ class BackupChartTests(unittest.TestCase):
             for previous in ("-", "", "previous-password"):
                 with self.subTest(secret=name, previous=previous):
                     password = 'contains <xml> & "quotes"'
-                    user = xml_tree(render_secret_template(auth, {"password": password, "previous": previous})).find("user")
+                    user = xml_tree(render_secret_template(auth, {"password": password, "previous": previous})).find("users/" + ("backup_probe" if "probe" in name else "backup"))
                     self.assertEqual(user.findtext("auth_methods/current/password"), password)
                     self.assertEqual(user.findtext("auth_methods/previous/password"),
                                      previous if previous == "previous-password" else None)
             empty = xml_tree(render_secret_template(auth, {"password": "", "previous": "previous-password"}))
-            self.assertIsNone(empty.find("user"), "An empty current credential must not create a passwordless user")
+            self.assertIsNone(empty.find("users/" + ("backup_probe" if "probe" in name else "backup")), "An empty current credential must not create a passwordless user")
 
-    def test_missing_backup_secrets_have_empty_user_fallbacks(self):
+    def test_missing_backup_secrets_omit_optional_users(self):
         config = one(self.enabled, "ConfigMap", self.name + "-backup-auth")["data"]
-        self.assertEqual(ET.tostring(xml_tree(config["empty-auth.xml"])), b"<clickhouse />")
+        self.assertNotIn("empty-auth.xml", config)
         volumes = {v["name"]: v for v in pod(self.chi)["volumes"]}
         for kind, username in (("user", "backup"), ("probe", "backup_probe")):
             with self.subTest(kind=kind):
                 wrapper = xml_tree(config[kind + ".xml"])
-                user = wrapper.find("users/" + username)
-                self.assertEqual(user.attrib, {"incl": "user", "optional": "true"})
-                self.assertEqual(wrapper.findtext("include_from"), f"/etc/clickhouse-backup-auth/{kind}/auth.xml")
+                self.assertEqual(ET.tostring(wrapper), b"<clickhouse />")
                 sources = volumes[f"backup-{kind}-auth"]["projected"]["sources"]
-                self.assertEqual(sources[0]["configMap"]["items"], [{"key": kind + ".xml", "path": "users.xml"}, {"key": "empty-auth.xml", "path": "auth.xml"}])
+                self.assertEqual(sources[0]["configMap"]["items"], [{"key": kind + ".xml", "path": "users.xml"}])
                 self.assertTrue(sources[1]["secret"]["optional"])
-                self.assertEqual(sources[1]["secret"]["items"], [{"key": "auth.xml", "path": "auth.xml"}])
-        shared_store_file = self.chi["spec"]["configuration"]["files"]["config.d/backup-users.xml"]
-        self.assertEqual(ET.tostring(xml_tree(shared_store_file)), b"<clickhouse />")
+                self.assertEqual(sources[1]["secret"]["items"], [{"key": "auth.xml", "path": "users.d/auth.xml"}])
+        self.assertNotIn("config.d/backup-users.xml", self.chi["spec"]["configuration"]["files"])
         stores = xml_tree(config["backup-users.xml"])
         self.assertEqual({n.findtext("path") for n in stores.findall("user_directories/users_xml")},
                          {f"/etc/clickhouse-backup-auth/{k}/users.xml" for k in ("user", "probe")})
-        self.assertEqual(volumes["backup-auth-config"]["configMap"], {
-            "name": self.name + "-backup-auth",
-            "items": [{"key": "backup-users.xml", "path": "backup-users.xml"}],
-        })
+        self.assertEqual(volumes["backup-auth-config"]["projected"]["sources"], [
+            {"configMap": {"name": "chi-" + self.name + "-common-configd"}},
+            {"configMap": {"name": self.name + "-backup-auth",
+                           "items": [{"key": "backup-users.xml", "path": "backup-users.xml"}]}},
+        ])
         database = next(c for c in pod(self.chi)["containers"] if c["name"] == "clickhouse")
         self.assertIn({"name": "backup-auth-config",
-                       "mountPath": "/etc/clickhouse-server/config.d/backup-users.xml",
-                       "subPath": "backup-users.xml", "readOnly": True}, database["volumeMounts"])
+                       "mountPath": "/etc/clickhouse-server/config.d/",
+                       "readOnly": True}, database["volumeMounts"])
+
+    def test_projected_sources_have_no_conflicting_file_paths(self):
+        # The API server rejects even optional Secret/ConfigMap sources that
+        # target the same file. A Docker bind mount does not catch this rule.
+        for volume in pod(self.chi)["volumes"]:
+            paths = []
+            for source in volume.get("projected", {}).get("sources", []):
+                for projection in source.values():
+                    for item in projection.get("items", []):
+                        path = item["path"]
+                        for previous in paths:
+                            self.assertFalse(path == previous or path.startswith(previous + "/")
+                                             or previous.startswith(path + "/"),
+                                             f"Conflicting projected paths in {volume['name']}: {previous}, {path}")
+                        paths.append(path)
 
     def test_migration_retains_old_auth_until_pods_have_new_mounts(self):
         bridge = render("clickhouse.backup.schedule.suspend=true",

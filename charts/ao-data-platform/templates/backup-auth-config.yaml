@@ -16,17 +16,11 @@ data:
         <users_xml name="backup_probe"><name>backup_probe</name><path>/etc/clickhouse-backup-auth/probe/users.xml</path></users_xml>
       </user_directories>
     </clickhouse>
-  # Optional Secrets overlay this fallback. Missing credentials omit the whole
-  # user, so database startup and unrelated users do not depend on backup ESO.
-  empty-auth.xml: <clickhouse/>
+  # Each always-present base file loads its sibling users.d directory. The
+  # optional Secret supplies the complete user there, at a distinct path.
+  # Missing credentials leave a valid empty store and never allow passwordless auth.
   user.xml: |
-    <clickhouse>
-      <include_from>/etc/clickhouse-backup-auth/user/auth.xml</include_from>
-      <users><backup incl="user" optional="true"/></users>
-    </clickhouse>
+    <clickhouse/>
   probe.xml: |
-    <clickhouse>
-      <include_from>/etc/clickhouse-backup-auth/probe/auth.xml</include_from>
-      <users><backup_probe incl="user" optional="true"/></users>
-    </clickhouse>
+    <clickhouse/>
 {{- end }}

@@ -30,7 +30,7 @@ grep -Fq '/etc/clickhouse-backup-auth/user/users.xml' "$stores"
 grep -Fq '/etc/clickhouse-backup-auth/probe/users.xml' "$stores"
 for kind in user probe; do
   test -s "/etc/clickhouse-backup-auth/$kind/users.xml"
-  test -r "/etc/clickhouse-backup-auth/$kind/auth.xml"
+  test -r "/etc/clickhouse-backup-auth/$kind/users.d/auth.xml"
 done
 '''
 
@@ -74,11 +74,16 @@ def check_mounts(pod):
         projected = volumes.get(mount.get("name"), {}).get("projected", {})
         sources = projected.get("sources", [])
         require(any("configMap" in source for source in sources)
-                and any(source.get("secret", {}).get("optional") is True for source in sources),
-                "A Pod lacks the fallback ConfigMap and optional backup Secret projection.")
-    mount = mounts.get("/etc/clickhouse-server/config.d/backup-users.xml", {})
-    require(mount.get("readOnly") is True and mount.get("subPath") == "backup-users.xml"
-            and "configMap" in volumes.get(mount.get("name"), {}),
+                and any(source.get("secret", {}).get("optional") is True
+                        and source["secret"].get("items") == [{"key": "auth.xml", "path": "users.d/auth.xml"}]
+                        for source in sources),
+                "A Pod lacks the empty user-store ConfigMap and optional backup Secret projection.")
+    mount = mounts.get("/etc/clickhouse-server/config.d/", {})
+    sources = volumes.get(mount.get("name"), {}).get("projected", {}).get("sources", [])
+    require(mount.get("readOnly") is True and "subPath" not in mount
+            and len(sources) == 2 and all("configMap" in source for source in sources)
+            and any({"key": "backup-users.xml", "path": "backup-users.xml"}
+                    in source["configMap"].get("items", []) for source in sources),
             "The backup user-store config is not mounted through the new Pod template.")
 
 

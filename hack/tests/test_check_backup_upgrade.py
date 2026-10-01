@@ -37,10 +37,13 @@ def fixture():
         for kind in ("user", "probe"):
             mounts.append({"name": kind, "mountPath": "/etc/clickhouse-backup-auth/" + kind, "readOnly": True})
             volumes.append({"name": kind, "projected": {"sources": [{"configMap": {"name": "otel-backup-auth"}},
-                                                                      {"secret": {"name": kind, "optional": True}}]}})
-        mounts.append({"name": "stores", "mountPath": "/etc/clickhouse-server/config.d/backup-users.xml",
-                       "subPath": "backup-users.xml", "readOnly": True})
-        volumes.append({"name": "stores", "configMap": {"name": "otel-backup-auth"}})
+                                                                      {"secret": {"name": kind, "optional": True, "items": [
+                                                                          {"key": "auth.xml", "path": "users.d/auth.xml"}]}}]}})
+        mounts.append({"name": "stores", "mountPath": "/etc/clickhouse-server/config.d/", "readOnly": True})
+        volumes.append({"name": "stores", "projected": {"sources": [
+            {"configMap": {"name": "chi-otel-common-configd"}},
+            {"configMap": {"name": "otel-backup-auth", "items": [
+                {"key": "backup-users.xml", "path": "backup-users.xml"}]}}]}})
         pods.append({"kind": "Pod", "metadata": metadata(f"pod{i}", labels={"controller-revision-hash": revision},
                      ownerReferences=[{"kind": "StatefulSet", "uid": uid, "controller": True}]),
                      "spec": {"containers": [{"name": "clickhouse", "volumeMounts": mounts}, {"name": "clickhouse-backup"}], "volumes": volumes},
@@ -130,20 +133,30 @@ class GateTests(unittest.TestCase):
         self.data[3][0]["spec"]["volumes"][0]["projected"]["sources"][1]["secret"]["optional"] = False
         self.refuses("optional backup Secret")
 
+    def test_previous_nested_config_file_mount_blocks(self):
+        mount = self.data[3][0]["spec"]["containers"][0]["volumeMounts"][-1]
+        mount.update(mountPath="/etc/clickhouse-server/config.d/backup-users.xml", subPath="backup-users.xml")
+        self.refuses("new Pod template")
+
+    def test_previous_auth_projection_path_blocks(self):
+        projection = self.data[3][0]["spec"]["volumes"][0]["projected"]["sources"][1]["secret"]
+        projection["items"][0]["path"] = "auth.xml"
+        self.refuses("optional backup Secret")
+
 
 class FileChecks(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
-        for directory in ("server/users.d", "server/config.d", "auth/user", "auth/probe"):
+        for directory in ("server/users.d", "server/config.d", "auth/user/users.d", "auth/probe/users.d"):
             (self.root / directory).mkdir(parents=True)
         (self.root / "server/users.d/auth-methods.xml").write_text("<clickhouse><users><otel/></users></clickhouse>")
         (self.root / "server/config.d/backup-users.xml").write_text(
             "/etc/clickhouse-backup-auth/user/users.xml /etc/clickhouse-backup-auth/probe/users.xml")
         for kind in ("user", "probe"):
             (self.root / "auth" / kind / "users.xml").write_text("<clickhouse/>")
-            (self.root / "auth" / kind / "auth.xml").write_text("<clickhouse/>")
+            (self.root / "auth" / kind / "users.d" / "auth.xml").write_text("<clickhouse/>")
 
     def run_files(self):
         # Redirect only filesystem paths. Keep literal grep patterns intact so
@@ -155,7 +168,7 @@ class FileChecks(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         return result.returncode
 
-    def test_real_boolean_script_accepts_fallback_files(self):
+    def test_real_boolean_script_accepts_user_store_files(self):
         self.assertEqual(self.run_files(), 0)
 
     def test_legacy_reference_in_actual_file_refuses(self):
@@ -171,7 +184,7 @@ class FileChecks(unittest.TestCase):
         self.assertNotEqual(self.run_files(), 0)
 
     def test_missing_projected_auth_file_refuses(self):
-        (self.root / "auth/probe/auth.xml").unlink()
+        (self.root / "auth/probe/users.d/auth.xml").unlink()
         self.assertNotEqual(self.run_files(), 0)
 
 
