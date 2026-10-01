@@ -24,6 +24,68 @@ clickhouse:
   # excess replicas stay Pending permanently instead of co-locating the way
   # pre-4.3.0 releases allowed.
   replicasCount: 2
+  # Optional scheduled backups. Credentials are isolated from database users.
+  backup:
+    enabled: false
+    provider: aws
+    sidecar:
+      # Official Altinity 2.8.1 image, pinned to its multi-platform digest.
+      image: altinity/clickhouse-backup:2.8.1@sha256:08016b048f7e6035c048501315c2a788e5a782f15f168e042c7bd48d5a388cc4
+      goMemoryLimit: "400MiB"
+      resources:
+        requests: {cpu: 100m, memory: 128Mi}
+        limits: {memory: 512Mi}
+    networkPolicy:
+      # Extra ClickHouse TCP listeners. Never include the backup API port 7171.
+      additionalPorts: []
+    aws:
+      bucket: ""
+      region: ""
+      roleArn: ""
+      path: clickhouse
+    serviceAccount:
+      name: clickhouse-backup
+    user:
+      secret: ao-clickhouse-backup-credentials
+      externalSecret:
+        secretStoreRef: {name: "", kind: ClusterSecretStore}
+        remoteRef: {key: "", property: "", version: ""}
+        previousKey: ""
+        refreshInterval: 1h
+    probe:
+      # Restrict to the network ranges used by backup Jobs when known.
+      networksIp: ["0.0.0.0/0", "::/0"]
+      secret: ao-clickhouse-backup-probe-credentials
+      externalSecret:
+        secretStoreRef: {name: "", kind: ClusterSecretStore}
+        remoteRef: {key: "", property: "", version: ""}
+        previousKey: ""
+        refreshInterval: 1h
+    api:
+      # Supply an existing Secret with password + revision, OR externalSecret.
+      existingSecret: ""
+      # Optional target name when using externalSecret; defaults to <CHI>-backup-api.
+      secret: ""
+      # Change together with the Secret's revision to roll ClickHouse pods.
+      passwordRevision: ""
+      # The external value contains password + revision in the same JSON object.
+      # Leave remoteRef.property empty; set secretStoreRef.name to enable this source.
+      externalSecret:
+        secretStoreRef: {name: "", kind: ClusterSecretStore}
+        remoteRef: {key: "", property: "", version: ""}
+        refreshInterval: 1h
+    schedule:
+      cron: "0 */4 * * *"
+      image: python:3.12-slim-bookworm@sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e
+      suspend: false
+      # Job deadline; the backup tool has its own fixed four-hour timeout.
+      timeoutSeconds: 10800
+      maxReplicaDelaySeconds: 5
+      freshnessRetrySeconds: 30
+      startingDeadlineSeconds: 900
+      resources:
+        requests: {cpu: 25m, memory: 32Mi}
+        limits: {memory: 128Mi}
   storageClass: ""
   storageSize: 100Gi
   # Data retention, in days, for the telemetry tables — the raw traces, the
@@ -45,7 +107,8 @@ clickhouse:
   # Note: shrinking the value purges already-expired data lazily on the next
   # background merge, not immediately — see README for the manual-purge escape hatch.
   ttlDays: 30
-  # Adding a ClickHouse user? Also update templates/clickhouse-installation.yaml and templates/external-secret.yaml.
+  # Main users are defined in templates/clickhouse-installation.yaml and external-secret.yaml.
+  # Backup and backup_probe users are defined separately in backup-external-secret.yaml.
   # otel — the OTel collector ingest identity. Writes raw telemetry into otel_traces.otel_traces.
   # The MV cascade runs as schema_owner (the MV DEFINER), so otel needs nothing on the
   # normalized targets.

@@ -1,0 +1,37 @@
+{{- include "ao-data-platform.backupValidate" . -}}
+{{- if .Values.clickhouse.backup.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "ao-data-platform.chiName" . }}-backup-api
+  labels:
+    {{- include "ao-data-platform.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      clickhouse.altinity.com/chi: {{ include "ao-data-platform.chiName" . }}
+  policyTypes: [Ingress]
+  ingress:
+    # Selecting these pods makes their incoming traffic deny-by-default. Allow
+    # the CHI listeners and the operator's replication/metrics ports again.
+    # The separate 7171 rule allows only the labels emitted by backup-cronjob.yaml.
+    - ports:
+        {{- $ports := include "ao-data-platform.clickhousePorts" . | fromJson }}
+        {{- $allowed := list }}
+        {{- range $key := keys $ports | sortAlpha }}
+        {{- $allowed = append $allowed (int (index $ports $key)) }}
+        {{- end }}
+        {{- range $port := .Values.clickhouse.backup.networkPolicy.additionalPorts }}
+        {{- $allowed = append $allowed (int $port) }}
+        {{- end }}
+        {{- range $port := $allowed | uniq }}
+        - {protocol: TCP, port: {{ int $port }}}
+        {{- end }}
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/component: clickhouse-backup-job
+      ports:
+        - {protocol: TCP, port: 7171}
+{{- end }}
