@@ -829,5 +829,44 @@ class APITests(unittest.TestCase):
         self.assertNotIn("private server body", stdout.getvalue() + stderr.getvalue())
 
 
+    def test_cleanup_deletion_is_rejected_before_any_backup_request(self):
+        for value in ("false", "invalid", ""):
+            settings = dict(self.settings, BACKUP_CLEANUP_ENABLED="true", BACKUP_CLEANUP_DRY_RUN=value)
+            errors = io.StringIO()
+            with self.subTest(value=value), mock.patch.dict(backup.os.environ, settings, clear=True), \
+                    mock.patch.object(backup, "configured_clients") as clients, \
+                    mock.patch.object(backup.Scheduler, "run") as run, redirect_stderr(errors):
+                self.assertEqual(backup.main(), 1)
+            clients.assert_not_called()
+            run.assert_not_called()
+            self.assertIn("preview only", errors.getvalue())
+
+    def test_cleanup_failure_fails_job_after_successful_upload(self):
+        settings = dict(self.settings, BACKUP_CLEANUP_ENABLED="true")
+        cleanup = mock.Mock()
+        cleanup.Cleaner.return_value.run.side_effect = backup.BackupError("Cleanup stopped safely.")
+        with mock.patch.dict(backup.os.environ, settings, clear=True), \
+                mock.patch.dict("sys.modules", {"cleanup_backups": cleanup}), \
+                mock.patch.object(backup.Path, "read_text", return_value="test-password"), \
+                mock.patch.object(backup, "PasswordRevisionGuard"), \
+                mock.patch.object(backup.Scheduler, "run", return_value=FULL) as run, \
+                mock.patch("sys.stderr"):
+            self.assertEqual(backup.main(), 1)
+            run.assert_called_once()
+            cleanup.Cleaner.return_value.run.assert_called_once_with(latest_backup=FULL, execute=False)
+
+    def test_failed_upload_never_calls_cleanup(self):
+        settings = dict(self.settings, BACKUP_CLEANUP_ENABLED="true")
+        cleanup = mock.Mock()
+        with mock.patch.dict(backup.os.environ, settings, clear=True), \
+                mock.patch.dict("sys.modules", {"cleanup_backups": cleanup}), \
+                mock.patch.object(backup.Path, "read_text", return_value="test-password"), \
+                mock.patch.object(backup, "PasswordRevisionGuard"), \
+                mock.patch.object(backup.Scheduler, "run", side_effect=backup.BackupError("upload failed")), \
+                mock.patch("sys.stderr"):
+            self.assertEqual(backup.main(), 1)
+            cleanup.Cleaner.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

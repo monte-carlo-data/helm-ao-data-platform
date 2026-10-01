@@ -433,8 +433,21 @@ def main():
         if timeout <= 0 or poll_seconds <= 0:
             raise BackupError("Backup timeout and polling interval must be positive seconds.")
         options = configured_options()
+        cleanup_enabled = os.environ.get("BACKUP_CLEANUP_ENABLED", "false") == "true"
+        if cleanup_enabled and os.environ.get("BACKUP_CLEANUP_DRY_RUN", "true") != "true":
+            raise BackupError("Backup deletion is unavailable with stock clickhouse-backup 2.8.1; cleanup supports preview only.")
         apis, probes = configured_clients()
-        Scheduler(apis, probes, timeout, poll_seconds, **options).run()
+        name = Scheduler(apis, probes, timeout, poll_seconds, **options).run()
+        if cleanup_enabled:
+            # Running in this same job prevents two scheduled cleanups or a
+            # scheduled backup and cleanup from overlapping. A cleanup error
+            # fails the job so monitoring reports it even though upload passed.
+            from cleanup_backups import Cleaner
+            cleaner = Cleaner(apis, keep_last=int(os.environ.get("BACKUP_KEEP_LAST", "2")),
+                              keep_days=int(os.environ.get("BACKUP_KEEP_DAYS", "0")),
+                              timeout=int(os.environ.get("BACKUP_CLEANUP_TIMEOUT_SECONDS", "1800")))
+            result = cleaner.run(latest_backup=name, execute=False)
+            print("Backup cleanup: " + json.dumps(result, sort_keys=True), flush=True)
         return 0
     except (KeyError, ValueError, OSError):
         print("Backup failed: check scheduler settings and the mounted password file.", file=sys.stderr)
@@ -444,4 +457,6 @@ def main():
 
 
 if __name__ == "__main__":
+    # Cleanup imports this error type; keep one copy when this file is executed.
+    sys.modules.setdefault("run_backup", sys.modules[__name__])
     sys.exit(main())

@@ -32,6 +32,20 @@
 {{- fail "clickhouse.backup.networkPolicy.additionalPorts must contain TCP ports from 1 to 65535, excluding the protected backup port 7171." -}}
 {{- end -}}
 {{- end -}}
+{{- if $b.cleanup.enabled -}}
+{{- if ne (toString $b.cleanup.dryRun) "true" -}}{{- fail "Backup deletion is unavailable with stock clickhouse-backup 2.8.1; cleanup.dryRun must remain true." -}}{{- end -}}
+{{- if ne (int .Values.clickhouse.replicasCount) 2 -}}{{- fail "Backup cleanup requires exactly two ClickHouse copies." -}}{{- end -}}
+{{- if or (lt (int $b.cleanup.keepLast) 1) (lt (int $b.cleanup.keepDays) 0) (lt (int $b.cleanup.timeoutSeconds) 60) -}}{{- fail "Backup cleanup needs keepLast >= 1, keepDays >= 0 and timeoutSeconds >= 60." -}}{{- end -}}
+{{- end -}}
+{{- if $b.monitoring.enabled -}}
+{{- if eq $b.serviceAccount.name "clickhouse-backup-monitor" -}}{{- fail "clickhouse.backup.serviceAccount.name must differ from clickhouse-backup-monitor when monitoring is enabled." -}}{{- end -}}
+{{- range $key := list "region" "roleArn" "clusterName" -}}
+{{- if not (index $b.monitoring.aws $key) -}}{{- fail (printf "clickhouse.backup.monitoring.aws.%s is required." $key) -}}{{- end -}}
+{{- end -}}
+{{- if lt (int $b.monitoring.maxAgeSeconds) 60 -}}{{- fail "Backup monitoring maxAgeSeconds must be at least 60." -}}{{- end -}}
+{{- end -}}
+{{- else -}}
+{{- if or $b.cleanup.enabled $b.monitoring.enabled -}}{{- fail "Backup cleanup and monitoring require clickhouse.backup.enabled." -}}{{- end -}}
 {{- end -}}
 {{- end -}}
 

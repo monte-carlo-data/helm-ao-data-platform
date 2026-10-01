@@ -203,6 +203,26 @@ and record backup names and results in your change record. The copy-switch helpe
 requires exactly two replicas and an idle, unsuspended CronJob with schedule
 `0 */4 * * *` in UTC; it does not support custom schedules.
 
+## Optional retention previews and monitoring (5.3.0+)
+
+Both features are disabled by default. Enable `clickhouse.backup.cleanup.enabled`
+to report which older backups fall outside `keepLast` and `keepDays` after each
+successful backup. The report preserves every required base and unrelated backup.
+It requires two available copies with matching, healthy catalogs. Keep
+`cleanup.dryRun: true`: the chart and Python entry point reject deletion because
+stock 2.8.1 can leave native JSON objects behind. No deletion implementation or
+custom image is included.
+
+Optional monitoring checks scheduled Job results every five minutes and sends
+CloudWatch metrics. It has no backup credentials or S3 access. AWS alarms and a
+confirmed SNS email subscription are also required for email notifications.
+If Kubernetes status cannot be read, only monitor failure is reported; backup
+alarms retain their prior state with the matching Terraform module settings.
+See [retention previews and alerts](backup-cleanup-alerts.md) for configuration,
+permissions, and verification. These features do not replace a tested restore.
+The backup Job's total deadline includes `cleanup.timeoutSeconds` when previews
+are enabled, so allow time for both before the next scheduled run.
+
 ## Current limitations
 
 - **No automatic retention.** Both keep-counts are zero, so the backup tool never
@@ -217,8 +237,9 @@ requires exactly two replicas and an idle, unsuspended CronJob with schedule
   proof that a restore works. The scheduled configuration disables cluster-wide
   backup/restore. Embedded mode ignores `restore_schema_on_cluster`; a separate
   administrator configuration and a tested restore procedure are still needed.
-- **No backup alerts.** Watch for failed `otel-backup` Jobs and check that expected
-  scheduled Jobs complete. A missing run may not produce a failed Job.
+- **Alerts require separate setup.** Monitoring is disabled by default. Enable
+  it with the required AWS permissions, alarms, and confirmed email subscription;
+  a failed Job alone does not prove notification delivery.
 - **Freshness checks are a point-in-time check.** They exclude replicas with
   missing or delayed data before backup submission; pod Ready alone is not used.
   They do not prove that a restore succeeds or make concurrent writes a global

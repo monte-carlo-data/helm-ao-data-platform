@@ -86,6 +86,26 @@ clickhouse:
       resources:
         requests: {cpu: 25m, memory: 32Mi}
         limits: {memory: 128Mi}
+    cleanup:
+      enabled: false
+      # Preview only: stock clickhouse-backup 2.8.1 cannot safely remove native files.
+      # Setting false is rejected; this chart does not execute backup deletion.
+      dryRun: true
+      keepLast: 2
+      # A time window preserves all entries in that window plus their bases.
+      # Use 30 for real-data deployments; 0 lets dev test the small count limit.
+      keepDays: 0
+      timeoutSeconds: 1800
+    monitoring:
+      enabled: false
+      # AWS's image includes Python and boto3; pinned to the tested amd64 build.
+      image: public.ecr.aws/lambda/python:3.13@sha256:2b439fd4b8cfb73e65a29a26170648333bf0880f7848a19d54c962e56f56d4ca
+      # Four-hour schedule plus 15 minutes for normal dev backup completion.
+      maxAgeSeconds: 15300
+      aws:
+        region: ""
+        roleArn: ""
+        clusterName: ""
   storageClass: ""
   storageSize: 100Gi
   # Data retention, in days, for the telemetry tables — the raw traces, the
