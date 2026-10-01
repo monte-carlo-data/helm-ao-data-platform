@@ -320,14 +320,15 @@ SELECT
                     ''
                 ),
                 -- Cortex reasoning steps: idx-th planning.messages element with its
-                -- "User: " / "Assistant: " prefix moved into role
-                nullIf(
+                -- "User: " / "Assistant: " prefix moved into role. An element that
+                -- strips to '' stays '' rather than falling through to planning.query.
+                if(idx < length(_planning_messages),
                     multiIf(
                         startsWith(_planning_messages[idx + 1], 'User: '), substring(_planning_messages[idx + 1], 7),
                         startsWith(_planning_messages[idx + 1], 'Assistant: '), substring(_planning_messages[idx + 1], 12),
                         _planning_messages[idx + 1]
                     ),
-                    ''
+                    NULL
                 ),
                 -- Snowflake native: single attr, idx=0 only
                 if(idx = 0,
