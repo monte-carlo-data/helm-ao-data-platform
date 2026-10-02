@@ -250,14 +250,16 @@ the first operation might still be running. Check the job and backup-container
 logs before retrying; concurrent or automatic retries could duplicate work.
 `schedule.timeoutSeconds` bounds the scheduler's wait (60 to 14400 seconds,
 default 10800). Kubernetes separately sets the Job's `activeDeadlineSeconds` to
-that value plus 60 seconds. These limits start from different events: scheduler
+that value plus 60 seconds and, when cleanup is enabled, `cleanup.timeoutSeconds`.
+These limits start from different events: scheduler
 startup and Job start, respectively. The stock tool requires its own ClickHouse
 timeout of four hours.
 Ending the Job does not cancel server-side work; check for a running operation
 before retrying. With `concurrencyPolicy: Forbid`, a Job that outlasts the cron interval causes scheduled
 runs to be skipped; leave time between the timeout and the next run.
 At the default four-hour interval, `timeoutSeconds` of 14340 or more leaves no
-gap before the Job deadline reaches that interval. Allow time for startup and
+gap before the Job deadline reaches that interval even with cleanup disabled.
+When cleanup is enabled, include its timeout in the total too. Allow time for startup and
 scheduling delays as well. A successful empty operation-status response means
 the backup process has lost the record, for example after a restart; the job
 stops with an explanation rather than waiting until the deadline. Inspect the
@@ -270,6 +272,22 @@ AWS permissions or network rules. Follow [the live backup test steps](verify-cli
 and record backup names and results in your change record. The copy-switch helper
 requires exactly two replicas and an idle, unsuspended CronJob with schedule
 `0 */4 * * *` in UTC; it does not support custom schedules.
+
+## Optional retention previews (5.3.0+)
+
+Enable `clickhouse.backup.cleanup.enabled` to report which older backups fall
+outside `keepLast` and `keepDays` after each verified backup. It is disabled by
+default. The report preserves every required base and unrelated remote backup.
+It needs two available copies with matching remote catalogs. Known incomplete
+local entries and scheduler-owned local files without remote backups are listed
+separately; no files are removed. Other preview errors log
+`Backup cleanup preview stopped:` and leave the successful backup Job successful.
+
+Keep `cleanup.dryRun: true`: the chart and Python entry point reject deletion
+because stock 2.8.1 leaves native JSON objects behind. No deletion implementation
+or custom image is included. See [retention previews](backup-cleanup.md) for
+configuration and checks. The Job deadline includes `cleanup.timeoutSeconds`,
+so allow time for both backup and preview before the next scheduled run.
 
 ## Current limitations
 
@@ -299,14 +317,17 @@ requires exactly two replicas and an idle, unsuspended CronJob with schedule
   Production enablement should wait for tested retention that removes selected
   remote backups first, then their local pointer directories on every copy,
   while preserving every backup still needed by a retained backup. The cleanup
-  work in https://github.com/monte-carlo-data/helm-ao-data-platform/pull/30 must
-  include that local cleanup. A preview alone does not limit this growth.
+  preview in 5.3.0 does not limit this growth; remote-first deletion and local
+  pruning still need to be implemented and tested. The tool's manual `delete
+  remote` also leaves native JSON files behind; see [the deletion limitation](backup-cleanup-tool-bug.md).
 - **Restore is not yet supported or documented.** A successful backup Job is not
   proof that a restore works. The scheduled configuration disables cluster-wide
   backup/restore. Embedded mode ignores `restore_schema_on_cluster`; a separate
   administrator configuration and a tested restore procedure are still needed.
-- **No backup alerts.** Watch for failed `otel-backup` Jobs and check that expected
-  scheduled Jobs complete. A missing run may not produce a failed Job.
+- **Alerts require separate setup.** This chart does not choose a monitoring
+  system or send backup alerts. Connect Job status and the cleanup report to
+  your existing monitoring; a successful backup Job does not prove its preview
+  completed, and a failed Job alone does not prove notification delivery.
 - **Freshness checks are a point-in-time check.** They exclude replicas with
   missing or delayed data before backup submission; pod Ready alone is not used.
   They do not prove that a restore succeeds or make concurrent writes a global

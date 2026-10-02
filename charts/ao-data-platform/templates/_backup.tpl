@@ -33,6 +33,16 @@
 {{- fail "clickhouse.backup.networkPolicy.additionalPorts must contain TCP ports from 1 to 65535, excluding the protected backup port 7171." -}}
 {{- end -}}
 {{- end -}}
+{{- if $b.cleanup.enabled -}}
+{{- if ne (toString $b.cleanup.dryRun) "true" -}}{{- fail "Backup deletion is unavailable with stock clickhouse-backup 2.8.1; cleanup.dryRun must remain true." -}}{{- end -}}
+{{- if ne (int .Values.clickhouse.replicasCount) 2 -}}{{- fail "Backup cleanup requires exactly two ClickHouse copies." -}}{{- end -}}
+{{- range $key, $minimum := dict "keepLast" 1 "keepDays" 0 "timeoutSeconds" 60 -}}
+{{- $value := index $b.cleanup $key -}}
+{{- if or (not (regexMatch "^[0-9]+$" (toString $value))) (lt (int $value) $minimum) -}}{{- fail (printf "clickhouse.backup.cleanup.%s must be an integer >= %d." $key $minimum) -}}{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- else -}}
+{{- if $b.cleanup.enabled -}}{{- fail "Backup cleanup requires clickhouse.backup.enabled." -}}{{- end -}}
 {{- end -}}
 {{- end -}}
 

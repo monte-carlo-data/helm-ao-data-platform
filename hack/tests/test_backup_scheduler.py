@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import sys
 import tempfile
 import threading
 import unittest
@@ -15,9 +16,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 SCRIPT = Path(__file__).resolve().parents[2] / "charts/ao-data-platform/files/clickhouse-backup/run_backup.py"
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "charts/ao-data-platform/files/clickhouse-backup"))
 SPEC = importlib.util.spec_from_file_location("backup_scheduler", SCRIPT)
 backup = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(backup)
+sys.path.pop(0)
 NOW = datetime(2026, 9, 29, 8, tzinfo=timezone.utc)
 FULL = "ao-otel-full-20260929T000000Z-12345678"
 
@@ -1110,6 +1113,64 @@ class APITests(unittest.TestCase):
         self.assertIn("Backup API returned HTTP 500", stderr.getvalue())
         self.assertNotIn("private-password", stdout.getvalue() + stderr.getvalue())
         self.assertNotIn("private server body", stdout.getvalue() + stderr.getvalue())
+
+
+    def test_cleanup_deletion_is_rejected_before_any_backup_request(self):
+        for value in ("false", "invalid", ""):
+            settings = dict(self.settings, BACKUP_CLEANUP_ENABLED="true", BACKUP_CLEANUP_DRY_RUN=value)
+            errors = io.StringIO()
+            with self.subTest(value=value), mock.patch.dict(backup.os.environ, settings, clear=True), \
+                    mock.patch.object(backup, "configured_clients") as clients, \
+                    mock.patch.object(backup.Scheduler, "run") as run, redirect_stderr(errors):
+                self.assertEqual(backup.main(), 1)
+            clients.assert_not_called()
+            run.assert_not_called()
+            self.assertIn("preview only", errors.getvalue())
+
+    def test_cleanup_failure_does_not_fail_job_after_successful_upload(self):
+        settings = dict(self.settings, BACKUP_CLEANUP_ENABLED="true")
+        cleanup = mock.Mock()
+        cleanup.Cleaner.return_value.run.side_effect = backup.BackupError("Cleanup stopped safely.")
+        with mock.patch.dict(backup.os.environ, settings, clear=True), \
+                mock.patch.dict("sys.modules", {"cleanup_backups": cleanup}), \
+                mock.patch.object(backup.Path, "read_text", return_value="test-password"), \
+                mock.patch.object(backup, "PasswordRevisionGuard"), \
+                mock.patch.object(backup.Scheduler, "run", return_value=FULL) as run, \
+                mock.patch("sys.stderr"):
+            self.assertEqual(backup.main(), 0)
+            run.assert_called_once()
+            cleanup.Cleaner.return_value.run.assert_called_once_with(latest_backup=FULL, execute=False)
+
+    def test_failed_upload_never_calls_cleanup(self):
+        settings = dict(self.settings, BACKUP_CLEANUP_ENABLED="true")
+        cleanup = mock.Mock()
+        with mock.patch.dict(backup.os.environ, settings, clear=True), \
+                mock.patch.dict("sys.modules", {"cleanup_backups": cleanup}), \
+                mock.patch.object(backup.Path, "read_text", return_value="test-password"), \
+                mock.patch.object(backup, "PasswordRevisionGuard"), \
+                mock.patch.object(backup.Scheduler, "run", side_effect=backup.BackupError("upload failed")), \
+                mock.patch("sys.stderr"):
+            self.assertEqual(backup.main(), 1)
+            cleanup.Cleaner.assert_not_called()
+
+    def test_incomplete_local_files_report_preview_without_failing_backup(self):
+        for broken in ([], [{"copy": 1, "name": FULL}]):
+            settings = dict(self.settings, BACKUP_CLEANUP_ENABLED="true")
+            cleanup = mock.Mock()
+            cleanup.Cleaner.return_value.run.return_value = {"mode": "dry-run", "deleted": [], "broken_local": broken, "local_only": []}
+            output, errors = io.StringIO(), io.StringIO()
+            with self.subTest(broken=broken), mock.patch.dict(backup.os.environ, settings, clear=True), \
+                    mock.patch.dict("sys.modules", {"cleanup_backups": cleanup}), \
+                    mock.patch.object(backup, "configured_clients", return_value=([mock.Mock(), mock.Mock()], [mock.Mock(), mock.Mock()])), \
+                    mock.patch.object(backup.Scheduler, "run", return_value=FULL) as run, \
+                    redirect_stdout(output), redirect_stderr(errors):
+                self.assertEqual(backup.main(), 0)
+            run.assert_called_once()
+            self.assertIn('"broken_local":', output.getvalue())
+            self.assertIn('"deleted": []', output.getvalue())
+            if broken:
+                self.assertIn("local files needing attention", errors.getvalue())
+                self.assertIn("No files were deleted", errors.getvalue())
 
 
 if __name__ == "__main__":
