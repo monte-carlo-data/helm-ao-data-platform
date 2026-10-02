@@ -159,6 +159,7 @@ class BackupChartTests(unittest.TestCase):
             self.assertNotIn(forbidden, env)
 
         disk = xml_tree(self.chi["spec"]["configuration"]["files"]["config.d/backup.xml"])
+        self.assertEqual(disk.findtext("s3/use_environment_credentials"), "0")
         destination = disk.find("storage_configuration/disks/backups_s3")
         self.assertEqual(destination.findtext("type"), "s3")
         self.assertEqual(destination.findtext("use_environment_credentials"), "1")

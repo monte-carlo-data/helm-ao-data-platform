@@ -21,6 +21,12 @@ database is healthy. The backup container uses a `400MiB` Go memory target under
 its default `512Mi` memory limit. Keep `clickhouse.backup.sidecar.goMemoryLimit`
 below the container limit when changing either value.
 
+With backups enabled, the chart sets global `s3.use_environment_credentials=0`
+so an `s3()` query without supplied AWS keys cannot automatically use the server's
+backup credentials. The `backups_s3` disk keeps its own setting at `1`, allowing
+embedded backups to use the AWS role. Existing `s3()` queries that relied on
+automatic access will now fail; supplying credentials explicitly still works.
+
 The backup container runs as user and group `101` and must write to the shared
 data volume. Enabling backups sets `fsGroup: 101` so that access works on a new
 volume too. With `fsGroupChangePolicy: OnRootMismatch`, the first enable can still
