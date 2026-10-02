@@ -29,6 +29,9 @@ import urllib.request
 import uuid
 
 
+from backup_common import BackupError, REQUEST_TIMEOUT_SECONDS, broken_local_entry
+
+
 TABLES = "otel_traces.*"
 FULL_NAME = re.compile(r"ao-otel-full-(\d{8}T\d{6}Z)-[0-9a-f]{8}\Z")
 REVISION_ANNOTATION = "backup.montecarlodata.com/password-revision"
@@ -41,10 +44,6 @@ FROM system.tables AS t LEFT JOIN system.replicas AS r
 WHERE t.database = 'otel_traces' AND startsWith(t.engine, 'Replicated')
 SETTINGS output_format_json_quote_64bit_integers = 0
 FORMAT JSONEachRow"""
-
-
-class BackupError(Exception):
-    """A safe-to-log failure message, without server bodies or credentials."""
 
 
 class RevisionError(BackupError):
@@ -106,7 +105,7 @@ class API:
             headers={"Authorization": self.authorization, "Accept": "application/json"},
         )
         try:
-            with self.opener.open(request, timeout=30) as response:
+            with self.opener.open(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
                 payload = response.read(32 * 1024 * 1024 + 1)
             if len(payload) > 32 * 1024 * 1024:
                 raise BackupError("Backup API response exceeded the size limit.")
@@ -308,14 +307,6 @@ def full_base(catalog, now):
     return max(candidates)[1] if candidates else None
 
 
-def broken_local_entry(row):
-    """Recognize the two incomplete-metadata descriptions emitted by v2.8.1."""
-    desc = row.get("desc")
-    return (row.get("location") == "local" and row.get("required") == ""
-            and isinstance(desc, str)
-            and (desc == "broken metadata.json not found" or desc.startswith("parse metadata.json error: ")))
-
-
 class Scheduler:
     def __init__(self, apis, probes, timeout=10800, poll_seconds=10,
                  clock=time.monotonic, sleep=time.sleep, max_replica_delay=5, freshness_retry_seconds=30):
@@ -515,14 +506,37 @@ def main():
         if timeout <= 0 or poll_seconds <= 0:
             raise BackupError("Backup timeout and polling interval must be positive seconds.")
         options = configured_options()
+        cleanup_enabled = os.environ.get("BACKUP_CLEANUP_ENABLED", "false") == "true"
+        if cleanup_enabled and os.environ.get("BACKUP_CLEANUP_DRY_RUN", "true") != "true":
+            raise BackupError("Backup deletion is unavailable with stock clickhouse-backup 2.8.1; cleanup supports preview only.")
         apis, probes = configured_clients()
-        Scheduler(apis, probes, timeout, poll_seconds, **options).run()
-        return 0
+        name = Scheduler(apis, probes, timeout, poll_seconds, **options).run()
     except (KeyError, ValueError, OSError):
         print("Backup failed: check scheduler settings and the mounted password file.", file=sys.stderr)
+        return 1
     except BackupError as error:
         print(f"Backup failed: {error}", file=sys.stderr)
-    return 1
+        return 1
+
+    if cleanup_enabled:
+        # This report runs after a verified upload. Its failure must not turn
+        # that successful backup into a failed Job or invite another upload.
+        try:
+            from cleanup_backups import Cleaner
+            cleaner = Cleaner(apis, keep_last=int(os.environ.get("BACKUP_KEEP_LAST", "2")),
+                              keep_days=int(os.environ.get("BACKUP_KEEP_DAYS", "0")),
+                              timeout=int(os.environ.get("BACKUP_CLEANUP_TIMEOUT_SECONDS", "1800")))
+            result = cleaner.run(latest_backup=name, execute=False)
+            print("Backup cleanup: " + json.dumps(result, sort_keys=True), flush=True)
+            if result["broken_local"] or result["local_only"]:
+                print("Backup cleanup preview found local files needing attention; "
+                      "see broken_local and local_only in the report. No files were deleted.", file=sys.stderr)
+        except (KeyError, ValueError, OSError):
+            print("Backup cleanup preview stopped: check cleanup settings; the backup already completed.",
+                  file=sys.stderr)
+        except BackupError as error:
+            print(f"Backup cleanup preview stopped: {error}", file=sys.stderr)
+    return 0
 
 
 if __name__ == "__main__":
