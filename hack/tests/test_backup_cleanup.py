@@ -110,6 +110,7 @@ class FakeAPI:
         self.broken_local = False
         self.broken_remote = False
         self.remote_override = None
+        self.local_descriptions = {}
 
     def request(self, method, path):
         world, index = self.world, self.index
@@ -129,7 +130,9 @@ class FakeAPI:
         desc = "directory, embedded" if location == "remote" else "embedded"
         if (location == "remote" and self.broken_remote) or (location == "local" and self.broken_local):
             desc = "private failure details"
-        return [dict(name=n, required=r, location=location, desc=desc) for n, r in entries.items()]
+        return [dict(name=n, required=r, location=location,
+                     desc=self.local_descriptions.get(n, desc) if location == "local" else desc)
+                for n, r in entries.items()]
 
 
 class PreviewTests(unittest.TestCase):
@@ -139,6 +142,7 @@ class PreviewTests(unittest.TestCase):
         result = world.run()
         self.assertEqual(result["mode"], "dry-run")
         self.assertEqual(result["deleted"], [])
+        self.assertEqual(result["broken_local"], [])
         self.assertEqual(set(result["delete"]), {A, AI, B, BI})
         self.assertTrue(world.calls)
         self.assertTrue(all(method == "GET" for _, method, _ in world.calls))
@@ -185,6 +189,46 @@ class PreviewTests(unittest.TestCase):
             with self.subTest(attribute=attribute), self.assertRaises(cleanup.BackupError) as caught:
                 world.run()
             self.assertNotIn("private", str(caught.exception))
+
+    def test_known_incomplete_local_files_are_reported_with_healthy_remote_backup(self):
+        for description in ("broken metadata.json not found", "parse metadata.json error: private parser details"):
+            world = World()
+            world.apis[1].local_descriptions[AI] = description
+            world.local[1][AI] = ""  # Broken metadata cannot tell us its base.
+            with self.subTest(description=description):
+                result = world.run()
+                self.assertEqual(result["broken_local"], [{"copy": 1, "name": AI}])
+                self.assertEqual(set(result["delete"]), {A, AI, B, BI})
+                self.assertEqual(result["deleted"], [])
+                self.assertNotIn("private", str(result))
+                self.assertTrue(all(method == "GET" for _, method, _ in world.calls))
+
+    def test_broken_local_entry_needs_a_healthy_remote_counterpart(self):
+        for missing in (False, True):
+            world = World()
+            world.apis[1].local_descriptions[AI] = "broken metadata.json not found"
+            if missing:
+                del world.remote[AI]
+            else:
+                world.apis[0].broken_remote = True
+            with self.subTest(missing=missing), self.assertRaises(cleanup.BackupError):
+                world.run()
+
+    def test_local_entry_repaired_during_preview_is_detected(self):
+        world = World()
+        world.apis[0].local_descriptions[AI] = "broken metadata.json not found"
+        reads = 0
+
+        def repair_during_read(index, path):
+            nonlocal reads
+            if index == 0 and path == "/backup/list/local":
+                reads += 1
+                if reads == 2:
+                    world.apis[0].local_descriptions.clear()
+
+        world.before_read = repair_during_read
+        with self.assertRaisesRegex(cleanup.BackupError, "changed"):
+            world.run()
 
     def test_disagreeing_remote_catalogues_stop_preview(self):
         world = World()

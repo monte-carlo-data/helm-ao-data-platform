@@ -867,6 +867,25 @@ class APITests(unittest.TestCase):
             self.assertEqual(backup.main(), 1)
             cleanup.Cleaner.assert_not_called()
 
+    def test_incomplete_local_files_report_preview_and_fail_job_for_existing_alert(self):
+        for broken in ([], [{"copy": 1, "name": FULL}]):
+            settings = dict(self.settings, BACKUP_CLEANUP_ENABLED="true")
+            cleanup = mock.Mock()
+            cleanup.Cleaner.return_value.run.return_value = {"mode": "dry-run", "deleted": [], "broken_local": broken}
+            output, errors = io.StringIO(), io.StringIO()
+            with self.subTest(broken=broken), mock.patch.dict(backup.os.environ, settings, clear=True), \
+                    mock.patch.dict("sys.modules", {"cleanup_backups": cleanup}), \
+                    mock.patch.object(backup, "configured_clients", return_value=([mock.Mock(), mock.Mock()], [mock.Mock(), mock.Mock()])), \
+                    mock.patch.object(backup.Scheduler, "run", return_value=FULL) as run, \
+                    redirect_stdout(output), redirect_stderr(errors):
+                self.assertEqual(backup.main(), 1 if broken else 0)
+            run.assert_called_once()
+            self.assertIn('"broken_local":', output.getvalue())
+            self.assertIn('"deleted": []', output.getvalue())
+            if broken:
+                self.assertIn("backup and cleanup preview completed", errors.getvalue())
+                self.assertIn("no files were deleted", errors.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

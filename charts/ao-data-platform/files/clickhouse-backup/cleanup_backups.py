@@ -38,16 +38,24 @@ def scheduled_time(name, now):
     return created
 
 
-def catalog(rows, location):
+def catalog(rows, location, remote=None):
     """Keep only stable API fields; error bodies and credentials never enter logs."""
     result = {}
     for row in rows:
         name, required = row.get("name"), row.get("required")
+        description = row.get("desc")
+        broken = (isinstance(description, str) and
+                  (description == "broken metadata.json not found"
+                   or description.startswith("parse metadata.json error: ")))
         if (not isinstance(name, str) or not name or name in result
                 or not isinstance(required, str) or row.get("location") != location
-                or row.get("desc") != ("directory, embedded" if location == "remote" else "embedded")):
+                or (description != ("directory, embedded" if location == "remote" else "embedded")
+                    and not (location == "local" and broken and remote is not None and name in remote))):
             raise BackupError("Cleanup stopped: backup metadata is broken, duplicated, or unsupported.")
-        result[name] = required
+        # None preserves the incomplete local entry in comparisons without
+        # trusting its missing dependency. The healthy remote catalog remains
+        # the only source for retention decisions. Never log parser messages.
+        result[name] = None if broken else required
     return result
 
 
@@ -141,9 +149,10 @@ class Cleaner:
         remote = [catalog(self.request(i, "GET", "/backup/list/remote"), "remote") for i in range(2)]
         if remote[0] != remote[1]:
             raise BackupError("Cleanup stopped: the copies disagree about remote backups.")
-        local = [catalog(self.request(i, "GET", "/backup/list/local"), "local") for i in range(2)]
+        local = [catalog(self.request(i, "GET", "/backup/list/local"), "local", remote[0]) for i in range(2)]
         for entries in local:
-            if any(name not in remote[0] or required != remote[0][name] for name, required in entries.items()):
+            if any(name not in remote[0] or (required is not None and required != remote[0][name])
+                   for name, required in entries.items()):
                 raise BackupError("Cleanup stopped: local metadata has no matching remote backup; inspect it first.")
         self.idle()
         return remote[0], local
@@ -153,7 +162,7 @@ class Cleaner:
         self.idle()
         for index in range(2):
             if (catalog(self.request(index, "GET", "/backup/list/remote"), "remote") != remote
-                    or catalog(self.request(index, "GET", "/backup/list/local"), "local") != local[index]):
+                    or catalog(self.request(index, "GET", "/backup/list/local"), "local", remote) != local[index]):
                 raise BackupError("Cleanup stopped: backup metadata changed during cleanup.")
         self.idle()
 
@@ -165,6 +174,9 @@ class Cleaner:
         now = now or datetime.now(timezone.utc)
         remote, local = self.snapshot()
         result = plan(remote, now, self.keep_last, self.keep_days, latest_backup)
-        result.update(mode="dry-run", deleted=[])
+        result.update(mode="dry-run", deleted=[], broken_local=[
+            {"copy": index, "name": name}
+            for index, entries in enumerate(local)
+            for name, required in sorted(entries.items()) if required is None])
         self.unchanged(remote, local)
         return result

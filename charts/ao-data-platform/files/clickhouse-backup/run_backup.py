@@ -448,6 +448,9 @@ def main():
                               timeout=int(os.environ.get("BACKUP_CLEANUP_TIMEOUT_SECONDS", "1800")))
             result = cleaner.run(latest_backup=name, execute=False)
             print("Backup cleanup: " + json.dumps(result, sort_keys=True), flush=True)
+            if result["broken_local"]:
+                raise BackupError("The backup and cleanup preview completed, but incomplete local backup files need attention. "
+                                  "See broken_local in the preview; no files were deleted.")
         return 0
     except (KeyError, ValueError, OSError):
         print("Backup failed: check scheduler settings and the mounted password file.", file=sys.stderr)

@@ -31,15 +31,38 @@ The tool's own automatic deletion remains off. Keep S3 lifecycle expiration
 disabled for both backup prefixes; the chart cannot inspect or change bucket
 lifecycle rules.
 
-Both copies must report the fixed version before cleanup can delete anything;
-the script checks again before each deletion. See the fix and test evidence in
-[backup-cleanup-tool-bug.md](backup-cleanup-tool-bug.md). The tool's own automatic
-deletion remains off. Keep S3 lifecycle expiration disabled for both backup
-prefixes; the chart cannot inspect or change bucket lifecycle rules.
-
 Both copies must report matching, healthy backup records. Missing bases, busy
 copies, or interrupted prior cleanup stop the report and fail the scheduled
 job, so the same alert catches cleanup problems after a successful upload.
+
+There is one reported exception: a local entry with `broken metadata.json not found`
+or `parse metadata.json error: ...` can be left by an interrupted download. When
+the same name has a healthy remote backup, the preview still completes and lists
+the affected name and copy under `broken_local`. It does not delete anything or
+trust the incomplete entry's dependency. The scheduled Job then fails with a
+message distinguishing the completed backup from the local files needing
+attention, so the existing failure alert reports it. Until a scheduled Job
+finishes without this warning, the monitor also retains the previous successful
+Job time. Follow the specific-entry recovery steps in
+[the backup instructions](clickhouse-backups.md#interrupted-base-downloads).
+An unknown error description or a missing remote counterpart still stops the
+preview. Parser messages are never copied into the report.
+
+## Local disk growth and deletion requirements
+
+ClickHouse keeps small files describing the S3 backups on its own data volume,
+under `/var/lib/clickhouse/disks/backups_s3/`. A preview does not remove these
+files or limit their growth. Check both free space and available file entries
+on every copy, using the commands in
+[the current limitations](clickhouse-backups.md#current-limitations).
+
+Before enabling backups for production data, retention must be able to remove
+selected remote backups and then their local pointer directories on every copy.
+Delete dependent backups before their bases, and preserve every base still used
+by a kept backup. Verify that remote objects are actually gone and that a kept
+backup can still be restored. Keep local deletion in that deliberate cleanup
+step, not in the scheduled backup operation. This PR's preview does not meet
+that deletion requirement by itself.
 
 ## Alerts
 
