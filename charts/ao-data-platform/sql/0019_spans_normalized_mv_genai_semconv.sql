@@ -2,9 +2,10 @@
 -- OTel-official instrumentors, e.g. Google ADK) on spans_normalized_mv.
 --
 -- SUPERSEDED, AND DELIBERATELY INERT. The SELECT this file used to install was
--- carried forward by 0020_spans_normalized_mv_tool_call_response.sql and now
--- lives in 0021_spans_normalized_mv_planning_tool_fallbacks.sql, the last
--- writer of this view. The statement was removed from here rather than left in
+-- carried forward by 0020_spans_normalized_mv_tool_call_response.sql and
+-- 0021_spans_normalized_mv_planning_tool_fallbacks.sql, and now lives in
+-- 0026_spans_normalized_mv_planning_tool_calls.sql, the last writer of this
+-- view. The statement was removed from here rather than left in
 -- place because schema-job.yaml re-runs every /sql/*.sql on install AND upgrade
 -- with no ledger or checksum: a superseded ALTER ... MODIFY QUERY is not merely
 -- redundant, it is a transient REGRESSION. Re-running this file restored the
@@ -35,7 +36,7 @@
 -- the mirrored files' relative order. Only the redundant statement is gone.
 --
 -- What that superseded SELECT added, kept here as the record of why the change
--- was made (all of it now carried by 0021):
+-- was made (all of it now carried forward through 0020 and 0021 into 0026):
 --   1. Content: the new semconv moved prompt/completion content from per-attribute
 --      indexed keys (gen_ai.prompt.{N}.content) to single JSON-array attributes
 --      gen_ai.input.messages / gen_ai.output.messages, each an array of
@@ -49,4 +50,4 @@
 -- Both axes are total / null-safe -- every expression degrades to '' for a
 -- missing or malformed JSON path and never raises, so a source INSERT into
 -- otel_traces can never be failed by this view (a raising MV halts ingestion
--- cluster-wide). 0021 preserves that property.
+-- cluster-wide). 0026 preserves that property.
