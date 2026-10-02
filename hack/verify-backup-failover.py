@@ -80,14 +80,14 @@ try:
     selected = []
     class UnreachableCopy:
         def request(self, *args, **kwargs):
-            raise b.BackupError("Copy 0 is unavailable for this controlled test.")
+            raise b.RequestNotSent("Copy 0 is unavailable for this controlled test; no request was sent.")
     scheduler = b.Scheduler([UnreachableCopy(), real[1]], probes,
                             timeout=timeout - 30, poll_seconds=5, **b.configured_options())
     choose = scheduler.choose_copy
-    def choose_copy():
-        result = choose()
+    def choose_copy(backup_time=None):
+        result = choose(backup_time)
         check(result[0] == 1, "The scheduler did not select copy 1.")
-        check(b.full_base(result[2], now) == expected, "The scheduler selected a different full backup.")
+        check(result[2] == expected, "The scheduler selected a different full backup.")
         selected.append(1)
         return result
     scheduler.choose_copy = choose_copy

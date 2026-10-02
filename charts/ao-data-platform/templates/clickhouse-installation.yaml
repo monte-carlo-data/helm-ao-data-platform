@@ -400,6 +400,8 @@ spec:
           serviceAccountName: {{ .Values.clickhouse.backup.serviceAccount.name }}
           automountServiceAccountToken: false
           securityContext:
+            # The backup process runs as group 101 and must write to the shared
+            # data volume, including before ClickHouse initializes a fresh volume.
             fsGroup: 101
             fsGroupChangePolicy: OnRootMismatch
           volumes:

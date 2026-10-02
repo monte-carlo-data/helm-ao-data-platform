@@ -37,7 +37,8 @@ that work started. The scheduler checks replica freshness before submission; the
 catalog check still does not prove that restoring the data will succeed.
 
 The first successful run each UTC day is full. Later runs that day are
-incremental. A manual test does not replace checking that the clock starts a
+incremental, unless every healthy copy has an incomplete local base and the
+scheduler creates a replacement full. A manual test does not replace checking that the clock starts a
 successful incremental run.
 
 ## Check that backup controls reject other callers
@@ -144,12 +145,15 @@ These checks use ClickHouse 26.4.3, the official pinned backup 2.8.1 image, and
 the scheduler's pinned Python image. They start only temporary local containers
 with generated credentials, without AWS calls. They test the actual rendered
 user files, missing and changing credentials, startup with unreachable S3,
-the stock backup startup script and frozen configuration, and the real HTTP
-replica query with an embedded Keeper. They remove only their own containers.
+the chart's startup script running on the stock image and its frozen configuration,
+and the real HTTP replica query with an embedded Keeper. They also run the real
+scheduler against local S3-compatible storage, creating a full and incremental
+backup and checking the recorded dependency. They remove only their own containers.
 PyYAML, Docker, and Helm on PATH (or `HELM=/path/to/helm`) are required.
 
-Before publishing a change to backup volumes, also run the separate Kubernetes
-API validation against an explicit existing test namespace:
+For changes to backup volumes, run this manual check before release against an
+explicit existing test namespace. CI does not run this Kubernetes API check or
+make publishing depend on it:
 
 ```bash
 BACKUP_KUBERNETES_CONTEXT="<your-context>" \

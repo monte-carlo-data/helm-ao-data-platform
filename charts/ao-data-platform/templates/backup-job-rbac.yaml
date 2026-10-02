@@ -1,13 +1,6 @@
 {{- include "ao-data-platform.backupValidate" . -}}
 {{- if .Values.clickhouse.backup.enabled }}
 {{- $name := printf "%s-backup-job" (include "ao-data-platform.chiName" .) }}
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: {{ $name }}
-  labels:
-    {{- include "ao-data-platform.labels" . | nindent 4 }}
----
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:

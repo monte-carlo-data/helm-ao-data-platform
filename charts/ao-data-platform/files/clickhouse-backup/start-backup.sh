@@ -44,7 +44,11 @@ while :; do
         wait_for_credentials 'database password is empty'
         continue
     fi
-    actual_revision=$(cat "$api_revision" 2>/dev/null || true)
+    if ! actual_revision=$(cat "$api_revision" 2>/dev/null && printf '.'); then
+        wait_for_credentials 'API revision is missing or does not match'
+        continue
+    fi
+    actual_revision=${actual_revision%.}
     if [ -z "$actual_revision" ] || [ "$actual_revision" != "$expected_revision" ]; then
         wait_for_credentials 'API revision is missing or does not match'
         continue

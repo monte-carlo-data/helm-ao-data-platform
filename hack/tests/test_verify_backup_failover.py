@@ -181,6 +181,11 @@ class PodTests(unittest.TestCase):
             "The expected full backup is not today's latest healthy full backup.")
         self.assertEqual(self.copies[0].posts + self.copies[1].posts, [])
 
+    def test_changed_base_at_scheduler_selection_stops_before_any_post(self):
+        with mock.patch.object(scheduler, "full_base", side_effect=[FULL, None]):
+            self.assert_inconclusive(self.run_pod(), "The scheduler selected a different full backup.")
+        self.assertEqual(self.copies[0].posts + self.copies[1].posts, [])
+
     def test_active_operation_hidden_by_later_list_still_blocks(self):
         self.copies[0].history.extend([
             {"command":"create_remote another", "status":"in progress", "operation_id":"busy"},

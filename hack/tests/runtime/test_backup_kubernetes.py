@@ -2,8 +2,9 @@
 
 Opt in with BACKUP_KUBERNETES_CONTEXT and BACKUP_KUBERNETES_NAMESPACE.
 Run with HELM set when Helm is not on PATH. The test uses fake CI credentials.
-Docker cannot catch Kubernetes projection validation, so this separate check
-must pass before publishing a change to backup volumes or mounts. It does not
+Docker cannot catch Kubernetes projection validation. This is a manual check
+before releasing changes to backup volumes or mounts, not an automatic CI
+publishing requirement. It does not
 exercise the ClickHouse operator or prove that kubelet can start a container.
 Run the Docker checks separately; operator integration requires its own cluster test.
 """
