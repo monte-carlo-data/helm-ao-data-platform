@@ -1011,10 +1011,10 @@ jobs:
             if [ "$base" = "$(git rev-parse HEAD)" ]; then
               base=$(git rev-parse HEAD^) || exit 0
             fi
-            # Read the whole list before grep exits early on a match. Otherwise
-            # pipefail can mistake git's broken pipe for an unrelated change.
+            # Read the whole list and let grep consume all input. Otherwise
+            # pipefail can mistake a broken pipe for an unrelated change.
             changed=$(git diff --name-only "$base" HEAD) || exit 0
-            if ! grep -Eq '^(\.circleci/|charts/ao-data-platform/|hack/tests/|hack/verify-backup-failover\.py)' <<< "$changed"; then
+            if ! printf '%s\n' "$changed" | grep -E '^(\.circleci/|charts/ao-data-platform/|hack/tests/|hack/verify-backup-failover\.py)' >/dev/null; then
               echo "No backup chart, script, or test changes; skipping Docker checks."
               circleci-agent step halt
             fi
