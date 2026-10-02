@@ -212,14 +212,16 @@ the first operation might still be running. Check the job and backup-container
 logs before retrying; concurrent or automatic retries could duplicate work.
 `schedule.timeoutSeconds` bounds the scheduler's wait (60 to 14400 seconds,
 default 10800). Kubernetes separately sets the Job's `activeDeadlineSeconds` to
-that value plus 60 seconds. These limits start from different events: scheduler
+that value plus 60 seconds and, when cleanup is enabled, `cleanup.timeoutSeconds`.
+These limits start from different events: scheduler
 startup and Job start, respectively. The stock tool requires its own ClickHouse
 timeout of four hours.
 Ending the Job does not cancel server-side work; check for a running operation
 before retrying. With `concurrencyPolicy: Forbid`, a Job that outlasts the cron interval causes scheduled
 runs to be skipped; leave time between the timeout and the next run.
 At the default four-hour interval, `timeoutSeconds` of 14340 or more leaves no
-gap before the Job deadline reaches that interval. Allow time for startup and
+gap before the Job deadline reaches that interval even with cleanup disabled.
+When cleanup is enabled, include its timeout in the total too. Allow time for startup and
 scheduling delays as well. A successful empty operation-status response means
 the backup process has lost the record, for example after a restart; the job
 stops with an explanation rather than waiting until the deadline. Inspect the

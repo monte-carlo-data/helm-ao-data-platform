@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 import re
 import time
 
-from run_backup import BackupError
+from run_backup import BackupError, broken_local_entry
 
 
 SCHEDULED_NAME = re.compile(r"ao-otel-(full|incremental)-(\d{8}T\d{6}Z)-[0-9a-f]{8}\Z")
@@ -44,9 +44,7 @@ def catalog(rows, location, remote=None):
     for row in rows:
         name, required = row.get("name"), row.get("required")
         description = row.get("desc")
-        broken = (isinstance(description, str) and
-                  (description == "broken metadata.json not found"
-                   or description.startswith("parse metadata.json error: ")))
+        broken = broken_local_entry(row)
         if (not isinstance(name, str) or not name or name in result
                 or not isinstance(required, str) or row.get("location") != location
                 or (description != ("directory, embedded" if location == "remote" else "embedded")

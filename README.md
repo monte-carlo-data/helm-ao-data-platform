@@ -933,7 +933,7 @@ helm upgrade ao-data-platform oci://registry-1.docker.io/montecarlodata/ao-data-
 | `clickhouse.backup.api.secret` | `""` | Target Secret name for the external API source; defaults to `<CHI>-backup-api`. |
 | `clickhouse.backup.schedule.cron` | `0 */4 * * *` | UTC schedule. The first successful run each day is full; later runs use that full as their base. |
 | `clickhouse.backup.schedule.suspend` | `false` | Pause new scheduled Jobs. Does not stop existing work or prevent the installation's pod roll; set `true` for initial setup. |
-| `clickhouse.backup.schedule.timeoutSeconds` | `10800` | Scheduler wait limit in seconds, from 60 to 14400. The Kubernetes Job deadline is this value plus 60 seconds. The tool separately uses a fixed four-hour timeout. At the default interval, values of 14340 or more reach the next run; leave time for startup and scheduling delays or `Forbid` can skip scheduled Jobs. |
+| `clickhouse.backup.schedule.timeoutSeconds` | `10800` | Scheduler wait limit in seconds, from 60 to 14400. The Kubernetes Job deadline adds 60 seconds and, when cleanup is enabled, `cleanup.timeoutSeconds`. The tool separately uses a fixed four-hour timeout. Keep that total below the schedule interval, with time for startup and scheduling delays, or `Forbid` can skip scheduled Jobs. |
 | `clickhouse.backup.schedule.maxReplicaDelaySeconds` | `5` | Largest replication delay allowed before backup, in seconds. Nonnegative integer. |
 | `clickhouse.backup.schedule.freshnessRetrySeconds` | `30` | How long to retry a delayed copy before trying another, in seconds. Zero checks once. |
 | `clickhouse.backup.schedule.startingDeadlineSeconds` | `900` | Latest allowed start after a missed scheduled time, in seconds. |

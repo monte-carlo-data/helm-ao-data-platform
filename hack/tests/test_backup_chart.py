@@ -436,15 +436,24 @@ class BackupChartTests(unittest.TestCase):
         source = (CHART / "templates/NOTES.txt").read_text()
         values = yaml.safe_load((CHART / "values.yaml").read_text())
         values["clickhouse"]["backup"]["enabled"] = True
-        for timeout in (14339, 14340, 14399, 14400):
-            with self.subTest(timeout=timeout):
-                values["clickhouse"]["backup"]["schedule"]["timeoutSeconds"] = timeout
-                notes = render_secret_template(source, {
-                    "Values": values, "Release": {"Namespace": "render-test"},
-                })
-                self.assertIn(f"scheduler waits up to {timeout}\nseconds", notes)
-                self.assertIn(f"Job deadline to {timeout + 60}\nseconds", notes)
-                self.assertEqual("WARNING:" in notes, timeout >= 14340)
+        for cleanup in (False, True):
+            cleanup_timeout = 1800
+            threshold = 14400 - 60 - (cleanup_timeout if cleanup else 0)
+            values["clickhouse"]["backup"]["cleanup"].update(enabled=cleanup, timeoutSeconds=cleanup_timeout)
+            for timeout in (threshold - 1, threshold, threshold + 59, threshold + 60):
+                with self.subTest(timeout=timeout, cleanup=cleanup):
+                    values["clickhouse"]["backup"]["schedule"]["timeoutSeconds"] = timeout
+                    notes = render_secret_template(source, {
+                        "Values": values, "Release": {"Namespace": "render-test"},
+                    })
+                    docs = render(f"clickhouse.backup.schedule.timeoutSeconds={timeout}",
+                                  "clickhouse.backup.cleanup.enabled=" + str(cleanup).lower(),
+                                  f"clickhouse.backup.cleanup.timeoutSeconds={cleanup_timeout}")
+                    deadline = one(docs, "CronJob")["spec"]["jobTemplate"]["spec"]["activeDeadlineSeconds"]
+                    self.assertIn(f"scheduler waits up to {timeout}\nseconds", notes)
+                    self.assertIn(f"Job deadline to {deadline}\nseconds", notes)
+                    self.assertEqual("WARNING:" in notes, deadline >= 14400)
+                    self.assertEqual("seconds for the cleanup preview" in notes, cleanup)
 
     def test_database_probe_tls_matches_certificates_and_mounts_only_public_ca(self):
         for tls in (True, False):

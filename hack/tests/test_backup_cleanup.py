@@ -207,6 +207,7 @@ class PreviewTests(unittest.TestCase):
         for missing in (False, True):
             world = World()
             world.apis[1].local_descriptions[AI] = "broken metadata.json not found"
+            world.local[1][AI] = ""
             if missing:
                 del world.remote[AI]
             else:
@@ -217,6 +218,7 @@ class PreviewTests(unittest.TestCase):
     def test_local_entry_repaired_during_preview_is_detected(self):
         world = World()
         world.apis[0].local_descriptions[AI] = "broken metadata.json not found"
+        world.local[0][AI] = ""
         reads = 0
 
         def repair_during_read(index, path):
@@ -225,6 +227,7 @@ class PreviewTests(unittest.TestCase):
                 reads += 1
                 if reads == 2:
                     world.apis[0].local_descriptions.clear()
+                    world.local[0][AI] = A
 
         world.before_read = repair_during_read
         with self.assertRaisesRegex(cleanup.BackupError, "changed"):
