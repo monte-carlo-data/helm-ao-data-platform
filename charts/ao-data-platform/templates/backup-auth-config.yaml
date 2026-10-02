@@ -1,0 +1,28 @@
+{{- include "ao-data-platform.backupValidate" . -}}
+{{- if .Values.clickhouse.backup.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ao-data-platform.chiName" . }}-backup-auth
+  labels:
+    {{- include "ao-data-platform.labels" . | nindent 4 }}
+data:
+  # Mounted with the separate user stores; see the Pod volumes in the CHI.
+  backup-users.xml: |
+    <clickhouse>
+      <user_directories>
+        <users_xml name="backup"><name>backup</name><path>/etc/clickhouse-backup-auth/user/users.xml</path></users_xml>
+        <users_xml name="backup_probe"><name>backup_probe</name><path>/etc/clickhouse-backup-auth/probe/users.xml</path></users_xml>
+      </user_directories>
+    </clickhouse>
+  # Each always-present base file loads its sibling users.d directory. The
+  # optional Secret supplies the complete user there, at a distinct path.
+  # Missing credentials leave a valid empty store and never allow passwordless auth.
+  user.xml: |
+    <clickhouse/>
+  probe.xml: |
+    <clickhouse>
+      <profiles><backup_probe><readonly>2</readonly></backup_probe></profiles>
+      <quotas><default><interval><duration>3600</duration><queries>0</queries><errors>0</errors><result_rows>0</result_rows><read_rows>0</read_rows><execution_time>0</execution_time></interval></default></quotas>
+    </clickhouse>
+{{- end }}
