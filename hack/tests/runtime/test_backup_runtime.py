@@ -9,6 +9,7 @@ no AWS or Kubernetes calls are made. Only containers created here are removed.
 import inspect
 import json
 import os
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 import subprocess
@@ -256,9 +257,9 @@ class BackupRuntimeTests(unittest.TestCase):
         self.root = Path(self.directory.name)
         self.sequence = 0
 
-    def db(self, **options):
+    def db(self, *, documents=None, **options):
         self.sequence += 1
-        database = Database(self.root / str(self.sequence), self.documents, self.passwords, **options)
+        database = Database(self.root / str(self.sequence), documents or self.documents, self.passwords, **options)
         self.addCleanup(database.close)
         database.start(wait=not options.get("access_check"))
         return database
@@ -508,7 +509,7 @@ except urllib.error.HTTPError as error:
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result.stdout
 
-    def test_real_scheduler_creates_full_then_incremental_with_stock_api_and_s3(self):
+    def start_s3(self):
         storage = "backup-runtime-s3-" + uuid.uuid4().hex[:10]
         credentials = {"access_key": "runtime-" + uuid.uuid4().hex, "secret_key": uuid.uuid4().hex}
         self.addCleanup(lambda: docker("rm", "-f", "-v", storage, check=False))
@@ -534,6 +535,71 @@ while True:
         time.sleep(0.2)
 local_s3_request('PUT', '/runtime-backups', os.environ['S3_ACCESS_KEY'], os.environ['S3_SECRET_KEY'])
 """, **s3_environment)
+        return storage, credentials
+
+    def test_sql_cannot_borrow_server_s3_credentials_but_backup_disk_can(self):
+        storage, credentials = self.start_s3()
+        database = self.db(network="container:" + storage, s3_credentials=credentials)
+        endpoint = "http://127.0.0.1:9001/runtime-backups/test/queries/"
+        explicit_keys = "'" + credentials["access_key"] + "', '" + credentials["secret_key"] + "', "
+
+        def s3(path, keys=""):
+            return "s3('" + endpoint + path + "', " + keys + "'CSV', 'id UInt64')"
+
+        # The default ingestion user has broad SQL grants. Prove that neither
+        # missing SQL permissions nor an unreachable object store explains a
+        # failed keyless request: explicit, disposable keys work for this user.
+        query = "INSERT INTO FUNCTION " + s3("read.csv", explicit_keys) + " SELECT 7"
+        result = database.query(query, user="otel")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = database.query("SELECT id FROM " + s3("read.csv", explicit_keys), user="otel")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "7")
+        for query in ("SELECT id FROM " + s3("read.csv"),
+                      "INSERT INTO FUNCTION " + s3("blocked-write.csv") + " SELECT 8"):
+            with self.subTest(query=query):
+                result = database.query(query, user="otel")
+                self.assertNotEqual(result.returncode, 0, "SQL borrowed the server's S3 credentials")
+                self.assertIn("(S3_ERROR)", result.stderr)
+                self.assertIn("HTTP response code: 403", result.stderr)
+
+        for query in ("CREATE DATABASE otel_traces",
+                      "CREATE TABLE otel_traces.runtime_sample (id UInt64) ENGINE=MergeTree ORDER BY id",
+                      "INSERT INTO otel_traces.runtime_sample VALUES (1)"):
+            result = database.query(query)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        result = database.query(
+            "BACKUP TABLE otel_traces.runtime_sample TO Disk('backups_s3', 'credentials-check')", user="backup")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("BACKUP_CREATED", result.stdout)
+
+        # Remove only the global guard and repeat against the same private
+        # store. Both keyless operations must then succeed, reproducing the
+        # original exposure while leaving the backup disk setting unchanged.
+        database.close()
+        documents = deepcopy(self.documents)
+        files = one(documents, "ClickHouseInstallation")["spec"]["configuration"]["files"]
+        config = ET.fromstring(files["config.d/backup.xml"])
+        global_s3 = config.find("s3")
+        self.assertIsNotNone(global_s3)
+        credential_setting = global_s3.find("use_environment_credentials")
+        self.assertIsNotNone(credential_setting)
+        global_s3.remove(credential_setting)
+        files["config.d/backup.xml"] = ET.tostring(config, encoding="unicode")
+        unguarded = self.db(documents=documents, network="container:" + storage, s3_credentials=credentials)
+        result = unguarded.query("SELECT id FROM " + s3("read.csv"), user="otel")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "7")
+        result = unguarded.query("INSERT INTO FUNCTION " + s3("control-write.csv") + " SELECT 9", user="otel")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = unguarded.query("SELECT id FROM " + s3("control-write.csv"), user="otel")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "9")
+
+    def test_real_scheduler_creates_full_then_incremental_with_stock_api_and_s3(self):
+        storage, credentials = self.start_s3()
+        s3_environment = {"S3_ACCESS_KEY": credentials["access_key"], "S3_SECRET_KEY": credentials["secret_key"]}
+        s3_script = "import json, os, time, urllib.request\n" + inspect.getsource(local_s3_request)
         database = self.db(network="container:" + storage, s3_credentials=credentials)
         for query in ("CREATE DATABASE otel_traces",
                       "CREATE TABLE otel_traces.runtime_sample (id UInt64, message String) ENGINE=MergeTree ORDER BY id",
