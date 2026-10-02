@@ -27,7 +27,9 @@ def load(name, path):
 
 
 helper = load("verify_failover", "hack/verify-backup-failover.py")
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "charts/ao-data-platform/files/clickhouse-backup"))
 scheduler = load("run_backup", "charts/ao-data-platform/files/clickhouse-backup/run_backup.py")
+sys.path.pop(0)
 FULL = "ao-otel-full-20260929T000000Z-12345678"
 NOW = datetime(2026, 9, 29, 0, 30, tzinfo=timezone.utc)
 
