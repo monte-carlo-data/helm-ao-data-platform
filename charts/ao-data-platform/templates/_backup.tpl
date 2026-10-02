@@ -10,7 +10,8 @@
 {{- if not (regexMatch "^[a-zA-Z0-9_-]+(/[a-zA-Z0-9_-]+)*$" $b.aws.path) -}}{{- fail "clickhouse.backup.aws.path must contain safe directory names without leading or trailing slashes." -}}{{- end -}}
 {{- if or (not $b.serviceAccount.name) (eq $b.serviceAccount.name "default") -}}{{- fail "clickhouse.backup.serviceAccount.name must be a dedicated account, not default." -}}{{- end -}}
 {{- if not $b.user.secret -}}{{- fail "clickhouse.backup.user.secret must name the backup credentials Secret." -}}{{- end -}}
-{{- if not (regexMatch "^(docker.io/|registry-1.docker.io/)?altinity/clickhouse-backup(:2\\.8\\.1)?@sha256:08016b048f7e6035c048501315c2a788e5a782f15f168e042c7bd48d5a388cc4$" $b.sidecar.image) -}}{{- fail "clickhouse.backup.sidecar.image must use the official Altinity 2.8.1 image and its verified digest." -}}{{- end -}}
+{{/* The startup wrapper and scheduler were verified against this exact stock build; mirrors must preserve its digest. */}}
+{{- if not (regexMatch "^[^[:space:]@]+@sha256:08016b048f7e6035c048501315c2a788e5a782f15f168e042c7bd48d5a388cc4$" $b.sidecar.image) -}}{{- fail "clickhouse.backup.sidecar.image must use the verified Altinity 2.8.1 digest; another registry or repository is allowed." -}}{{- end -}}
 {{- if not $b.probe.secret -}}{{- fail "clickhouse.backup.probe.secret is required." -}}{{- end -}}
 {{- if not (regexMatch "^[a-zA-Z0-9._-]+$" (toString $b.api.passwordRevision)) -}}{{- fail "clickhouse.backup.api.passwordRevision must be a nonempty revision using letters, digits, dots, underscores, or hyphens." -}}{{- end -}}
 {{- $externalAPI := not (empty (dig "secretStoreRef" "name" "" ($b.api.externalSecret | default dict))) -}}
@@ -172,4 +173,13 @@ api:
     allowPrivilegeEscalation: false
     capabilities:
       drop: ["ALL"]
+{{- end -}}
+
+{{/* One StatefulSet per replica, with Pod ordinal zero in the single-shard layout. */}}
+{{- define "ao-data-platform.backupPodNames" -}}
+{{- $names := list -}}
+{{- range $replica := (include "ao-data-platform.backupReplicas" . | fromJsonArray) -}}
+{{- $names = append $names (printf "chi-%s-%s-0-%d-0" (include "ao-data-platform.chiName" $) (include "ao-data-platform.clickhouseClusterName" $) (int $replica)) -}}
+{{- end -}}
+{{- toJson $names -}}
 {{- end -}}

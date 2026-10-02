@@ -20,15 +20,16 @@ Verify the deployment:
   kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/name=opentelemetry-collector
 {{- if .Values.clickhouse.backup.enabled }}
 
-Backups: the Job deadline is {{ .Values.clickhouse.backup.schedule.timeoutSeconds }}
+Backups: the scheduler waits up to {{ .Values.clickhouse.backup.schedule.timeoutSeconds }}
+seconds. Kubernetes sets the Job deadline to {{ add (int .Values.clickhouse.backup.schedule.timeoutSeconds) 60 }}
 seconds; the backup tool separately has a four-hour timeout. Ending the Job does
 not cancel server-side work. A job still running
 at the next scheduled time causes that run to be skipped (concurrencyPolicy: Forbid).
-{{- if and (eq .Values.clickhouse.backup.schedule.cron "0 */4 * * *") (ge (int .Values.clickhouse.backup.schedule.timeoutSeconds) 14400) }}
-WARNING: the backup timeout reaches or exceeds the four-hour schedule interval.
+{{- if and (eq .Values.clickhouse.backup.schedule.cron "0 */4 * * *") (ge (add (int .Values.clickhouse.backup.schedule.timeoutSeconds) 60) 14400) }}
+WARNING: the Job deadline reaches or exceeds the four-hour schedule interval.
 Shorten the timeout or allow for skipped scheduled runs.
 {{- else if ne .Values.clickhouse.backup.schedule.cron "0 */4 * * *" }}
-You changed the schedule; check that the timeout is shorter than its interval.
+You changed the schedule; check that the Job deadline is shorter than its interval.
 {{- end }}
 {{- end }}
 {{- if .Values.gateway.enabled }}

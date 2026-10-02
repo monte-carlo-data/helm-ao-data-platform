@@ -83,7 +83,7 @@ class FakeAPI:
     def request(self, method, path, query=None):
         self.calls.append((method, path, query))
         if self.unavailable:
-            raise backup.BackupError("not reachable")
+            raise backup.RequestNotSent("connection refused; no request was sent")
         if method == "POST":
             if self.post_failure:
                 raise backup.BackupError("connection lost after submitting")
@@ -93,7 +93,7 @@ class FakeAPI:
             self.operation_id = "id-" + str(len(self.history) + 1)
             acknowledgement = {"status": "acknowledged", "operation": operation,
                                "backup_name": name, "operation_id": self.operation_id}
-            self.history.append(dict(acknowledgement, status="in progress"))
+            self.history.append(dict(acknowledgement, command=operation + " " + name, status="in progress"))
             acknowledgement.update(self.acknowledgement_changes)
             return [acknowledgement] * self.acknowledgement_count
         if path == "/backup/actions":
@@ -103,7 +103,7 @@ class FakeAPI:
                 return self.history[-1:]
             if self.status_read_failures:
                 self.status_read_failures -= 1
-                raise backup.BackupError("read timed out")
+                raise backup.ReadUnavailable("read timed out")
             status = self.statuses[0]
             if len(self.statuses) > 1:
                 self.statuses.pop(0)
@@ -270,6 +270,63 @@ class SchedulerTests(unittest.TestCase):
                 self.run_scheduler(first, second)
         self.assertEqual(first.posts + second.posts, [])
 
+    def test_uncertain_in_progress_check_never_starts_work_on_another_copy(self):
+        for error in (backup.RevisionCheckUnavailable("Could not check Pods."),
+                      backup.ReadUnavailable("Read timed out after contact."),
+                      backup.BackupError("Unexpected response.")):
+            with self.subTest(error=type(error).__name__):
+                first = FakeAPI(history=[{"status": "in progress"}])
+                second = FakeAPI()
+                with mock.patch.object(first, "request", side_effect=error):
+                    with self.assertRaises(type(error)):
+                        self.run_scheduler(first, second)
+                self.assertEqual(first.posts + second.posts, [])
+                self.assertEqual(second.calls, [])
+
+    def test_incomplete_action_history_is_not_proof_a_copy_is_idle(self):
+        for row in ({}, {"command": "list remote"}, {"status": "success"},
+                    {"command": "", "status": "success"}, {"command": "list remote", "status": "unknown"}):
+            with self.subTest(row=row):
+                first, second = FakeAPI(history=[row]), FakeAPI()
+                with self.assertRaisesRegex(backup.BackupError, "could not confirm it is idle"):
+                    self.run_scheduler(first, second)
+                self.assertEqual(first.posts + second.posts, [])
+                self.assertEqual(second.calls, [])
+
+    def test_rejected_backup_credentials_stop_without_retry_or_switch(self):
+        cases = [("/backup/actions", 1), ("/backup/tables", 1),
+                 ("/backup/list/remote", 1), ("/backup/list/remote", 2),
+                 ("/backup/list/local", 1), ("/backup/create_remote", 1),
+                 ("/backup/status", 1)]
+        for failed_path, occurrence in cases:
+            with self.subTest(path=failed_path, occurrence=occurrence):
+                full = remote()
+                first = FakeAPI([full], [dict(full, location="local", desc="embedded")], created_required=FULL)
+                second = FakeAPI([full])
+                request = first.request
+                count = 0
+
+                def rejected_request(method, path, query=None):
+                    nonlocal count
+                    if path == failed_path:
+                        count += 1
+                        if count == occurrence:
+                            raise backup.AuthenticationError("Password rejected; rotate it.")
+                    return request(method, path, query)
+
+                with mock.patch.object(first, "request", side_effect=rejected_request):
+                    with self.assertRaisesRegex(backup.AuthenticationError, "Password rejected"):
+                        self.run_scheduler(first, second)
+                self.assertEqual(count, occurrence)
+                self.assertEqual(second.posts, [])
+
+    def test_rejected_credentials_on_second_copy_stop_before_any_backup(self):
+        first, second = FakeAPI(), FakeAPI()
+        with mock.patch.object(second, "request", side_effect=backup.AuthenticationError("Password rejected.")):
+            with self.assertRaises(backup.AuthenticationError):
+                self.run_scheduler(first, second)
+        self.assertEqual(first.posts + second.posts, [])
+
     def test_first_run_creates_full_for_all_trace_tables_on_copy_zero(self):
         first, second = FakeAPI(), FakeAPI()
         name = self.run_scheduler(first, second)
@@ -314,6 +371,82 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(second.posts[1][2]["diff-from-remote"], FULL)
         self.assertFalse(any("schema" in (query or {}) for _, _, query in second.posts))
         self.assertFalse(any("delete" in path or "restore" in path for _, path, _ in second.calls))
+
+    def test_incomplete_local_base_uses_healthy_copy_without_deleting_or_redownloading(self):
+        for desc in ("broken metadata.json not found", "parse metadata.json error: unexpected EOF"):
+            with self.subTest(desc=desc):
+                full = remote()
+                first = FakeAPI([full], [dict(full, location="local", desc=desc)])
+                second = FakeAPI([full], [dict(full, location="local", desc="embedded")], created_required=FULL)
+                self.run_scheduler(first, second)
+                self.assertEqual(first.posts, [])
+                self.assertEqual(len(second.posts), 1)
+                self.assertEqual(second.posts[0][2]["diff-from-remote"], FULL)
+                self.assertEqual(first.local[0]["desc"], desc)
+
+    def test_existing_usable_base_is_preferred_to_downloading_on_first_copy(self):
+        full = remote()
+        first = FakeAPI([full])
+        second = FakeAPI([full], [dict(full, location="local", desc="embedded")], created_required=FULL)
+        self.run_scheduler(first, second)
+        self.assertEqual(first.posts, [])
+        self.assertEqual(len(second.posts), 1)
+        self.assertEqual(second.posts[0][2]["diff-from-remote"], FULL)
+
+    def test_missing_base_on_second_copy_is_downloaded_when_first_base_is_broken(self):
+        full = remote()
+        first = FakeAPI([full], [dict(full, location="local", desc="broken metadata.json not found")])
+        second = FakeAPI([full], created_required=FULL)
+        self.run_scheduler(first, second)
+        self.assertEqual(first.posts, [])
+        self.assertEqual(second.posts[0], ("POST", "/backup/download/" + FULL, None))
+        self.assertEqual(second.posts[1][2]["diff-from-remote"], FULL)
+
+    def test_all_healthy_copies_with_confirmed_broken_bases_create_one_replacement_full(self):
+        for copies in (1, 2):
+            with self.subTest(copies=copies):
+                full = remote()
+                descriptions = ["broken metadata.json not found", "parse metadata.json error: unexpected EOF"]
+                apis = [FakeAPI([full], [dict(full, location="local", desc=desc)]) for desc in descriptions[:copies]]
+                name = self.run_scheduler(*apis)
+                self.assertTrue(name.startswith("ao-otel-full-20260929T080000Z-"))
+                self.assertNotEqual(name, FULL)
+                self.assertEqual(apis[0].posts, [("POST", "/backup/create_remote", {"name": name, "table": backup.TABLES})])
+                self.assertTrue(all(not api.posts for api in apis[1:]))
+                self.assertEqual(backup.full_base(apis[0].catalog, NOW), name)
+                for api, desc in zip(apis, descriptions):
+                    self.assertEqual(api.local[0]["desc"], desc)
+
+    def test_failed_local_list_does_not_prove_all_bases_are_broken(self):
+        for failed_copy in (0, 1):
+            with self.subTest(copy=failed_copy):
+                full = remote()
+                apis = [FakeAPI([full], [dict(full, location="local", desc="broken metadata.json not found")])
+                        for _ in range(2)]
+                request = apis[failed_copy].request
+
+                def unavailable_list(method, path, query=None):
+                    if path == "/backup/list/local":
+                        raise backup.ReadUnavailable("Temporary list failure.")
+                    return request(method, path, query)
+
+                with mock.patch.object(apis[failed_copy], "request", side_effect=unavailable_list):
+                    with self.assertRaisesRegex(backup.BackupError, "wait timed out"):
+                        self.run_scheduler(*apis)
+                self.assertEqual(apis[0].posts + apis[1].posts, [])
+
+    def test_unknown_or_inconsistent_local_base_does_not_trigger_replacement_full(self):
+        for changes in ({"desc": "broken"}, {"desc": "directory"},
+                        {"desc": "parse metadata.json error"},
+                        {"location": "remote", "desc": "broken metadata.json not found"},
+                        {"required": "other-base", "desc": "broken metadata.json not found"}):
+            with self.subTest(changes=changes):
+                row = dict(remote(), location="local", desc="embedded")
+                row.update(changes)
+                api = FakeAPI([remote()], [row])
+                with self.assertRaisesRegex(backup.BackupError, "unsupported way"):
+                    self.run_scheduler(api)
+                self.assertEqual(api.posts, [])
 
     def test_api_alive_but_clickhouse_down_uses_copy_one(self):
         first, second = FakeAPI(), FakeAPI()
@@ -403,6 +536,69 @@ class SchedulerTests(unittest.TestCase):
         self.run_scheduler(first)
         self.assertEqual(len(first.posts), 1)
 
+    def test_empty_successful_status_reports_lost_operation_without_retry_or_switch(self):
+        for operation in ("create_remote", "download"):
+            with self.subTest(operation=operation):
+                first = FakeAPI([remote()] if operation == "download" else [])
+                second = FakeAPI()
+                request = first.request
+                reads = 0
+
+                def lost_operation(method, path, query=None):
+                    nonlocal reads
+                    if path == "/backup/status":
+                        reads += 1
+                        return []
+                    return request(method, path, query)
+
+                with mock.patch.object(first, "request", side_effect=lost_operation):
+                    with self.assertRaisesRegex(backup.BackupError, "no longer knows this operation; it may have restarted"):
+                        self.run_scheduler(first, second)
+                self.assertEqual((reads, len(first.posts), second.posts), (1, 1, []))
+
+    def test_temporary_list_failures_retry_only_reads_before_and_after_operations(self):
+        # The local list is read at selection, before download and after
+        # download; the remote list is also read after backup completion.
+        for failed_path, occurrence in [("/backup/list/local", 1), ("/backup/list/local", 2),
+                                        ("/backup/list/local", 3), ("/backup/list/remote", 2)]:
+            for failure in (backup.ReadUnavailable("Temporary list failure."),
+                            backup.RevisionCheckUnavailable("Could not check Pods.")):
+                with self.subTest(path=failed_path, occurrence=occurrence, failure=type(failure).__name__):
+                    first = FakeAPI([remote()], created_required=FULL)
+                    request = first.request
+                    count = 0
+
+                    def intermittent_list(method, path, query=None):
+                        nonlocal count
+                        if path == failed_path:
+                            count += 1
+                            if count == occurrence:
+                                raise failure
+                        return request(method, path, query)
+
+                    with mock.patch.object(first, "request", side_effect=intermittent_list):
+                        self.run_scheduler(first)
+                    self.assertEqual([path for _, path, _ in first.posts],
+                                     ["/backup/download/" + FULL, "/backup/create_remote"])
+
+    def test_revision_change_during_completion_check_is_not_retried(self):
+        api = FakeAPI()
+        request = api.request
+        reads = 0
+
+        def rotated_secret(method, path, query=None):
+            nonlocal reads
+            if path == "/backup/list/remote":
+                reads += 1
+                if reads == 2:
+                    raise backup.RevisionError("Password revision changed.")
+            return request(method, path, query)
+
+        with mock.patch.object(api, "request", side_effect=rotated_secret):
+            with self.assertRaises(backup.RevisionError):
+                self.run_scheduler(api)
+        self.assertEqual((reads, len(api.posts)), (2, 1))
+
     def test_temporary_guard_failure_during_acknowledged_operations_retries_without_sending(self):
         for operation, path in (("create_remote", "/backup/create_remote"),
                                 ("download", "/backup/download/example")):
@@ -444,6 +640,16 @@ class SchedulerTests(unittest.TestCase):
         with self.assertRaises(backup.RevisionCheckUnavailable):
             backup.Scheduler([api], [FakeProbe()]).operation(
                 api, "create_remote", "example", "/backup/create_remote", {"name": "example"})
+        api.opener.open.assert_not_called()
+
+    def test_missing_pod_before_post_reports_no_request_was_sent(self):
+        api = backup.API("http://copy0:7171", "backup", "api-secret",
+                         guard=mock.Mock(side_effect=backup.RequestNotSent("The selected copy has no Pod; no request was sent.")))
+        api.opener = mock.Mock()
+        with self.assertRaisesRegex(backup.RequestNotSent, "no request was sent") as caught:
+            backup.Scheduler([api], [FakeProbe()]).operation(
+                api, "create_remote", "example", "/backup/create_remote", {"name": "example"})
+        self.assertNotIn("may still run", str(caught.exception))
         api.opener.open.assert_not_called()
 
     def test_unavailable_guard_during_poll_stops_at_deadline_without_resubmitting(self):
@@ -489,12 +695,29 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(second.posts, [])
 
     def test_download_failure_never_starts_incremental(self):
-        first = FakeAPI([remote()])
+        first, second = FakeAPI([remote()]), FakeAPI([remote()])
         first.statuses = ["error"]
         with self.assertRaisesRegex(backup.BackupError, "download operation failed"):
-            self.run_scheduler(first)
+            self.run_scheduler(first, second)
         self.assertEqual(len(first.posts), 1)
         self.assertIn("download", first.posts[0][1])
+        self.assertEqual(second.posts, [])
+
+    def test_incomplete_metadata_after_download_does_not_switch_or_create_a_new_full(self):
+        first, second = FakeAPI([remote()]), FakeAPI([remote()])
+        request = first.request
+
+        def incomplete_download(method, path, query=None):
+            rows = request(method, path, query)
+            if path == "/backup/list/local" and first.posts:
+                return [dict(remote(), location="local", desc="broken metadata.json not found")]
+            return rows
+
+        with mock.patch.object(first, "request", side_effect=incomplete_download):
+            with self.assertRaisesRegex(backup.BackupError, "no incremental was started"):
+                self.run_scheduler(first, second)
+        self.assertEqual(first.posts, [("POST", "/backup/download/" + FULL, None)])
+        self.assertEqual(second.posts, [])
 
     def test_broken_existing_local_metadata_stops_without_deleting_it(self):
         first = FakeAPI([remote()], [dict(remote(), location="local", desc="broken")])
@@ -546,6 +769,10 @@ class PasswordRevisionTests(unittest.TestCase):
         self.assert_refused_without_api_request([self.pod()], "mounted backup password changed")
         self.password_file.write_text("private-password")
         self.revision_file.write_text("revision-2")
+        self.assert_refused_without_api_request([self.pod()], "wrong revision")
+
+    def test_trailing_newline_in_revision_is_rejected_without_sending_credentials(self):
+        self.revision_file.write_text("revision-1\n")
         self.assert_refused_without_api_request([self.pod()], "wrong revision")
 
     def test_password_update_during_pod_lookup_stops_before_api_request(self):
@@ -706,6 +933,61 @@ class APITests(unittest.TestCase):
             backup.API(self.url, "backup", "private").request("GET", "/backup/list/remote")
         self.assertEqual(str(caught.exception), "Backup API returned HTTP 500.")
 
+    def test_backup_authentication_errors_name_rotation_without_printing_credentials(self):
+        for status in (401, 403):
+            with self.subTest(status=status):
+                type(self).response = (status, {}, b"private password and cloud details")
+                with self.assertRaises(backup.AuthenticationError) as caught:
+                    backup.API(self.url, "backup", "private").request("GET", "/backup/actions")
+                message = str(caught.exception)
+                self.assertIn("changed without a revision update", message)
+                self.assertIn("server may have logged", message)
+                self.assertIn("No retry or switch", message)
+                self.assertNotIn("private", message)
+
+    def test_database_authentication_errors_are_not_backup_password_rotation_errors(self):
+        type(self).response = (403, {}, b"private database details")
+        probe = backup.API(self.url, "backup_probe", "private", backup_api=False)
+        with self.assertRaises(backup.BackupError) as caught:
+            probe.request("GET", "/", {"query": backup.REPLICA_QUERY})
+        self.assertNotIsInstance(caught.exception, backup.AuthenticationError)
+        self.assertNotIn("rotation", str(caught.exception))
+        first, second = FakeAPI(), FakeAPI()
+        clock = Clock()
+        with redirect_stdout(io.StringIO()):
+            backup.Scheduler([first, second], [probe, FakeProbe()], timeout=30,
+                             clock=clock.now, sleep=clock.sleep).run(NOW)
+        self.assertEqual(first.posts, [])
+        self.assertEqual(len(second.posts), 1)
+
+    def test_only_definite_connection_failures_are_classified_as_not_sent(self):
+        cases = [(ConnectionRefusedError("private details"), backup.RequestNotSent),
+                 (backup.socket.gaierror("private details"), backup.RequestNotSent),
+                 (TimeoutError("private details"), backup.ReadUnavailable),
+                 (ConnectionResetError("private details"), backup.ReadUnavailable),
+                 (backup.http.client.RemoteDisconnected("private details"), backup.ReadUnavailable)]
+        for reason, expected in cases:
+            for wrapped in (False, True):
+                with self.subTest(reason=type(reason).__name__, wrapped=wrapped):
+                    error = backup.urllib.error.URLError(reason) if wrapped else reason
+                    api = backup.API(self.url, "backup", "private")
+                    api.opener = mock.Mock()
+                    api.opener.open.side_effect = error
+                    with self.assertRaises(expected) as caught:
+                        api.request("GET", "/backup/actions")
+                    self.assertNotIn("private", str(caught.exception))
+
+    def test_timeout_while_reading_contacted_server_is_not_classified_as_unsent(self):
+        api = backup.API(self.url, "backup", "private")
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.side_effect = TimeoutError("private response details")
+        api.opener = mock.Mock()
+        api.opener.open.return_value = response
+        with self.assertRaises(backup.ReadUnavailable) as caught:
+            api.request("GET", "/backup/actions")
+        self.assertNotIsInstance(caught.exception, backup.RequestNotSent)
+        self.assertIn("may have reached the server", str(caught.exception))
+
     def test_redirects_are_rejected_without_forwarding_credentials(self):
         type(self).response = (302, {"Location": self.url + "/other"}, b"")
         with self.assertRaisesRegex(backup.BackupError, "HTTP 302"):
@@ -747,6 +1029,7 @@ class APITests(unittest.TestCase):
             self.assertEqual(len(api.call_args_list), 2)
             self.assertEqual(api.call_args_list[0].args, (self.url, "backup", "backup-pw"))
             self.assertEqual(api.call_args_list[1].args, (self.url, "backup_probe", "probe-pw"))
+            self.assertFalse(api.call_args_list[1].kwargs["backup_api"])
             self.assertEqual(read.call_args_list, [mock.call(Path(path)) for path in passwords])
             copy_guard = api.call_args_list[0].kwargs["guard"]
             self.assertIs(copy_guard, api.call_args_list[1].kwargs["guard"])
@@ -824,7 +1107,7 @@ class APITests(unittest.TestCase):
                 mock.patch.object(backup, "PasswordRevisionGuard"), \
                 redirect_stdout(stdout), redirect_stderr(stderr):
             self.assertEqual(backup.main(), 1)
-        self.assertIn("able to list the trace tables and remote backups", stderr.getvalue())
+        self.assertIn("Backup API returned HTTP 500", stderr.getvalue())
         self.assertNotIn("private-password", stdout.getvalue() + stderr.getvalue())
         self.assertNotIn("private server body", stdout.getvalue() + stderr.getvalue())
 

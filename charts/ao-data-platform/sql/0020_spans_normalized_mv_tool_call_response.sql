@@ -1,17 +1,18 @@
 -- Render gen_ai-semconv tool results in the message view.
 --
--- SUPERSEDED, AND DELIBERATELY INERT. The SELECT this file used to install now
--- lives in 0021_spans_normalized_mv_planning_tool_fallbacks.sql, which is the
--- last writer of this view. The statement was removed from here rather than
+-- SUPERSEDED, AND DELIBERATELY INERT. The SELECT this file used to install
+-- was carried forward by 0021_spans_normalized_mv_planning_tool_fallbacks.sql
+-- and now lives in 0026_spans_normalized_mv_planning_tool_calls.sql, the last
+-- writer of this view. The statement was removed from here rather than
 -- left in place because schema-job.yaml re-runs every /sql/*.sql on install AND
 -- upgrade with no ledger or checksum: a superseded ALTER ... MODIFY QUERY is
 -- not merely redundant, it is a transient REGRESSION. Left in place, this file
 -- would restore the pre-planning-tool-fallback SELECT for the window between it
--- and 0021, and because the view is insert-triggered and forward-only, a Cortex
--- planning tool-use span ingested in that window keeps an empty completion
--- permanently -- the exact defect 0021 fixes. The mechanism is measured, not
--- theoretical: when 0020 superseded 0019, a two-replica cluster lost, then
--- regained, the newer handling on every upgrade pass.
+-- and its successor, and because the view is insert-triggered and forward-only,
+-- a Cortex planning tool-use span ingested in that window keeps an empty
+-- completion permanently -- the exact defect 0021 fixed. The mechanism is
+-- measured, not theoretical: when 0020 superseded 0019, a two-replica cluster
+-- lost, then regained, the newer handling on every upgrade pass.
 --
 -- The file is retained (not deleted) to hold the numbering, so this ordinal is
 -- never reused, the relative order of files mirrored from the source schema
@@ -25,10 +26,10 @@
 -- migration history -- so exactly one file may carry the current definition of a
 -- given view. That is 0006 (CREATE ... IF NOT EXISTS, which owns the view on a
 -- fresh install) plus one trailing ALTER for clusters where the CREATE is a
--- no-op -- now 0021.
+-- no-op -- now 0026.
 --
 -- What that superseded SELECT added, kept here as the record of why the change
--- was made (all of it now carried by 0021):
+-- was made (all of it now carried forward through 0021 into 0026):
 --   1. Tool results: a gen_ai.input.messages / gen_ai.output.messages part of
 --      type 'tool_call_response' carries its payload under `response`, not
 --      `content`, so 0019's content-only part-concatenation rendered tool
@@ -63,7 +64,7 @@
 --      and no service.name resource attribute) kept the raw ServiceName and
 --      agent-scoped reads silently missed them.
 --
--- SIZE, kept because 0021's header builds on it: `response` is tool-controlled
+-- SIZE (still applies to the live SELECT in 0026): `response` is tool-controlled
 -- and copied verbatim, so prompts[].message is unbounded here. It amplifies --
 -- gen_ai.input.messages on a follow-up turn replays every prior tool result,
 -- so a conversation grows O(turns^2) in total prompt bytes. Left unbounded
@@ -81,5 +82,5 @@
 --
 -- Every expression it added was total (never raises), preserving this view's
 -- headline invariant: a raising SELECT expression fails the source INSERT into
--- otel_traces and silently HALTS span ingestion cluster-wide. 0021 preserves
+-- otel_traces and silently HALTS span ingestion cluster-wide. 0026 preserves
 -- that property.

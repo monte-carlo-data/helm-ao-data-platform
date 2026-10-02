@@ -402,6 +402,8 @@ class BackupChartTests(unittest.TestCase):
     def test_backup_timeouts_and_job_resources_follow_settings(self):
         docs = render("clickhouse.backup.schedule.timeoutSeconds=7200",
                       "clickhouse.backup.schedule.startingDeadlineSeconds=300",
+                      "clickhouse.backup.schedule.maxReplicaDelaySeconds=12",
+                      "clickhouse.backup.schedule.freshnessRetrySeconds=0",
                       "clickhouse.backup.schedule.resources.requests.cpu=50m",
                       "clickhouse.backup.schedule.resources.limits.memory=256Mi",
                       "clickhouse.backup.sidecar.goMemoryLimit=300MiB")
@@ -415,9 +417,34 @@ class BackupChartTests(unittest.TestCase):
         runner = template["template"]["spec"]["containers"][0]
         self.assertEqual(runner["resources"]["requests"]["cpu"], "50m")
         self.assertEqual(runner["resources"]["limits"]["memory"], "256Mi")
-        self.assertEqual(next(e["value"] for e in runner["env"] if e["name"] == "BACKUP_TIMEOUT_SECONDS"), "7200")
+        env = {entry["name"]: entry.get("value") for entry in runner["env"]}
+        self.assertEqual(env["BACKUP_TIMEOUT_SECONDS"], "7200")
+        self.assertEqual(env["BACKUP_MAX_REPLICA_DELAY_SECONDS"], "12")
+        self.assertEqual(env["BACKUP_FRESHNESS_RETRY_SECONDS"], "0")
         sidecar = next(c for c in pod(one(docs, "ClickHouseInstallation"))["containers"] if c["name"] == "clickhouse-backup")
         self.assertEqual(next(e["value"] for e in sidecar["env"] if e["name"] == "GOMEMLIMIT"), "300MiB")
+
+    def test_backup_image_mirror_must_keep_the_verified_digest(self):
+        image = "mirror.example.org/cache/altinity/clickhouse-backup@sha256:08016b048f7e6035c048501315c2a788e5a782f15f168e042c7bd48d5a388cc4"
+        docs = render("clickhouse.backup.sidecar.image=" + image)
+        sidecar = next(container for container in pod(one(docs, "ClickHouseInstallation"))["containers"]
+                       if container["name"] == "clickhouse-backup")
+        self.assertEqual(sidecar["image"], image)
+
+    def test_backup_notes_warn_when_the_job_deadline_reaches_the_next_run(self):
+        # Render the real NOTES source as text; helm template omits NOTES.txt.
+        source = (CHART / "templates/NOTES.txt").read_text()
+        values = yaml.safe_load((CHART / "values.yaml").read_text())
+        values["clickhouse"]["backup"]["enabled"] = True
+        for timeout in (14339, 14340, 14399, 14400):
+            with self.subTest(timeout=timeout):
+                values["clickhouse"]["backup"]["schedule"]["timeoutSeconds"] = timeout
+                notes = render_secret_template(source, {
+                    "Values": values, "Release": {"Namespace": "render-test"},
+                })
+                self.assertIn(f"scheduler waits up to {timeout}\nseconds", notes)
+                self.assertIn(f"Job deadline to {timeout + 60}\nseconds", notes)
+                self.assertEqual("WARNING:" in notes, timeout >= 14340)
 
     def test_database_probe_tls_matches_certificates_and_mounts_only_public_ca(self):
         for tls in (True, False):
@@ -461,8 +488,9 @@ class BackupChartTests(unittest.TestCase):
             "clickhouse.backup.serviceAccount.name=default": "dedicated account",
             "clickhouse.backup.api.existingSecret=": "exactly one",
             "clickhouse.backup.api.passwordRevision=": "passwordRevision",
-            "clickhouse.backup.sidecar.image=": "official Altinity 2.8.1",
-            "clickhouse.backup.sidecar.image=altinity/clickhouse-backup:2.8.1": "official Altinity 2.8.1",
+            "clickhouse.backup.sidecar.image=": "verified Altinity 2.8.1 digest",
+            "clickhouse.backup.sidecar.image=altinity/clickhouse-backup:2.8.1": "verified Altinity 2.8.1 digest",
+            "clickhouse.backup.sidecar.image=mirror.example.org/backup@sha256:" + "0" * 64: "verified Altinity 2.8.1 digest",
             "clickhouse.backup.probe.secret=ao-clickhouse-backup-credentials": "separate Secrets",
             "clickhouse.backup.user.secret=ao-clickhouse-auth-methods": "shared auth bundle",
             "clickhouse.backup.probe.secret=ao-clickhouse-otel-credentials": "another ClickHouse user",
@@ -473,6 +501,10 @@ class BackupChartTests(unittest.TestCase):
             "clickhouse.backup.user.externalSecret.secretStoreRef.name=": "secretStoreRef.name",
             "clickhouse.backup.schedule.timeoutSeconds=1": "from 60 to 14400",
             "clickhouse.backup.schedule.timeoutSeconds=14401": "from 60 to 14400",
+            "clickhouse.backup.schedule.maxReplicaDelaySeconds=-1": "maxReplicaDelaySeconds must be a nonnegative integer",
+            "clickhouse.backup.schedule.maxReplicaDelaySeconds=abc": "maxReplicaDelaySeconds must be a nonnegative integer",
+            "clickhouse.backup.schedule.freshnessRetrySeconds=-1": "freshnessRetrySeconds must be a nonnegative integer",
+            "clickhouse.backup.schedule.freshnessRetrySeconds=abc": "freshnessRetrySeconds must be a nonnegative integer",
             "clickhouse.backup.networkPolicy.additionalPorts[0]=7171": "protected backup port",
             "clickhouse.backup.networkPolicy.additionalPorts[0]=0": "TCP ports",
             "clickhouse.backup.networkPolicy.additionalPorts[0]=65536": "TCP ports",

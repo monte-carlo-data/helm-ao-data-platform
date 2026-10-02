@@ -1011,7 +1011,10 @@ jobs:
             if [ "$base" = "$(git rev-parse HEAD)" ]; then
               base=$(git rev-parse HEAD^) || exit 0
             fi
-            if ! git diff --name-only "$base" HEAD | grep -Eq '^(\.circleci/|charts/ao-data-platform/|hack/tests/|hack/verify-backup-failover\.py)'; then
+            # Read the whole list before grep exits early on a match. Otherwise
+            # pipefail can mistake git's broken pipe for an unrelated change.
+            changed=$(git diff --name-only "$base" HEAD) || exit 0
+            if ! grep -Eq '^(\.circleci/|charts/ao-data-platform/|hack/tests/|hack/verify-backup-failover\.py)' <<< "$changed"; then
               echo "No backup chart, script, or test changes; skipping Docker checks."
               circleci-agent step halt
             fi
@@ -1027,8 +1030,9 @@ jobs:
             docker pull clickhouse/clickhouse-server:26.4.3
             docker pull altinity/clickhouse-backup:2.8.1@sha256:08016b048f7e6035c048501315c2a788e5a782f15f168e042c7bd48d5a388cc4
             docker pull python:3.12-slim-bookworm@sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e
+            docker pull chainguard/minio@sha256:0f95aa412a12351a95bb43c3b54b66440eb0aa022bb3f3458942678a489e915b
       - run:
-          name: Test stock backup startup, secrets, S3 isolation, and replica queries
+          name: Test stock backup startup and scheduled full/incremental backups
           no_output_timeout: 15m
           command: |
             RUN_BACKUP_RUNTIME=1 PYTHONDONTWRITEBYTECODE=1 /tmp/backup-runtime-tests/bin/python \

@@ -21,6 +21,14 @@ database is healthy. The backup container uses a `400MiB` Go memory target under
 its default `512Mi` memory limit. Keep `clickhouse.backup.sidecar.goMemoryLimit`
 below the container limit when changing either value.
 
+The backup container runs as user and group `101` and must write to the shared
+data volume. Enabling backups sets `fsGroup: 101` so that access works on a new
+volume too. With `fsGroupChangePolicy: OnRootMismatch`, the first enable can still
+walk existing files to update their permissions if the volume root's group and
+permission bits do not match. Allow extra time for that first pod restart on a
+large volume; a single-copy installation is unavailable while its pod restarts.
+The exact behavior depends on the volume driver.
+
 ## AWS prerequisites
 
 Create these before setting `clickhouse.backup.enabled: true`:
@@ -141,6 +149,13 @@ Use only dummy passwords for denied-access tests and never put credentials in
 authentication fails. The scheduler checks revisions before sending passwords,
 and rotation must stay paused until all copies use the new revision. Restrict
 access to backup-container logs as well as the API.
+Changing the password without changing its revision can pass the revision checks
+but cause a `401` or `403` rejection. The scheduler stops on that rejection rather
+than trying another copy or repeating the password. The first rejected request
+may already have logged it: restrict those logs and rotate the password using
+the paused procedure above. Revision files must contain exactly the configured
+value, without a trailing newline; use `printf '%s' '1'`, not `echo 1`, when
+preparing a file for `api.existingSecret`.
 
 ## Operation and access
 
@@ -164,6 +179,12 @@ ClickHouse's TLS certificate when `tls.enabled` is true.
 Before an incremental on another copy, it downloads the full backup's small
 metadata files. Database backup data stays in S3, encrypted by the bucket's
 settings. No AWS access keys or KMS key material are stored in the chart.
+If an earlier download left incomplete local files, the job checks another
+healthy copy before submitting any work. If every healthy copy explicitly has
+an incomplete base, it creates a replacement full backup. Later runs use that
+new full. This can add one full backup's storage and runtime; a failed status
+read alone never triggers it. Once a download or backup request is sent, the job
+does not switch copies or resubmit it.
 
 The NetworkPolicy permits port 7171 only from this release's backup Job pods in
 the same namespace. A cluster with working NetworkPolicy enforcement is required;
@@ -189,11 +210,20 @@ The job waits for completion and checks the S3 catalog. If a submission response
 is lost, it fails without sending another backup request or switching copies:
 the first operation might still be running. Check the job and backup-container
 logs before retrying; concurrent or automatic retries could duplicate work.
-`schedule.timeoutSeconds` limits how long the Job runs (60 to 14400 seconds,
-default 10800). The stock tool requires its own ClickHouse timeout of four hours.
+`schedule.timeoutSeconds` bounds the scheduler's wait (60 to 14400 seconds,
+default 10800). Kubernetes separately sets the Job's `activeDeadlineSeconds` to
+that value plus 60 seconds. These limits start from different events: scheduler
+startup and Job start, respectively. The stock tool requires its own ClickHouse
+timeout of four hours.
 Ending the Job does not cancel server-side work; check for a running operation
 before retrying. With `concurrencyPolicy: Forbid`, a Job that outlasts the cron interval causes scheduled
 runs to be skipped; leave time between the timeout and the next run.
+At the default four-hour interval, `timeoutSeconds` of 14340 or more leaves no
+gap before the Job deadline reaches that interval. Allow time for startup and
+scheduling delays as well. A successful empty operation-status response means
+the backup process has lost the record, for example after a restart; the job
+stops with an explanation rather than waiting until the deadline. Inspect the
+selected copy before starting more work.
 
 Before calling the installation complete, check a scheduled full and incremental
 backup, an incremental on another replica based on the first replica's full where
@@ -228,11 +258,31 @@ are enabled, so allow time for both before the next scheduled run.
 - **No automatic retention.** Both keep-counts are zero, so the backup tool never
   deletes backups. With the default schedule, expect roughly one full backup's
   storage growth per day, plus incremental data and metadata; watch bucket size.
+  The native S3 disk also keeps small pointer files on the database's data volume
+  under `/var/lib/clickhouse/disks/backups_s3/`. A full backup adds pointers for
+  its files, incrementals add pointers for changed data, and downloading a base
+  on another copy adds its pointers there. Watch every copy's local disk, not
+  only the S3 bucket: running out of disk space or file entries can stop database
+  writes. Use `df -h /var/lib/clickhouse`, `df -i /var/lib/clickhouse`, and
+  `du -sh /var/lib/clickhouse/disks/backups_s3` inside each ClickHouse container.
+  For illustration, a workload with roughly 1,000 wide parts and 80–120 files per
+  part can add around 100–150 thousand pointer files and 0.5 GB per full backup.
+  An ext4 volume with 100 GiB and its usual fixed allocation of roughly 6.5 million
+  file entries could exhaust them in about 6–9 weeks at that rate. These are
+  workload estimates, not a prediction for every installation. For new volumes,
+  prefer a StorageClass using XFS, which allocates file entries as needed; it
+  still needs enough disk space. Do not convert an existing data volume as part
+  of enabling backups.
   Bucket lifecycle rules are separate and must not expire either backup prefix.
   If manual pruning is necessary, check dependencies in the catalog first. For
   this scheduler's usual daily chains, remove the whole UTC day's full and its
   dependent incrementals, never the full alone. Manual backups can depend on an
   older day's full; retain the base until every backup depending on it is removed.
+  Production enablement should wait for tested retention that removes selected
+  remote backups first, then their local pointer directories on every copy,
+  while preserving every backup still needed by a retained backup. The cleanup
+  work in https://github.com/monte-carlo-data/helm-ao-data-platform/pull/30 must
+  include that local cleanup. A preview alone does not limit this growth.
 - **Restore is not yet supported or documented.** A successful backup Job is not
   proof that a restore works. The scheduled configuration disables cluster-wide
   backup/restore. Embedded mode ignores `restore_schema_on_cluster`; a separate
@@ -244,3 +294,37 @@ are enabled, so allow time for both before the next scheduled run.
   missing or delayed data before backup submission; pod Ready alone is not used.
   They do not prove that a restore succeeds or make concurrent writes a global
   database snapshot. A completed catalog entry still needs a tested restore.
+
+## Interrupted base downloads
+
+Stock 2.8.1 writes `metadata.json` last when downloading a backup. An interrupted
+download can leave a local entry described as `broken metadata.json not found`
+or `parse metadata.json error: ...`. The scheduler can work around that entry as
+described above, but it does not remove the files.
+
+To remove a specific incomplete entry manually, first pause scheduled work and
+verify that no backup, restore, or cleanup is running on any copy. Check that
+the local entry has one of those two descriptions and that the same name has a
+healthy completed remote entry (`directory, embedded`) in the shared catalog.
+On the affected copy, use the configured tool's `delete local <name>` for that
+exact entry. If the tool refuses because another backup depends on it, stop and
+inspect that dependency; do not force deletion. Do not use this procedure for a
+healthy `embedded` entry or one without a healthy remote counterpart. Avoid
+`clean/local_broken`, which acts on all broken local entries rather than only
+the entry you checked. Verify the remote backup still exists before resuming.
+
+## Updating the images
+
+The backup image digest is pinned because the startup script and scheduler were
+tested against that exact build. A registry mirror is allowed if it serves the
+same digest. Within `charts/ao-data-platform`, update its default in `values.yaml`,
+the CI example in `ci/backup-values.yaml`, and validation and its error in
+`templates/_backup.tpl`. Also update chart assertions in `hack/tests/test_backup_chart.py`,
+the runtime default in `hack/tests/runtime/test_backup_runtime.py`, the CI pull
+in `.circleci/config.yml`, and version references in the scheduler, README, and
+backup docs.
+
+For a ClickHouse server upgrade, keep `charts/ao-data-platform/values.yaml`, the CI pull, the runtime
+test's `CH_IMAGE` default, and the documented version together. Test the chosen
+server and backup versions together, including a real full and incremental
+backup; testing an older server does not validate the newly selected pair.

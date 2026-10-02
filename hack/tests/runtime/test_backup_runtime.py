@@ -9,6 +9,7 @@ no AWS or Kubernetes calls are made. Only containers created here are removed.
 import inspect
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 import subprocess
 import sys
@@ -26,6 +27,7 @@ from test_backup_chart import CHART, one, pod, render, render_secret_template
 CH_IMAGE = os.environ.get("CLICKHOUSE_TEST_IMAGE", "clickhouse/clickhouse-server:26.4.3")
 BACKUP_IMAGE = os.environ.get("BACKUP_TEST_IMAGE", "altinity/clickhouse-backup:2.8.1@sha256:08016b048f7e6035c048501315c2a788e5a782f15f168e042c7bd48d5a388cc4")
 PYTHON_IMAGE = os.environ.get("BACKUP_PYTHON_IMAGE", "python:3.12-slim-bookworm@sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e")
+S3_IMAGE = os.environ.get("BACKUP_S3_IMAGE", "chainguard/minio@sha256:0f95aa412a12351a95bb43c3b54b66440eb0aa022bb3f3458942678a489e915b")
 WRAPPER = CHART / "files/clickhouse-backup/start-backup.sh"
 BASE = """<clickhouse><logger><level>error</level><console>1</console></logger>
 <max_thread_pool_size>256</max_thread_pool_size><background_schedule_pool_size>16</background_schedule_pool_size>
@@ -78,11 +80,41 @@ def project(directory, files):
             link.symlink_to("..data/" + name, target_is_directory=(generation / name).is_dir())
 
 
+def local_s3_request(method, path, access_key, secret_key):
+    """Sign a request to the disposable MinIO server using only the stdlib."""
+    from datetime import datetime, timezone
+    import hashlib
+    import hmac
+    import urllib.request
+
+    now = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    body_hash = hashlib.sha256(b"").hexdigest()
+    headers = {"host": "127.0.0.1:9001", "x-amz-content-sha256": body_hash, "x-amz-date": now}
+    signed_headers = ";".join(headers)
+    canonical = "\n".join((method, path, "", "".join(key + ":" + value + "\n" for key, value in headers.items()),
+                            signed_headers, body_hash))
+    scope = now[:8] + "/us-east-1/s3/aws4_request"
+    to_sign = "\n".join(("AWS4-HMAC-SHA256", now, scope, hashlib.sha256(canonical.encode()).hexdigest()))
+    key = ("AWS4" + secret_key).encode()
+    for part in (now[:8], "us-east-1", "s3", "aws4_request"):
+        key = hmac.new(key, part.encode(), hashlib.sha256).digest()
+    signature = hmac.new(key, to_sign.encode(), hashlib.sha256).hexdigest()
+    headers["Authorization"] = ("AWS4-HMAC-SHA256 Credential=" + access_key + "/" + scope
+                                + ", SignedHeaders=" + signed_headers + ", Signature=" + signature)
+    request = urllib.request.Request("http://127.0.0.1:9001" + path, method=method,
+                                     data=b"" if method == "PUT" else None, headers=headers)
+    with urllib.request.urlopen(request, timeout=5) as response:
+        return response.read()
+
+
 class Database:
-    def __init__(self, root, documents, passwords, *, missing=False, access_check=False, keeper=False):
+    def __init__(self, root, documents, passwords, *, missing=False, access_check=False, keeper=False,
+                 network="none", s3_credentials=None):
         self.root, self.passwords = root, passwords
         self.name = "backup-runtime-db-" + uuid.uuid4().hex[:10]
         self.started = False
+        self.network, self.s3_credentials = network, s3_credentials
+        self.data_volume = self.name + "-data" if s3_credentials else None
         self.auth_volumes = {kind: self.name + "-" + kind for kind in ("user", "probe")}
         self.documents = documents
         root.mkdir(parents=True)
@@ -103,6 +135,10 @@ class Database:
             if setting is None:
                 raise AssertionError("Rendered backup disk lost skip_access_check")
             setting.text = "false"
+            config["backup.xml"] = ET.tostring(disk, encoding="unicode")
+        if s3_credentials:
+            disk = ET.fromstring(config["backup.xml"])
+            disk.find("storage_configuration/disks/backups_s3/endpoint").text = "http://127.0.0.1:9001/runtime-backups/test/native/"
             config["backup.xml"] = ET.tostring(disk, encoding="unicode")
         project(root / "config", config)
         project(root / "users", {name.removeprefix("users.d/"): value for name, value in files.items()
@@ -152,12 +188,18 @@ class Database:
 
     def start(self, wait=True):
         self.sync_credentials()
-        args = ["run", "-d", "--name", self.name, "--network", "none", "--hostname", "localhost",
+        args = ["run", "-d", "--name", self.name, "--network", self.network,
                 "--cpus", "2", "--memory", "2g", "--env", "CLICKHOUSE_SKIP_USER_SETUP=1",
-                "--env", "AWS_EC2_METADATA_DISABLED=true", "--env", "AWS_ACCESS_KEY_ID=dummy",
-                "--env", "AWS_SECRET_ACCESS_KEY=dummy",
-                "--tmpfs", "/var/lib/clickhouse:rw,size=536870912",
+                "--env", "AWS_EC2_METADATA_DISABLED=true",
+                "--env", "AWS_ACCESS_KEY_ID=" + (self.s3_credentials or {}).get("access_key", "dummy"),
+                "--env", "AWS_SECRET_ACCESS_KEY=" + (self.s3_credentials or {}).get("secret_key", "dummy"),
                 "--tmpfs", "/var/log/clickhouse-server:rw,size=33554432"]
+        if self.data_volume:
+            args += ["--mount", f"type=volume,source={self.data_volume},target=/var/lib/clickhouse"]
+        else:
+            args += ["--tmpfs", "/var/lib/clickhouse:rw,size=536870912"]
+        if self.network == "none":
+            args += ["--hostname", "localhost"]
         for source, target in self.mounts:
             if source.name in self.auth_volumes:
                 args += ["--mount", f"type=volume,source={self.auth_volumes[source.name]},target={target},readonly"]
@@ -194,6 +236,8 @@ class Database:
         docker("rm", "-f", "-v", self.name, self.name + "-projector", check=False)
         for volume in self.auth_volumes.values():
             docker("volume", "rm", volume, check=False)
+        if self.data_volume:
+            docker("volume", "rm", self.data_volume, check=False)
 
 
 @unittest.skipUnless(os.environ.get("RUN_BACKUP_RUNTIME") == "1", "opt-in local Docker test")
@@ -272,7 +316,7 @@ class BackupRuntimeTests(unittest.TestCase):
         script = """import json, os, sys
 sys.path.insert(0, '/test')
 import run_backup as backup
-api = backup.API('http://127.0.0.1:8123', 'backup_probe', os.environ['PROBE_PASSWORD'])
+api = backup.API('http://127.0.0.1:8123', 'backup_probe', os.environ['PROBE_PASSWORD'], backup_api=False)
 rows = api.request('GET', '/', {'query': backup.REPLICA_QUERY})
 try:
     fresh = backup.replica_is_fresh(api, replica_count=int(sys.argv[1]))
@@ -313,13 +357,17 @@ except backup.ReplicaError:
         api.mkdir(mode=0o755, exist_ok=True)
         project(self.root / "scripts", {"start-backup.sh": WRAPPER.read_text()})
         self.addCleanup(lambda: docker("rm", "-f", "-v", name, check=False))
-        docker("run", "-d", "--name", name, "--network", "container:" + database.name,
-               "--user", "101:101", "--read-only", "--tmpfs", "/tmp/clickhouse-backup:rw,size=1048576,uid=101,gid=101",
+        args = ["run", "-d", "--name", name, "--network", "container:" + database.name,
+               "--user", "101:101", "--read-only", "--tmpfs", "/tmp:rw,size=33554432,uid=101,gid=101",
+               "--tmpfs", "/tmp/clickhouse-backup:rw,size=1048576,uid=101,gid=101",
                "--env", "BACKUP_PASSWORD_REVISION=" + revision,
                "--mount", f"type=bind,source={config},target=/etc/clickhouse-backup,readonly",
                "--mount", f"type=bind,source={api},target=/etc/clickhouse-backup-api,readonly",
                "--mount", f"type=bind,source={self.root / 'scripts'},target=/scripts,readonly",
-               "--entrypoint", "/bin/sh", BACKUP_IMAGE, "/scripts/start-backup.sh")
+               "--entrypoint", "/bin/sh"]
+        if database.data_volume:
+            args += ["--mount", f"type=volume,source={database.data_volume},target=/var/lib/clickhouse"]
+        docker(*args, BACKUP_IMAGE, "/scripts/start-backup.sh")
         return name
 
     def config_source(self, password=None):
@@ -330,15 +378,21 @@ except backup.ReplicaError:
         config["general"]["remote_storage"] = "none"
         return {"config.yml": yaml.safe_dump(config), "password": self.passwords["backup"] if password is None else password}
 
-    def assert_waiting(self, name):
+    def update_projection(self, directory, files):
+        project(directory, files)
+        # The next poll must explain this update, not an earlier missing key.
+        return datetime.now(timezone.utc).isoformat()
+
+    def assert_waiting(self, name, reason, *, since=None):
+        since = since or docker("inspect", "--format", "{{.State.StartedAt}}", name).stdout.strip()
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
-            logs = docker("logs", name)
-            if "Waiting for" in logs.stdout + logs.stderr:
+            logs = docker("logs", "--since", since, name)
+            if "Waiting for backup credentials: " + reason + "." in logs.stdout + logs.stderr:
                 break
             time.sleep(0.2)
         else:
-            self.fail("The startup wrapper never reported its waiting state")
+            self.fail("The startup wrapper never reported the current waiting reason: " + reason)
         # Observe at least two complete 2-second polls after the wrapper starts.
         deadline = time.monotonic() + 4.2
         while time.monotonic() < deadline:
@@ -381,20 +435,24 @@ except urllib.error.HTTPError as error:
         database = self.db()
         project(self.root / "api", {"password": "dummy-api-password", "revision": "revision-1"})
         name = self.start_wrapper(database)
-        self.assert_waiting(name)
+        self.assert_waiting(name, "database configuration is missing")
         source = self.config_source()
         # The rendered source may omit/empty its YAML password: the separate
         # nonempty file supplies CLICKHOUSE_PASSWORD to the stock process.
         config = yaml.safe_load(source["config.yml"])
         config["clickhouse"]["password"] = ""
         source["config.yml"] = yaml.safe_dump(config)
-        project(self.root / "config", {"config.yml": source["config.yml"]})
-        self.assert_waiting(name)
-        project(self.root / "config", self.config_source(password=""))
-        self.assert_waiting(name)
+        since = self.update_projection(self.root / "config", {"config.yml": source["config.yml"]})
+        self.assert_waiting(name, "database password is missing", since=since)
+        since = self.update_projection(self.root / "config", self.config_source(password=""))
+        self.assert_waiting(name, "database password is empty", since=since)
         invalid = dict(source, **{"config.yml": "clickhouse: [" + self.passwords["backup"]})
-        project(self.root / "config", invalid)
-        self.assert_waiting(name)
+        since = self.update_projection(self.root / "config", invalid)
+        self.assert_waiting(name, "database configuration is not valid", since=since)
+        # Positive case: an empty YAML password is valid when the separate
+        # password file is present and nonempty.
+        self.assertEqual(yaml.safe_load(source["config.yml"])["clickhouse"]["password"], "")
+        self.assertTrue(source["password"])
         project(self.root / "config", source)
         self.assert_started(name, database)
 
@@ -402,11 +460,13 @@ except urllib.error.HTTPError as error:
         database = self.db()
         project(self.root / "config", self.config_source())
         name = self.start_wrapper(database)
-        self.assert_waiting(name)
-        project(self.root / "api", {"password": "", "revision": "revision-1"})
-        self.assert_waiting(name)
-        project(self.root / "api", {"password": "dummy-api-password", "revision": "old-revision"})
-        self.assert_waiting(name)
+        self.assert_waiting(name, "API revision is missing or does not match")
+        since = self.update_projection(self.root / "api", {"password": "", "revision": "revision-1"})
+        self.assert_waiting(name, "API password is empty", since=since)
+        since = self.update_projection(self.root / "api", {"password": "dummy-api-password", "revision": "old-revision"})
+        self.assert_waiting(name, "API revision is missing or does not match", since=since)
+        since = self.update_projection(self.root / "api", {"password": "dummy-api-password", "revision": "revision-1\n"})
+        self.assert_waiting(name, "API revision is missing or does not match", since=since)
         project(self.root / "api", {"password": "dummy-api-password", "revision": "revision-1"})
         self.assert_started(name, database)
 
@@ -415,7 +475,7 @@ except urllib.error.HTTPError as error:
         project(self.root / "config", self.config_source())
         project(self.root / "api", {"password": "dummy-api-password", "revision": "revision-1"})
         name = self.start_wrapper(database, revision="")
-        self.assert_waiting(name)
+        self.assert_waiting(name, "expected API revision is missing")
 
     def test_stock_api_keeps_startup_credentials_and_configuration_until_restart(self):
         database = self.db()
@@ -435,6 +495,92 @@ except urllib.error.HTTPError as error:
         self.assertEqual(self.request_status(database, path="/backup/tables"), 200)
         for path in ("/etc/clickhouse-backup/password", "/etc/clickhouse-backup-api/password"):
             self.assertNotEqual(docker("exec", name, "sh", "-c", 'echo forbidden >> "$1"', "_", path, check=False).returncode, 0)
+        self.assert_clean_logs(name)
+
+    def runtime_python(self, namespace, script, **environment):
+        name = "backup-runtime-client-" + uuid.uuid4().hex[:10]
+        self.addCleanup(lambda: docker("rm", "-f", name, check=False))
+        args = ["run", "--rm", "--name", name, "--network", "container:" + namespace,
+                "--mount", f"type=bind,source={CHART / 'files/clickhouse-backup'},target=/test,readonly"]
+        for key, value in environment.items():
+            args += ["--env", key + "=" + value]
+        result = docker(*args, PYTHON_IMAGE, "python", "-c", script, timeout=240, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return result.stdout
+
+    def test_real_scheduler_creates_full_then_incremental_with_stock_api_and_s3(self):
+        storage = "backup-runtime-s3-" + uuid.uuid4().hex[:10]
+        credentials = {"access_key": "runtime-" + uuid.uuid4().hex, "secret_key": uuid.uuid4().hex}
+        self.addCleanup(lambda: docker("rm", "-f", "-v", storage, check=False))
+        # Every service shares this isolated network namespace. No test service
+        # can reach AWS, and no ports are published on the developer's machine.
+        docker("run", "-d", "--name", storage, "--network", "none", "--memory", "512m",
+               "--tmpfs", "/data:rw,size=268435456,uid=65532,gid=65532",
+               "--env", "MINIO_ROOT_USER=" + credentials["access_key"],
+               "--env", "MINIO_ROOT_PASSWORD=" + credentials["secret_key"],
+               S3_IMAGE, "server", "/data", "--address", ":9001", "--console-address", ":9002")
+        s3_environment = {"S3_ACCESS_KEY": credentials["access_key"], "S3_SECRET_KEY": credentials["secret_key"]}
+        s3_script = "import json, os, time, urllib.request\n" + inspect.getsource(local_s3_request)
+        self.runtime_python(storage, s3_script + """
+deadline = time.monotonic() + 30
+while True:
+    try:
+        with urllib.request.urlopen('http://127.0.0.1:9001/minio/health/ready', timeout=2) as response:
+            assert response.status == 200
+        break
+    except OSError:
+        if time.monotonic() >= deadline:
+            raise
+        time.sleep(0.2)
+local_s3_request('PUT', '/runtime-backups', os.environ['S3_ACCESS_KEY'], os.environ['S3_SECRET_KEY'])
+""", **s3_environment)
+        database = self.db(network="container:" + storage, s3_credentials=credentials)
+        for query in ("CREATE DATABASE otel_traces",
+                      "CREATE TABLE otel_traces.runtime_sample (id UInt64, message String) ENGINE=MergeTree ORDER BY id",
+                      "INSERT INTO otel_traces.runtime_sample VALUES (1, 'first batch')"):
+            self.assertEqual(database.query(query).returncode, 0)
+        source = self.config_source()
+        config = yaml.safe_load(source["config.yml"])
+        config["general"]["remote_storage"] = "s3"
+        config["s3"].update(endpoint="http://127.0.0.1:9001", bucket="runtime-backups", region="us-east-1",
+                            path="test/catalog", force_path_style=True, disable_ssl=True, **credentials)
+        source["config.yml"] = yaml.safe_dump(config)
+        project(self.root / "config", source)
+        project(self.root / "api", {"password": "dummy-api-password", "revision": "revision-1"})
+        name = self.start_wrapper(database)
+        self.assert_started(name, database)
+        scheduler_script = """import json, os, sys
+from datetime import datetime, timedelta, timezone
+sys.path.insert(0, '/test')
+import run_backup as backup
+api = backup.API('http://127.0.0.1:7171', 'backup', 'dummy-api-password')
+probe = backup.API('http://127.0.0.1:8123', 'backup_probe', os.environ['PROBE_PASSWORD'], backup_api=False)
+now = datetime.fromisoformat(os.environ['TEST_DAY']) + timedelta(hours=int(os.environ['TEST_HOUR']))
+name = backup.Scheduler([api], [probe], timeout=180, poll_seconds=0.2).run(now)
+print(json.dumps({'name': name, 'remote': api.request('GET', '/backup/list/remote')}))
+"""
+        environment = {"PROBE_PASSWORD": self.passwords["backup_probe"],
+                       "TEST_DAY": datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()}
+        full = json.loads(self.runtime_python(database.name, scheduler_script, TEST_HOUR="0", **environment).splitlines()[-1])
+        self.assertEqual(database.query("INSERT INTO otel_traces.runtime_sample VALUES (2, 'second batch')").returncode, 0)
+        incremental = json.loads(self.runtime_python(database.name, scheduler_script, TEST_HOUR="4", **environment).splitlines()[-1])
+        self.assertTrue(full["name"].startswith("ao-otel-full-"))
+        self.assertTrue(incremental["name"].startswith("ao-otel-incremental-"))
+        catalog = {row["name"]: row for row in incremental["remote"]}
+        self.assertEqual(set(catalog), {full["name"], incremental["name"]})
+        for backup_name, required in ((full["name"], ""), (incremental["name"], full["name"])):
+            with self.subTest(backup=backup_name):
+                self.assertEqual(catalog[backup_name]["desc"], "directory, embedded")
+                self.assertEqual(catalog[backup_name]["location"], "remote")
+                self.assertEqual(catalog[backup_name]["required"], required)
+                metadata = json.loads(self.runtime_python(storage, s3_script + """
+print(local_s3_request('GET', '/runtime-backups/test/catalog/' + os.environ['BACKUP_NAME'] + '/metadata.json',
+                      os.environ['S3_ACCESS_KEY'], os.environ['S3_SECRET_KEY']).decode())
+""", BACKUP_NAME=backup_name, **s3_environment))
+                self.assertEqual(metadata["backup_name"], backup_name)
+                self.assertEqual(metadata.get("required_backup", ""), required)
+                self.assertIn("embedded", metadata["tags"])
+                self.assertEqual(metadata["tables"], [{"database": "otel_traces", "table": "runtime_sample"}])
         self.assert_clean_logs(name)
 
 
