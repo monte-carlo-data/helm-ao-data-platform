@@ -546,6 +546,24 @@ local_s3_request('PUT', '/runtime-backups', os.environ['S3_ACCESS_KEY'], os.envi
         def s3(path, keys=""):
             return "s3('" + endpoint + path + "', " + keys + "'CSV', 'id UInt64')"
 
+        def prepare_database(instance):
+            for query in ("CREATE DATABASE otel_traces",
+                          "CREATE TABLE otel_traces.runtime_sample (id UInt64) ENGINE=MergeTree ORDER BY id",
+                          "INSERT INTO otel_traces.runtime_sample VALUES (1)",
+                          "CREATE TABLE otel_traces.runtime_s3 (id UInt64) ENGINE=S3('"
+                          + endpoint + "read.csv', 'CSV')"):
+                result = instance.query(query)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+        def keyless_queries(prefix):
+            return (
+                ("table-function-read", "SELECT id FROM " + s3("read.csv"), "7"),
+                ("table-function-write", "INSERT INTO FUNCTION " + s3(prefix + "-write.csv") + " SELECT 8", ""),
+                ("s3-engine-read", "SELECT id FROM otel_traces.runtime_s3", "7"),
+                ("backup-to-s3", "BACKUP TABLE otel_traces.runtime_sample TO S3('"
+                 + endpoint + prefix + "-backup')", "BACKUP_CREATED"),
+            )
+
         # The default ingestion user has broad SQL grants. Prove that neither
         # missing SQL permissions nor an unreachable object store explains a
         # failed keyless request: explicit, disposable keys work for this user.
@@ -555,26 +573,37 @@ local_s3_request('PUT', '/runtime-backups', os.environ['S3_ACCESS_KEY'], os.envi
         result = database.query("SELECT id FROM " + s3("read.csv", explicit_keys), user="otel")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "7")
-        for query in ("SELECT id FROM " + s3("read.csv"),
-                      "INSERT INTO FUNCTION " + s3("blocked-write.csv") + " SELECT 8"):
-            with self.subTest(query=query):
+        prepare_database(database)
+        result = database.query(
+            "CREATE TABLE otel_traces.runtime_s3_explicit (id UInt64) ENGINE=S3('"
+            + endpoint + "read.csv', " + explicit_keys + "'CSV')", user="otel")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = database.query("SELECT id FROM otel_traces.runtime_s3_explicit", user="otel")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "7")
+        result = database.query(
+            "BACKUP TABLE otel_traces.runtime_sample TO S3('" + endpoint + "explicit-backup', '"
+            + credentials["access_key"] + "', '" + credentials["secret_key"] + "')", user="otel")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("BACKUP_CREATED", result.stdout)
+
+        for operation, query, _ in keyless_queries("blocked"):
+            with self.subTest(operation=operation, guarded=True):
                 result = database.query(query, user="otel")
                 self.assertNotEqual(result.returncode, 0, "SQL borrowed the server's S3 credentials")
                 self.assertIn("(S3_ERROR)", result.stderr)
-                self.assertIn("HTTP response code: 403", result.stderr)
+                if operation == "backup-to-s3":
+                    self.assertIn("Access Denied", result.stderr)
+                else:
+                    self.assertIn("HTTP response code: 403", result.stderr)
 
-        for query in ("CREATE DATABASE otel_traces",
-                      "CREATE TABLE otel_traces.runtime_sample (id UInt64) ENGINE=MergeTree ORDER BY id",
-                      "INSERT INTO otel_traces.runtime_sample VALUES (1)"):
-            result = database.query(query)
-            self.assertEqual(result.returncode, 0, result.stderr)
         result = database.query(
             "BACKUP TABLE otel_traces.runtime_sample TO Disk('backups_s3', 'credentials-check')", user="backup")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("BACKUP_CREATED", result.stdout)
 
         # Remove only the global guard and repeat against the same private
-        # store. Both keyless operations must then succeed, reproducing the
+        # store. All four keyless operations must then succeed, reproducing the
         # original exposure while leaving the backup disk setting unchanged.
         database.close()
         documents = deepcopy(self.documents)
@@ -587,14 +616,18 @@ local_s3_request('PUT', '/runtime-backups', os.environ['S3_ACCESS_KEY'], os.envi
         global_s3.remove(credential_setting)
         files["config.d/backup.xml"] = ET.tostring(config, encoding="unicode")
         unguarded = self.db(documents=documents, network="container:" + storage, s3_credentials=credentials)
-        result = unguarded.query("SELECT id FROM " + s3("read.csv"), user="otel")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "7")
-        result = unguarded.query("INSERT INTO FUNCTION " + s3("control-write.csv") + " SELECT 9", user="otel")
-        self.assertEqual(result.returncode, 0, result.stderr)
+        prepare_database(unguarded)
+        for operation, query, expected in keyless_queries("control"):
+            with self.subTest(operation=operation, guarded=False):
+                result = unguarded.query(query, user="otel")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                if operation == "backup-to-s3":
+                    self.assertIn(expected, result.stdout)
+                else:
+                    self.assertEqual(result.stdout.strip(), expected)
         result = unguarded.query("SELECT id FROM " + s3("control-write.csv"), user="otel")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "9")
+        self.assertEqual(result.stdout.strip(), "8")
 
     def test_real_scheduler_creates_full_then_incremental_with_stock_api_and_s3(self):
         storage, credentials = self.start_s3()
