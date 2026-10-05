@@ -67,6 +67,8 @@
 {{- define "ao-data-platform.backupDisk" -}}
 {{- $b := .Values.clickhouse.backup -}}
 <clickhouse>
+  <!-- SQL S3 queries must not borrow the server's backup credentials. -->
+  <s3><use_environment_credentials>0</use_environment_credentials></s3>
   <storage_configuration>
     <disks>
       <backups_s3>

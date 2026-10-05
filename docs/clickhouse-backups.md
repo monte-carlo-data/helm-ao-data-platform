@@ -21,6 +21,44 @@ database is healthy. The backup container uses a `400MiB` Go memory target under
 its default `512Mi` memory limit. Keep `clickhouse.backup.sidecar.goMemoryLimit`
 below the container limit when changing either value.
 
+With backups enabled, the chart sets global `s3.use_environment_credentials=0`.
+For ordinary URL-based `s3()` table functions, S3-engine tables, and direct
+`BACKUP ... TO S3(...)` or `RESTORE ... FROM S3(...)`, this disables credential lookup
+through IRSA/web identity, environment variables, container credentials, SSO, and
+instance metadata. Private S3 requests that depended on those sources now fail,
+including requests that used a node's instance role before backups were enabled.
+No chart value turns this setting off while backups are enabled.
+
+Explicit access and secret keys still work. For `s3()` and S3-engine tables,
+temporary credentials also need a session token. The `S3(...)` form used by native
+`BACKUP`/`RESTORE` in ClickHouse `26.4.3` accepts a URL and optional
+access and secret keys; it has no session-token argument. Public objects may
+remain readable without credentials. ClickHouse `26.4.3` also still checks AWS
+credential files when this setting is `0`, and named collections can enable their
+own environment-credential lookup. The exact credential chain is in
+https://github.com/ClickHouse/ClickHouse/blob/v26.4.3.37-stable/src/IO/S3/Credentials.cpp#L865-L1011
+and the native backup arguments are in
+https://github.com/ClickHouse/ClickHouse/blob/v26.4.3.37-stable/src/Backups/registerBackupEngineS3.cpp#L90-L99.
+
+The `backups_s3` disk keeps its own setting at `1` so embedded backups can use the
+AWS role. The `allowed_disk` list is server-wide: users with `BACKUP` on the
+source tables can use `BACKUP ... TO Disk('backups_s3', ...)`. Restoring from that
+disk requires the appropriate permissions to create objects or insert data;
+`BACKUP` alone does not grant them. With the default
+`clickhouse.otel.restrictGrants: false`, the ingestion user has broad permissions
+and can use the disk. Set it to `true` to limit that user to inserts. Users allowed
+to create tables, including `schema_owner`, can also define inline S3 disks with
+their own `use_environment_credentials=1` and use the role. The global setting
+does not restrict those disks. Restore permission checks are in
+https://github.com/ClickHouse/ClickHouse/blob/v26.4.3.37-stable/src/Backups/RestorerFromBackup.cpp#L278-L364.
+
+ClickHouse `26.7` adds `s3_allow_server_credentials_in_user_queries`, which defaults
+to `false` and covers more SQL paths, including inline S3 disks. Keep the global
+`s3.use_environment_credentials=0` after an image upgrade: a `compatibility`
+setting can restore the older, permissive default for the new query setting,
+while this server configuration does not depend on that default. See
+https://github.com/ClickHouse/ClickHouse/blob/v26.7.1.1315-stable/src/Core/Settings.cpp#L4459-L4499.
+
 The backup container runs as user and group `101` and must write to the shared
 data volume. Enabling backups sets `fsGroup: 101` so that access works on a new
 volume too. With `fsGroupChangePolicy: OnRootMismatch`, the first enable can still

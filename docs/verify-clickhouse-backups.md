@@ -148,8 +148,15 @@ user files, missing and changing credentials, startup with unreachable S3,
 the chart's startup script running on the stock image and its frozen configuration,
 and the real HTTP replica query with an embedded Keeper. They also run the real
 scheduler against local S3-compatible storage, creating a full and incremental
-backup and checking the recorded dependency. They remove only their own containers.
-PyYAML, Docker, and Helm on PATH (or `HELM=/path/to/helm`) are required.
+backup and checking the recorded dependency. The S3 credential check verifies
+that the global setting rejects four requests without supplied keys: an `s3()`
+read, an `s3()` write, a direct `BACKUP ... TO S3(...)`, and an S3-engine table read.
+Explicit-key requests and the backup disk still work. Removing only the global
+setting makes the same four requests succeed. These checks use generated
+environment credentials, not AWS role authentication; the other SQL paths
+described in [backup setup](clickhouse-backups.md) remain outside this test.
+The checks remove only their own containers. PyYAML, Docker, and Helm on PATH
+(or `HELM=/path/to/helm`) are required.
 
 For changes to backup volumes, run this manual check before release against an
 explicit existing test namespace. CI does not run this Kubernetes API check or
