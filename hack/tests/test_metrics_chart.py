@@ -7,6 +7,8 @@ Set HELM to use a Helm binary outside PATH.
 import copy
 import unittest
 
+import yaml
+
 # Imported as a module so unittest does not collect its test class a second time.
 import test_backup_chart as chart
 
@@ -146,6 +148,27 @@ class KeeperMetricsTests(unittest.TestCase):
         for key, document in by_key(self.default).items():
             if key not in {("ClickHouseKeeperInstallation", "otel"), ("NetworkPolicy", "keeper-otel")}:
                 self.assertEqual(document, enabled[key], key)
+
+
+class CollectorMetricsTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        documents = render()
+        cls.config = yaml.safe_load(chart.one(documents, "ConfigMap", "opentelemetry-collector")["data"]["relay"])
+        cls.service = chart.one(documents, "Service", "opentelemetry-collector")
+
+    def test_collector_does_not_scrape_itself(self):
+        for name, pipeline in self.config["service"]["pipelines"].items():
+            self.assertNotIn("prometheus", pipeline["receivers"], name)
+
+    def test_collector_still_serves_its_own_metrics_on_the_pod_ip(self):
+        readers = self.config["service"]["telemetry"]["metrics"]["readers"]
+        self.assertIn({"pull": {"exporter": {"prometheus": {"host": "${env:MY_POD_IP}", "port": 8888}}}},
+                      readers)
+
+    def test_collector_metrics_stay_off_the_service(self):
+        # The Service can sit behind a public load balancer, so 8888 is never added to it.
+        self.assertEqual([port["port"] for port in self.service["spec"]["ports"]], [4317, 4318])
 
 
 if __name__ == "__main__":
