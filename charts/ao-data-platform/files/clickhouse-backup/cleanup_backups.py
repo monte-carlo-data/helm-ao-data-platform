@@ -7,26 +7,25 @@ and required bases are preserved.
 
 Stock clickhouse-backup 2.8.1 skips native serialization.json objects during
 S3 deletion. This module therefore rejects execution before making any API
-request and contains no deletion operation. Keep the tool's automatic retention
-and S3 lifecycle expiration disabled for the backup prefixes.
+request and contains no deletion operation. See docs/backup-cleanup.md for
+operator instructions and deletion limitations.
 Source: https://github.com/Altinity/clickhouse-backup/blob/v2.8.1/pkg/backup/delete.go
 """
 
 from datetime import datetime, timedelta, timezone
-import re
 import time
 
-from backup_common import BackupError, REQUEST_TIMEOUT_SECONDS, broken_local_entry
+from backup_common import (BackupError, DELETION_UNAVAILABLE, NAME_PREFIX,
+                           REQUEST_TIMEOUT_SECONDS, SCHEDULED_NAME, broken_local_entry)
 
 
-SCHEDULED_NAME = re.compile(r"ao-otel-(full|incremental)-(\d{8}T\d{6}Z)-[0-9a-f]{8}\Z")
-DELETION_UNAVAILABLE = "Backup deletion is unavailable with stock clickhouse-backup 2.8.1; cleanup supports preview only."
+READ_PATHS = frozenset(("/backup/actions", "/backup/list/remote", "/backup/list/local"))
 
 
 def scheduled_time(name, now):
     match = SCHEDULED_NAME.fullmatch(name)
     if not match:
-        if name.startswith("ao-otel-"):
+        if name.startswith(NAME_PREFIX):
             raise BackupError("Cleanup stopped: a scheduled backup name is malformed.")
         return None
     try:
@@ -39,7 +38,10 @@ def scheduled_time(name, now):
 
 
 def catalog(rows, location, remote=None):
-    """Keep only stable API fields; error bodies and credentials never enter logs."""
+    """Map names to required bases; broken local entries map to None.
+
+    Errors stay generic so description/parser text never reaches logs.
+    """
     result = {}
     for row in rows:
         name, required = row.get("name"), row.get("required")
@@ -126,7 +128,7 @@ class Cleaner:
         self.deadline = clock() + timeout
 
     def request(self, index, method, path):
-        if method != "GET":
+        if method != "GET" or path not in READ_PATHS:
             raise BackupError(DELETION_UNAVAILABLE)
         # Leave room for the same request timeout used by the backup API.
         if self.clock() + REQUEST_TIMEOUT_SECONDS > self.deadline:
@@ -153,7 +155,7 @@ class Cleaner:
                 if name not in remote[0]:
                     if not SCHEDULED_NAME.fullmatch(name):
                         raise BackupError("Cleanup stopped: unrelated local metadata has no matching remote backup.")
-                    # Interrupted uploads and remote-first removal can leave
+                    # Interrupted uploads and manual remote removal can leave
                     # owned local files. Report them without trusting a base.
                     continue
                 if required is not None and required != remote[0][name]:

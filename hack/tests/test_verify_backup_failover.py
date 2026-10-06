@@ -102,7 +102,7 @@ class PodTests(unittest.TestCase):
         self.probes = [ProbeAPI(), ProbeAPI()]
         self.revision_failure = None
 
-    def run_pod(self, expected=FULL, settings=None):
+    def run_pod(self, expected=FULL, settings=None, changed_script=None, common_present=True):
         fake_datetime = types.ModuleType("datetime")
         fake_datetime.__dict__.update(vars(importlib.import_module("datetime")))
         fake_datetime.datetime = FrozenDateTime
@@ -110,6 +110,7 @@ class PodTests(unittest.TestCase):
                      "http://copy0:8123":self.probes[0], "http://copy1:8123":self.probes[1]}
         environment = {"VERIFY_EXPECTED_FULL":expected, "VERIFY_TIMEOUT_SECONDS":"600",
                        "VERIFY_SCRIPT_SHA256":hashlib.sha256(b"installed scheduler").hexdigest(),
+                       "VERIFY_COMMON_SHA256":hashlib.sha256(b"installed shared helpers").hexdigest() if common_present else "absent",
                        "BACKUP_ENDPOINTS":json.dumps(list(endpoints)[:2]), "BACKUP_PASSWORD_FILE":"/credentials/password",
                        "BACKUP_DATABASE_ENDPOINTS": json.dumps(list(endpoints)[2:]),
                        "BACKUP_PASSWORD_REVISION": "revision-1", "POD_NAMESPACE": "test",
@@ -118,12 +119,20 @@ class PodTests(unittest.TestCase):
                        "BACKUP_MAX_REPLICA_DELAY_SECONDS": "5", "BACKUP_FRESHNESS_RETRY_SECONDS": "0"}
         environment.update(settings or {})
         passwords = {"/credentials/password": "backup-pw", "/probe-credentials/password": "probe-pw"}
+        scripts = {"run_backup.py": b"installed scheduler", "backup_common.py": b"installed shared helpers"}
+        if not common_present:
+            del scripts["backup_common.py"]
+        if changed_script:
+            scripts[changed_script] = b"changed after preparation"
         output = io.StringIO()
         with mock.patch.dict(sys.modules, {"run_backup":scheduler, "datetime":fake_datetime}), \
                 mock.patch.dict(helper.os.environ, environment, clear=True), \
                 mock.patch.object(Path, "read_text", autospec=True,
                                   side_effect=lambda path: passwords[str(path)]) as read, \
-                mock.patch.object(Path, "read_bytes", return_value=b"installed scheduler"), \
+                mock.patch.object(Path, "read_bytes", autospec=True,
+                                  side_effect=lambda path: scripts[path.name]), \
+                mock.patch.object(Path, "is_file", autospec=True,
+                                  side_effect=lambda path: path.name in scripts), \
                 mock.patch.object(scheduler, "API", side_effect=lambda endpoint, *args, **kwargs:endpoints[endpoint]) as api, \
                 mock.patch.object(scheduler, "PasswordRevisionGuard", return_value=mock.Mock(side_effect=self.revision_failure)), \
                 redirect_stdout(output):
@@ -131,7 +140,7 @@ class PodTests(unittest.TestCase):
                 exec(helper.POD_SCRIPT, {})
             except SystemExit as error:
                 self.assertEqual(error.code, 1)
-        if not self.revision_failure:
+        if not self.revision_failure and not changed_script:
             self.assertEqual(read.call_args_list, [mock.call(Path(path)) for path in passwords])
             self.assertEqual([call.args for call in api.call_args_list], [
                 ("http://copy0:7171", "backup", "backup-pw"),
@@ -158,6 +167,21 @@ class PodTests(unittest.TestCase):
         self.assertEqual(result["required"], FULL)
         self.assertEqual(self.copies[0].posts, [])
         self.assertEqual([p[0] for p in self.copies[1].posts], ["/backup/download/" + FULL, "/backup/create_remote"])
+
+    def test_either_changed_script_blocks_before_api_access(self):
+        for script in ("run_backup.py", "backup_common.py"):
+            with self.subTest(script=script):
+                self.assert_inconclusive(self.run_pod(changed_script=script),
+                                         "The installed scheduler changed after preparation.")
+                self.assertEqual(self.copies[0].calls + self.copies[1].calls, [])
+
+    def test_older_chart_without_shared_script_is_supported(self):
+        self.assertEqual(self.run_pod(common_present=False)["status"], "passed")
+
+    def test_added_shared_script_blocks_before_api_access(self):
+        self.assert_inconclusive(self.run_pod(common_present=False, changed_script="backup_common.py"),
+                                 "The installed scheduler changed after preparation.")
+        self.assertEqual(self.copies[0].calls + self.copies[1].calls, [])
 
     def test_helper_cannot_bypass_password_revision_guard(self):
         self.revision_failure = scheduler.RevisionError("Password revision changed.")
@@ -239,6 +263,7 @@ class CLITests(unittest.TestCase):
                 "spec":{"restartPolicy":"Never", "containers":[{"name":"backup", "env":[]}],
                         "volumes":[{"name":"script", "configMap":{"name":"live-scheduler"}}]}}}}}}
         self.jobs = []
+        self.scripts = {"run_backup.py": "installed scheduler", "backup_common.py": "installed shared helpers"}
         self.calls = []
         self.terminal = {"status":{
             "conditions":[{"type":"Complete", "status":"True"}], "succeeded":1,
@@ -256,7 +281,7 @@ class CLITests(unittest.TestCase):
         if command[:2] == ("get", "jobs"):
             return json.dumps({"items":self.jobs})
         if command[:2] == ("get", "configmap"):
-            return json.dumps({"data":{"run_backup.py":"installed scheduler"}})
+            return json.dumps({"data": self.scripts})
         if command[:2] == ("create", "-f"):
             manifest = json.loads(Path(command[2]).read_text())
             self.assertEqual(manifest["kind"], "Job")
@@ -323,7 +348,8 @@ class CLITests(unittest.TestCase):
             evidence = json.loads(evidence_path.read_text())
             expected = dict(self.evidence, job="verify-one", context="test", namespace="montecarlo",
                             started="2026-09-29T00:30:00Z", completed="2026-09-29T00:31:00Z",
-                            scheduler_sha256=hashlib.sha256(b"installed scheduler").hexdigest())
+                            scheduler_sha256=hashlib.sha256(b"installed scheduler").hexdigest(),
+                            common_sha256=hashlib.sha256(b"installed shared helpers").hexdigest())
             self.assertEqual(evidence, expected)
             self.assertEqual(json.loads(output.splitlines()[-1]), expected)
             self.assertEqual([c for c in self.calls if c[0] == "create"],
@@ -344,6 +370,31 @@ class CLITests(unittest.TestCase):
                              "The live Job template or scheduler changed after preparation. Stop and review it.")
             self.assert_no_create()
             self.assertFalse((Path(directory) / "verify-one.run.json").exists())
+
+    def test_either_configmap_script_change_refuses_run(self):
+        for script in ("run_backup.py", "backup_common.py"):
+            with self.subTest(script=script), tempfile.TemporaryDirectory() as directory:
+                self.assertEqual(self.run_cli(directory, run=False)[0], 0)
+                self.scripts[script] += "\n# updated"
+                self.calls.clear()
+                result, _, errors = self.run_cli(directory)
+                self.assertEqual(result, 1)
+                self.assertIn("changed after preparation", errors)
+                self.assert_no_create()
+
+    def test_old_chart_prepares_without_shared_script_and_detects_its_addition(self):
+        del self.scripts["backup_common.py"]
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(self.run_cli(directory, run=False)[0], 0)
+            manifest = json.loads((Path(directory) / "verify-one.prepared.json").read_text())
+            env = {e["name"]: e["value"] for e in manifest["spec"]["template"]["spec"]["containers"][0]["env"]}
+            self.assertEqual(env["VERIFY_COMMON_SHA256"], "absent")
+            self.scripts["backup_common.py"] = "new shared helpers"
+            self.calls.clear()
+            result, _, errors = self.run_cli(directory)
+            self.assertEqual(result, 1)
+            self.assertIn("changed after preparation", errors)
+            self.assert_no_create()
 
     def test_missing_or_duplicate_evidence_refuses_success(self):
         for count in (0, 2):

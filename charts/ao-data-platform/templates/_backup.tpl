@@ -1,5 +1,6 @@
 {{- define "ao-data-platform.backupValidate" -}}
 {{- $b := .Values.clickhouse.backup -}}
+{{- if not (kindIs "bool" $b.cleanup.enabled) -}}{{- fail "clickhouse.backup.cleanup.enabled must be a boolean." -}}{{- end -}}
 {{- if $b.enabled -}}
 {{- if ne $b.provider "aws" -}}{{- fail "clickhouse.backup.provider currently supports only aws." -}}{{- end -}}
 {{- range $key := list "bucket" "region" "roleArn" "path" -}}

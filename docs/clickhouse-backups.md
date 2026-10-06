@@ -283,9 +283,10 @@ local entries and scheduler-owned local files without remote backups are listed
 separately; no files are removed. Other preview errors log
 `Backup cleanup preview stopped:` and leave the successful backup Job successful.
 
-Keep `cleanup.dryRun: true`: the chart and Python entry point reject deletion
-because stock 2.8.1 leaves native JSON objects behind. No deletion implementation
-or custom image is included. See [retention previews](backup-cleanup.md) for
+Keep `cleanup.dryRun: true` when cleanup is enabled: this chart does not delete
+backups, and changing the image cannot enable deletion. See
+[why deletion is unavailable](backup-cleanup.md#why-deletion-is-unavailable)
+for the upstream limitation and [retention previews](backup-cleanup.md) for
 configuration and checks. The Job deadline includes `cleanup.timeoutSeconds`,
 so allow time for both backup and preview before the next scheduled run.
 
@@ -310,24 +311,22 @@ so allow time for both backup and preview before the next scheduled run.
   still needs enough disk space. Do not convert an existing data volume as part
   of enabling backups.
   Bucket lifecycle rules are separate and must not expire either backup prefix.
-  If manual pruning is necessary, check dependencies in the catalog first. For
-  this scheduler's usual daily chains, remove the whole UTC day's full and its
-  dependent incrementals, never the full alone. Manual backups can depend on an
-  older day's full; retain the base until every backup depending on it is removed.
-  Production enablement should wait for tested retention that removes selected
-  remote backups first, then their local pointer directories on every copy,
-  while preserving every backup still needed by a retained backup. The cleanup
-  preview in 5.3.0 does not limit this growth; remote-first deletion and local
-  pruning still need to be implemented and tested. The tool's manual `delete
-  remote` also leaves native JSON files behind; see [the deletion limitation](backup-cleanup-tool-bug.md).
+  The cleanup preview in 5.3.0 does not limit this growth. On a copy with a
+  matching local backup, manual `delete remote` removes the remote catalog
+  prefix and leaves native S3 data for a later local deletion. That later step
+  skips native JSON files in 2.8.1. This chart has no supported retention or
+  local-pruning procedure; do not treat manual catalog removal as freeing S3
+  space. See [why deletion is unavailable](backup-cleanup.md#why-deletion-is-unavailable)
+  and [local files in the report](backup-cleanup.md#local-files-in-the-report).
 - **Restore is not yet supported or documented.** A successful backup Job is not
   proof that a restore works. The scheduled configuration disables cluster-wide
   backup/restore. Embedded mode ignores `restore_schema_on_cluster`; a separate
   administrator configuration and a tested restore procedure are still needed.
-- **Alerts require separate setup.** This chart does not choose a monitoring
-  system or send backup alerts. Connect Job status and the cleanup report to
-  your existing monitoring; a successful backup Job does not prove its preview
-  completed, and a failed Job alone does not prove notification delivery.
+- **No backup alerts.** Watch for failed `otel-backup` Jobs and for expected
+  scheduled Jobs that never ran; a skipped run produces no failed Job. Cleanup
+  preview problems do not fail a Job after a verified backup: watch for log
+  lines starting `Backup cleanup preview stopped:` and for the local-files
+  warning. This chart does not send alerts for those conditions.
 - **Freshness checks are a point-in-time check.** They exclude replicas with
   missing or delayed data before backup submission; pod Ready alone is not used.
   They do not prove that a restore succeeds or make concurrent writes a global

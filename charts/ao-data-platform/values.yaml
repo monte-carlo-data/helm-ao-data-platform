@@ -89,7 +89,7 @@ clickhouse:
     cleanup:
       enabled: false
       # Preview only: stock clickhouse-backup 2.8.1 cannot safely remove native files.
-      # Setting false is rejected; this chart does not execute backup deletion.
+      # When cleanup is enabled, any value but true is rejected; this chart never deletes backups.
       dryRun: true
       keepLast: 2
       # Also keep every backup from the last N days, plus their bases.

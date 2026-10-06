@@ -1157,7 +1157,9 @@ class APITests(unittest.TestCase):
         for broken in ([], [{"copy": 1, "name": FULL}]):
             settings = dict(self.settings, BACKUP_CLEANUP_ENABLED="true")
             cleanup = mock.Mock()
-            cleanup.Cleaner.return_value.run.return_value = {"mode": "dry-run", "deleted": [], "broken_local": broken, "local_only": []}
+            cleanup.Cleaner.return_value.run.return_value = {
+                "mode": "dry-run", "keep_last": 2, "keep_days": 0,
+                "kept": [FULL], "delete": [], "deleted": [], "broken_local": broken, "local_only": []}
             output, errors = io.StringIO(), io.StringIO()
             with self.subTest(broken=broken), mock.patch.dict(backup.os.environ, settings, clear=True), \
                     mock.patch.dict("sys.modules", {"cleanup_backups": cleanup}), \
@@ -1166,8 +1168,8 @@ class APITests(unittest.TestCase):
                     redirect_stdout(output), redirect_stderr(errors):
                 self.assertEqual(backup.main(), 0)
             run.assert_called_once()
-            self.assertIn('"broken_local":', output.getvalue())
-            self.assertIn('"deleted": []', output.getvalue())
+            self.assertIn('"broken_local_count": ' + str(len(broken)), output.getvalue())
+            self.assertIn('"deleted_count": 0', output.getvalue())
             if broken:
                 self.assertIn("local files needing attention", errors.getvalue())
                 self.assertIn("No files were deleted", errors.getvalue())

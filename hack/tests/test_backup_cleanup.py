@@ -34,6 +34,21 @@ THREE_GROUPS = {A: "", AI: A, B: "", BI: B, C: "", CI: C}
 
 
 class SelectionTests(unittest.TestCase):
+    def test_scheduler_names_are_recognized_by_cleanup_and_full_base_selection(self):
+        from test_backup_scheduler import FakeAPI as SchedulerAPI, FakeProbe
+        api = SchedulerAPI()
+        scheduler = backup.Scheduler([api], [FakeProbe()])
+        with redirect_stdout(io.StringIO()):
+            full = scheduler.run(NOW)
+            api.created_required = full
+            incremental = scheduler.run(NOW + timedelta(hours=1))
+        self.assertEqual(cleanup.scheduled_time(full, NOW), NOW)
+        self.assertEqual(cleanup.scheduled_time(incremental, NOW + timedelta(hours=1)),
+                         NOW + timedelta(hours=1))
+        self.assertEqual(backup.full_base(api.catalog, NOW + timedelta(hours=1)), full)
+        self.assertEqual(set(cleanup.plan({full: "", incremental: full},
+                                         NOW + timedelta(hours=1))["kept"]), {full, incremental})
+
     def test_count_is_individual_backups_not_full_groups(self):
         result = cleanup.plan(THREE_GROUPS, NOW)
         self.assertEqual(set(result["kept"]), {C, CI})
@@ -144,7 +159,7 @@ class FakeAPI:
         if path == "/backup/actions":
             return list(world.actions[index])
         if path not in ("/backup/list/remote", "/backup/list/local"):
-            raise AssertionError("Preview must not depend on a patched tool version")
+            raise AssertionError(f"Preview read an unexpected endpoint: {path}")
         location = path.rsplit("/", 1)[1]
         entries = (self.remote_override if self.remote_override is not None else world.remote) if location == "remote" else world.local[index]
         desc = "directory, embedded" if location == "remote" else "embedded"
@@ -181,6 +196,9 @@ class PreviewTests(unittest.TestCase):
         for method in ("POST", "DELETE", "PUT"):
             with self.subTest(method=method), self.assertRaisesRegex(cleanup.BackupError, "preview only"):
                 cleaner.request(0, method, "/backup/delete/remote/" + A)
+        for path in ("/restart", "/backup/kill", "/backup/watch", "/backup/list/remote?unexpected=1"):
+            with self.subTest(path=path), self.assertRaisesRegex(cleanup.BackupError, "preview only"):
+                cleaner.request(0, "GET", path)
         self.assertEqual(world.calls, [])
 
     def test_remote_only_backup_can_be_previewed_without_deleting_it(self):
@@ -332,6 +350,21 @@ class PreviewTests(unittest.TestCase):
                 world.run()
         selection.assert_not_called()
 
+    def test_action_started_during_final_catalog_read_stops_report(self):
+        world = World()
+        reads = 0
+
+        def start_action(index, path):
+            nonlocal reads
+            if index == 1 and path == "/backup/list/local":
+                reads += 1
+                if reads == 2:
+                    world.actions[0] = [dict(command="create_remote concurrent", status="in progress")]
+
+        world.before_read = start_action
+        with self.assertRaisesRegex(cleanup.BackupError, "copy is busy"):
+            world.run()
+
     def test_deadline_leaves_room_for_a_request(self):
         world = World()
         with self.assertRaisesRegex(cleanup.BackupError, "time limit"):
@@ -360,10 +393,13 @@ class MainCleanupTests(unittest.TestCase):
         env = dict(BACKUP_CLEANUP_ENABLED="true", BACKUP_KEEP_LAST="1", BACKUP_KEEP_DAYS="3")
         env.update(settings)
         with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.dict(sys.modules, {"cleanup_backups": cleanup}), \
                 mock.patch.object(backup, "configured_clients", return_value=(world.apis, [object(), object()])), \
                 mock.patch.object(backup.Scheduler, "run", return_value=CI), \
+                mock.patch.object(cleanup, "datetime", wraps=datetime) as dates, \
                 mock.patch.object(sys, "path", [str(DIRECTORY)] + sys.path), \
                 redirect_stdout(output), redirect_stderr(errors):
+            dates.now.return_value = NOW
             status = backup.main()
         return status, output.getvalue(), errors.getvalue()
 
@@ -371,13 +407,15 @@ class MainCleanupTests(unittest.TestCase):
         status, output, errors = self.run_main(World())
         self.assertEqual(status, 0)
         self.assertEqual(errors, "")
-        line, = output.splitlines()
+        line, *entries = output.splitlines()
         self.assertTrue(line.startswith("Backup cleanup: "))
         result = json.loads(line.removeprefix("Backup cleanup: "))
         self.assertEqual(result["keep_last"], 1)
         self.assertEqual(result["keep_days"], 3)
-        self.assertEqual(result["deleted"], [])
-        self.assertEqual(result["local_only"], [])
+        self.assertEqual(result["deleted_count"], 0)
+        self.assertEqual(result["local_only_count"], 0)
+        self.assertEqual(result["kept_count"], 6)
+        self.assertEqual(len(entries), 6)
 
     def test_real_cleaner_error_keeps_verified_backup_successful(self):
         world = World()
@@ -394,9 +432,30 @@ class MainCleanupTests(unittest.TestCase):
         del world.remote[AI]
         status, output, errors = self.run_main(world)
         self.assertEqual(status, 0)
-        self.assertIn('"local_only": [{', output)
+        self.assertIn('"list": "local_only"', output)
         self.assertIn("local files needing attention", errors)
         self.assertNotIn("Backup failed", errors)
+
+    def test_large_report_keeps_lines_short_and_every_name_in_order(self):
+        remote = {}
+        for day in range(90):
+            full = name("full", day * 24 + 4)
+            remote[full] = ""
+            for hour in (0, 1, 2, 3):
+                remote[name("incremental", day * 24 + hour)] = full
+        result = cleanup.plan(remote, NOW)
+        result.update(mode="dry-run", deleted=[], broken_local=[], local_only=[])
+        output = io.StringIO()
+        with redirect_stdout(output):
+            backup.report_cleanup(result)
+        lines = output.getvalue().splitlines()
+        self.assertTrue(all(len(line.encode()) < 1024 for line in lines))
+        summary = json.loads(lines[0].removeprefix("Backup cleanup: "))
+        entries = [json.loads(line.removeprefix("Backup cleanup entry: ")) for line in lines[1:]]
+        for key in ("kept", "delete"):
+            self.assertEqual([entry["name"] for entry in entries if entry["list"] == key], result[key])
+            self.assertEqual(summary[key + "_count"], len(result[key]))
+        self.assertEqual(summary["deleted_count"], 0)
 
     def test_bad_cleanup_settings_do_not_relabel_verified_backup(self):
         for settings in ({"BACKUP_KEEP_LAST": "bad"}, {"BACKUP_KEEP_LAST": "0"},
@@ -482,13 +541,16 @@ class EntryPointTransport:
 class CleanupChartTests(unittest.TestCase):
     def test_cleanup_is_explicit_dry_run_and_shares_backup_job(self):
         from test_backup_chart import render, one
-        docs = render("clickhouse.backup.cleanup.enabled=true")
+        docs = render("clickhouse.backup.cleanup.enabled=true", "clickhouse.backup.cleanup.keepLast=3",
+                      "clickhouse.backup.cleanup.keepDays=7", "clickhouse.backup.cleanup.timeoutSeconds=900")
         self.assertEqual(len([doc for doc in docs if doc["kind"] == "CronJob"]), 1)
         job = one(docs, "CronJob", "otel-backup")["spec"]["jobTemplate"]["spec"]
         env = {item["name"]: item.get("value") for item in job["template"]["spec"]["containers"][0]["env"]}
-        self.assertEqual(env["BACKUP_CLEANUP_DRY_RUN"], "true")
-        self.assertEqual(env["BACKUP_KEEP_LAST"], "2")
-        self.assertEqual(job["activeDeadlineSeconds"], 10800 + 1800 + 60)
+        self.assertEqual({key: value for key, value in env.items()
+                          if key.startswith(("BACKUP_CLEANUP_", "BACKUP_KEEP_"))}, {
+            "BACKUP_CLEANUP_ENABLED": "true", "BACKUP_CLEANUP_DRY_RUN": "true",
+            "BACKUP_KEEP_LAST": "3", "BACKUP_KEEP_DAYS": "7", "BACKUP_CLEANUP_TIMEOUT_SECONDS": "900"})
+        self.assertEqual(job["activeDeadlineSeconds"], 10800 + 900 + 60)
         data = one(docs, "ConfigMap", "otel-backup-job")["data"]
         for script in ("run_backup.py", "backup_common.py", "cleanup_backups.py"):
             self.assertEqual(data[script].rstrip(), (DIRECTORY / script).read_text().rstrip())
@@ -520,6 +582,18 @@ class CleanupChartTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaisesRegex(
                     AssertionError, "deletion is unavailable.*dryRun must remain true"):
                 render("clickhouse.backup.cleanup.enabled=true", "clickhouse.backup.cleanup.dryRun=" + value)
+
+    def test_cleanup_enabled_requires_a_boolean(self):
+        from test_backup_chart import CHART, HELM
+        for value in ("true", "false"):
+            with self.subTest(value=value):
+                result = subprocess.run([HELM, "template", "cleanup-test", str(CHART),
+                                         "-f", str(CHART / "ci/lint-values.yaml"),
+                                         "-f", str(CHART / "ci/backup-values.yaml"),
+                                         "--set-string", "clickhouse.backup.cleanup.enabled=" + value],
+                                        capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("clickhouse.backup.cleanup.enabled must be a boolean", result.stderr)
 
 
 if __name__ == "__main__":
