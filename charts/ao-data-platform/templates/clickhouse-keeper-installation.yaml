@@ -25,6 +25,7 @@
 {{- fail (printf "keeper.zoneSpread.minDomains (%d) must not exceed keeper.replicasCount (%d) — the constraint would demand more zones than there are voters to fill them, leaving voters Pending forever. Leave it null to default to keeper.replicasCount." $zoneMinDomains (int .Values.keeper.replicasCount)) }}
 {{- end }}
 {{- end }}
+{{- $ports := include "ao-data-platform.clickhousePorts" . | fromJson }}
 # ClickHouse Keeper ensemble (Raft coordination for ReplicatedMergeTree).
 #
 # Deployed as an Altinity ClickHouseKeeperInstallation (CHK); the same
@@ -48,13 +49,20 @@ metadata:
     {{- include "ao-data-platform.labels" . | nindent 4 }}
 spec:
   configuration:
-    {{- with .Values.keeper.fourLetterWordAllowList }}
+    {{- /* Rendered only when it has keys, so installs using neither option keep an
+       unchanged CHK (no `settings: null`) and are not rolled on upgrade. */ -}}
+    {{- if or .Values.keeper.fourLetterWordAllowList .Values.keeper.metrics.enabled }}
     settings:
+      {{- with .Values.keeper.fourLetterWordAllowList }}
       # Trim the four-letter-word commands served unauthenticated on the client port
       # (Keeper's built-in default includes cluster-affecting ones like rcvr/rqld).
       # Must keep ruok — the operator's injected liveness probe sends it. Omitted
       # entirely (falling back to Keeper's built-in default) when the value is "".
       keeper_server/four_letter_word_allow_list: {{ . | quote }}
+      {{- end }}
+      {{- if .Values.keeper.metrics.enabled }}
+      {{- include "ao-data-platform.prometheusSettings" . | nindent 6 }}
+      {{- end }}
     {{- end }}
     clusters:
       - name: "keeper"
@@ -75,6 +83,12 @@ spec:
           containers:
             - name: clickhouse-keeper
               image: {{ .Values.keeper.image }}
+              {{- if .Values.keeper.metrics.enabled }}
+              ports:
+                - name: metrics
+                  containerPort: {{ int $ports.metrics }}
+                  protocol: TCP
+              {{- end }}
               {{- with .Values.keeper.resources }}
               resources:
                 {{- toYaml . | nindent 16 }}

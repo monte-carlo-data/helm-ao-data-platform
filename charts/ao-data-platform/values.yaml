@@ -372,6 +372,11 @@ keeper:
   # conflicts with the cluster's CNI.
   networkPolicy:
     enabled: true
+  # Native Prometheus endpoint on port 9363 of every Keeper voter. Off by default;
+  # enabling it on an existing install changes the CHK, so the operator rolls the
+  # Keeper pods.
+  metrics:
+    enabled: false
   # Keeper four-letter-word admin commands, exposed unauthenticated on the client port.
   # Trimmed from Keeper's built-in default — which includes cluster-affecting commands
   # like rcvr (force recovery mode) and rqld (request leadership) — down to the liveness
