@@ -74,5 +74,79 @@ class ClickHouseMetricsTests(unittest.TestCase):
                 self.assertEqual(document, enabled[key], key)
 
 
+SCRAPERS = [{
+    "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "monitoring"}},
+    "podSelector": {"matchLabels": {"app.kubernetes.io/name": "prometheus"}},
+}]
+SCRAPERS_OVERRIDE = "keeper.metrics.networkPolicyFrom[0].namespaceSelector.matchLabels.kubernetes\\.io/metadata\\.name=monitoring"
+SCRAPERS_POD_OVERRIDE = "keeper.metrics.networkPolicyFrom[0].podSelector.matchLabels.app\\.kubernetes\\.io/name=prometheus"
+
+
+def keeper_settings(documents):
+    return chart.one(documents, "ClickHouseKeeperInstallation")["spec"]["configuration"].get("settings")
+
+
+def keeper_ingress(documents):
+    return chart.one(documents, "NetworkPolicy", "keeper-otel")["spec"]["ingress"]
+
+
+def rule_ports(rule):
+    return {port["port"] for port in rule["ports"]}
+
+
+class KeeperMetricsTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.default = render()
+        cls.enabled = render("keeper.metrics.enabled=true", SCRAPERS_OVERRIDE, SCRAPERS_POD_OVERRIDE)
+        cls.chk_off = chart.one(cls.default, "ClickHouseKeeperInstallation")
+        cls.chk_on = chart.one(cls.enabled, "ClickHouseKeeperInstallation")
+
+    def test_metrics_are_off_by_default(self):
+        self.assertEqual(keeper_settings(self.default),
+                         {"keeper_server/four_letter_word_allow_list": "ruok,mntr,srvr,stat,conf"})
+        self.assertNotIn("ports", container(self.chk_off, "clickhouse-keeper"))
+        self.assertEqual({p for rule in keeper_ingress(self.default) for p in rule_ports(rule)}, {2181, 9444})
+
+    def test_enabling_serves_metrics_on_each_voter(self):
+        self.assertEqual(keeper_settings(self.enabled), {
+            "keeper_server/four_letter_word_allow_list": "ruok,mntr,srvr,stat,conf",
+            **PROMETHEUS_SETTINGS,
+        })
+        self.assertEqual(container(self.chk_on, "clickhouse-keeper")["ports"], [METRICS_PORT])
+
+    def test_empty_allow_list_still_falls_back_to_keepers_default(self):
+        # No settings key at all keeps the CHK unchanged for installs using neither option.
+        self.assertIsNone(keeper_settings(render("keeper.fourLetterWordAllowList=")))
+        self.assertEqual(
+            keeper_settings(render("keeper.fourLetterWordAllowList=", "keeper.metrics.enabled=true",
+                                   SCRAPERS_OVERRIDE, SCRAPERS_POD_OVERRIDE)),
+            PROMETHEUS_SETTINGS)
+
+    def test_scrapers_reach_metrics_but_never_the_client_port(self):
+        default_rules = keeper_ingress(self.default)
+        rules = keeper_ingress(self.enabled)
+        self.assertEqual(rules[:len(default_rules)], default_rules)
+        metrics_rules = [rule for rule in rules if 9363 in rule_ports(rule)]
+        self.assertEqual(metrics_rules, [{"from": SCRAPERS, "ports": [{"protocol": "TCP", "port": 9363}]}])
+        client_rules = [rule for rule in rules if 2181 in rule_ports(rule)]
+        self.assertEqual(len(client_rules), 1)
+        self.assertNotIn(SCRAPERS[0], client_rules[0]["from"])
+
+    def test_enabling_without_scrapers_fails_while_the_policy_is_on(self):
+        with self.assertRaisesRegex(AssertionError, "keeper.metrics.networkPolicyFrom is empty"):
+            render("keeper.metrics.enabled=true")
+        documents = render("keeper.metrics.enabled=true", "keeper.networkPolicy.enabled=false")
+        self.assertFalse([d for d in documents if d["kind"] == "NetworkPolicy"
+                          and d["metadata"]["name"].startswith("keeper-")])
+        self.assertEqual(keeper_settings(documents)["prometheus/port"], "9363")
+
+    def test_enabling_changes_only_keeper_objects(self):
+        enabled = by_key(self.enabled)
+        for key, document in by_key(self.default).items():
+            if key not in {("ClickHouseKeeperInstallation", "otel"), ("NetworkPolicy", "keeper-otel")}:
+                self.assertEqual(document, enabled[key], key)
+
+
 if __name__ == "__main__":
     unittest.main()
