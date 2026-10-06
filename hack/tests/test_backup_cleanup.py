@@ -126,13 +126,13 @@ class SelectionTests(unittest.TestCase):
 
 
 class World:
-    def __init__(self):
+    def __init__(self, copies=2):
         self.remote = dict(THREE_GROUPS)
-        self.local = [dict(THREE_GROUPS), dict(THREE_GROUPS)]
+        self.local = [dict(THREE_GROUPS) for _ in range(copies)]
         self.calls = []
-        self.actions = [[], []]
+        self.actions = [[] for _ in range(copies)]
         self.before_read = None
-        self.apis = [FakeAPI(self, 0), FakeAPI(self, 1)]
+        self.apis = [FakeAPI(self, index) for index in range(copies)]
 
     def run(self, **kwargs):
         return cleanup.Cleaner(self.apis, **kwargs).run(NOW, latest_backup=CI)
@@ -141,6 +141,7 @@ class World:
 class FakeAPI:
     def __init__(self, world, index):
         self.world, self.index = world, index
+        self.endpoint = f"http://copy{index}:7171"
         self.unavailable = False
         self.broken_local = False
         self.broken_remote = False
@@ -172,16 +173,49 @@ class FakeAPI:
 
 class PreviewTests(unittest.TestCase):
     def test_preview_only_reads_and_reports_retention(self):
-        world = World()
-        before = (dict(world.remote), [dict(entries) for entries in world.local])
+        for copies in (1, 2, 3):
+            with self.subTest(copies=copies):
+                world = World(copies)
+                before = (dict(world.remote), [dict(entries) for entries in world.local])
+                result = world.run()
+                self.assertEqual(result["mode"], "dry-run")
+                self.assertEqual(result["deleted"], [])
+                self.assertEqual(result["broken_local"], [])
+                self.assertEqual(set(result["kept"]), {C, CI})
+                self.assertEqual(set(result["delete"]), {A, AI, B, BI})
+                self.assertEqual(set(world.calls), {
+                    (index, "GET", path) for index in range(copies)
+                    for path in ("/backup/actions", "/backup/list/remote", "/backup/list/local")})
+                self.assertEqual((world.remote, world.local), before)
+
+    def test_every_copy_must_be_readable_and_idle(self):
+        for copies in (1, 3):
+            for index in range(copies):
+                for failure in ("unavailable", "broken_remote", "broken_local", "busy", "failed_delete"):
+                    with self.subTest(copies=copies, index=index, failure=failure):
+                        world = World(copies)
+                        if failure == "busy":
+                            world.actions[index] = [dict(command="create_remote other", status="in progress")]
+                        elif failure == "failed_delete":
+                            world.actions[index] = [dict(command="delete remote " + A, status="error")]
+                        else:
+                            setattr(world.apis[index], failure, True)
+                        with self.assertRaises(cleanup.BackupError):
+                            world.run()
+
+    def test_third_copy_local_files_are_checked_and_reported(self):
+        world = World(3)
+        world.local[2][AI] = ""
+        with self.assertRaisesRegex(cleanup.BackupError, "dependencies disagree"):
+            world.run()
+        world.apis[2].local_descriptions[AI] = "broken metadata.json not found"
+        del world.remote[AI]
+        del world.local[0][AI]
+        del world.local[1][AI]
         result = world.run()
-        self.assertEqual(result["mode"], "dry-run")
+        self.assertEqual(result["broken_local"], [{"copy": 2, "name": AI}])
+        self.assertEqual(result["local_only"], [{"copy": 2, "name": AI}])
         self.assertEqual(result["deleted"], [])
-        self.assertEqual(result["broken_local"], [])
-        self.assertEqual(set(result["delete"]), {A, AI, B, BI})
-        self.assertTrue(world.calls)
-        self.assertTrue(all(method == "GET" for _, method, _ in world.calls))
-        self.assertEqual((world.remote, world.local), before)
 
     def test_execute_is_rejected_before_any_request_even_with_verified_backup(self):
         for latest in (None, CI):
@@ -283,10 +317,12 @@ class PreviewTests(unittest.TestCase):
             world.run()
 
     def test_disagreeing_remote_catalogues_stop_preview(self):
-        world = World()
-        world.apis[1].remote_override = {C: "", CI: C}
-        with self.assertRaisesRegex(cleanup.BackupError, "disagree"):
-            world.run()
+        for copies in (2, 3):
+            with self.subTest(copies=copies):
+                world = World(copies)
+                world.apis[-1].remote_override = {C: "", CI: C}
+                with self.assertRaisesRegex(cleanup.BackupError, "disagree"):
+                    world.run()
 
     def test_older_active_action_is_found_even_when_last_action_succeeded(self):
         world = World()
@@ -337,6 +373,27 @@ class PreviewTests(unittest.TestCase):
         with self.assertRaisesRegex(cleanup.BackupError, "backup metadata changed during cleanup"):
             world.run()
 
+    def test_single_and_third_copy_changes_stop_preview(self):
+        for copies in (1, 3):
+            for location in ("remote", "local"):
+                with self.subTest(copies=copies, location=location):
+                    world = World(copies)
+                    reads = 0
+
+                    def change_after_snapshot(index, path):
+                        nonlocal reads
+                        if index == copies - 1 and path == "/backup/list/" + location:
+                            reads += 1
+                            if reads == 2:
+                                if location == "remote":
+                                    world.apis[index].remote_override = {**world.remote, name("full", 0): ""}
+                                else:
+                                    del world.local[index][AI]
+
+                    world.before_read = change_after_snapshot
+                    with self.assertRaisesRegex(cleanup.BackupError, "backup metadata changed during cleanup"):
+                        world.run()
+
     def test_action_started_during_snapshot_stops_before_selection(self):
         world = World()
 
@@ -351,19 +408,21 @@ class PreviewTests(unittest.TestCase):
         selection.assert_not_called()
 
     def test_action_started_during_final_catalog_read_stops_report(self):
-        world = World()
-        reads = 0
+        for copies in (1, 2, 3):
+            with self.subTest(copies=copies):
+                world = World(copies)
+                reads = 0
 
-        def start_action(index, path):
-            nonlocal reads
-            if index == 1 and path == "/backup/list/local":
-                reads += 1
-                if reads == 2:
-                    world.actions[0] = [dict(command="create_remote concurrent", status="in progress")]
+                def start_action(index, path):
+                    nonlocal reads
+                    if index == copies - 1 and path == "/backup/list/local":
+                        reads += 1
+                        if reads == 2:
+                            world.actions[index] = [dict(command="create_remote concurrent", status="in progress")]
 
-        world.before_read = start_action
-        with self.assertRaisesRegex(cleanup.BackupError, "copy is busy"):
-            world.run()
+                world.before_read = start_action
+                with self.assertRaisesRegex(cleanup.BackupError, "copy is busy"):
+                    world.run()
 
     def test_deadline_leaves_room_for_a_request(self):
         world = World()
@@ -371,17 +430,20 @@ class PreviewTests(unittest.TestCase):
             world.run(timeout=29)
         self.assertEqual(world.calls, [])
 
-    def test_both_distinct_copies_and_boolean_execute_are_required(self):
-        world = World()
-        with self.assertRaisesRegex(cleanup.BackupError, "both ClickHouse"):
-            cleanup.Cleaner(world.apis[:1])
-        with self.assertRaisesRegex(cleanup.BackupError, "different"):
-            cleanup.Cleaner([world.apis[0], world.apis[0]])
-        for api in world.apis:
-            api.endpoint = "http://same-copy:7171"
-        with self.assertRaisesRegex(cleanup.BackupError, "different"):
-            cleanup.Cleaner(world.apis)
-        del world.apis[1].endpoint
+    def test_nonempty_distinct_copies_and_boolean_execute_are_required(self):
+        world = World(3)
+        with self.assertRaisesRegex(cleanup.BackupError, "at least one"):
+            cleanup.Cleaner([])
+        for copies in ([world.apis[0], world.apis[0]],
+                       [world.apis[0], world.apis[1], world.apis[0]],
+                       [world.apis[0], world.apis[1], world.apis[1]]):
+            with self.subTest(copies=copies), self.assertRaisesRegex(cleanup.BackupError, "different"):
+                cleanup.Cleaner(copies)
+        for duplicate in (0, 1):
+            world.apis[2].endpoint = world.apis[duplicate].endpoint
+            with self.subTest(duplicate=duplicate), self.assertRaisesRegex(cleanup.BackupError, "different"):
+                cleanup.Cleaner(world.apis)
+        del world.apis[2].endpoint
         with self.assertRaisesRegex(cleanup.BackupError, "explicit boolean"):
             cleanup.Cleaner(world.apis).run(NOW, latest_backup=CI, execute="false")
         self.assertEqual(world.calls, [])
@@ -394,7 +456,7 @@ class MainCleanupTests(unittest.TestCase):
         env.update(settings)
         with mock.patch.dict(os.environ, env, clear=True), \
                 mock.patch.dict(sys.modules, {"cleanup_backups": cleanup}), \
-                mock.patch.object(backup, "configured_clients", return_value=(world.apis, [object(), object()])), \
+                mock.patch.object(backup, "configured_clients", return_value=(world.apis, [object() for _ in world.apis])), \
                 mock.patch.object(backup.Scheduler, "run", return_value=CI), \
                 mock.patch.object(cleanup, "datetime", wraps=datetime) as dates, \
                 mock.patch.object(sys, "path", [str(DIRECTORY)] + sys.path), \
@@ -418,14 +480,16 @@ class MainCleanupTests(unittest.TestCase):
         self.assertEqual(len(entries), 6)
 
     def test_real_cleaner_error_keeps_verified_backup_successful(self):
-        world = World()
-        world.apis[1].unavailable = True
-        status, output, errors = self.run_main(world)
-        self.assertEqual(status, 0)
-        self.assertEqual(output, "")
-        self.assertEqual(errors, "Backup cleanup preview stopped: Backup API could not be reached.\n")
-        self.assertNotIn("Backup failed", errors)
-        self.assertNotIn("Traceback", errors)
+        for copies in (1, 2, 3):
+            with self.subTest(copies=copies):
+                world = World(copies)
+                world.apis[-1].unavailable = True
+                status, output, errors = self.run_main(world)
+                self.assertEqual(status, 0)
+                self.assertEqual(output, "")
+                self.assertEqual(errors, "Backup cleanup preview stopped: Backup API could not be reached.\n")
+                self.assertNotIn("Backup failed", errors)
+                self.assertNotIn("Traceback", errors)
 
     def test_real_residue_is_reported_without_failing_backup(self):
         world = World()
@@ -483,26 +547,28 @@ with mock.patch("urllib.request.build_opener", return_value=transport), \
     runpy.run_path(sys.argv[1], run_name="__main__")
 """
         env = dict(os.environ, PYTHONPATH=os.pathsep.join([str(Path(__file__).parent), str(DIRECTORY)]),
-                   BACKUP_ENDPOINTS='["http://copy0:7171", "http://copy1:7171"]',
-                   BACKUP_DATABASE_ENDPOINTS='["http://copy0:8123", "http://copy1:8123"]',
-                   BACKUP_POD_NAMES='["copy0", "copy1"]', POD_NAMESPACE="test",
+                   POD_NAMESPACE="test",
                    BACKUP_PASSWORD_REVISION="one", BACKUP_CLEANUP_ENABLED="true",
                    BACKUP_CLEANUP_DRY_RUN="true", BACKUP_KEEP_DAYS="3")
-        for keep_last in ("1", "0"):
-            with self.subTest(keep_last=keep_last):
-                result = subprocess.run([sys.executable, "-c", program, str(DIRECTORY / "run_backup.py")],
-                                        env=dict(env, BACKUP_KEEP_LAST=keep_last), capture_output=True,
-                                        text=True, timeout=20)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn("Verified completed full backup", result.stdout)
-                if keep_last == "1":
-                    self.assertIn('"keep_last": 1', result.stdout)
-                    self.assertIn('"keep_days": 3', result.stdout)
-                    self.assertEqual(result.stderr, "")
-                else:
-                    self.assertIn("Backup cleanup preview stopped: Cleanup needs a positive keep_last", result.stderr)
-                self.assertNotIn("Traceback", result.stderr)
-                self.assertNotIn("Backup failed", result.stderr)
+        for copies in (1, 2, 3):
+            for keep_last in ("1", "0"):
+                with self.subTest(copies=copies, keep_last=keep_last):
+                    result = subprocess.run([sys.executable, "-c", program, str(DIRECTORY / "run_backup.py")],
+                                            env=dict(env, BACKUP_KEEP_LAST=keep_last,
+                                                     BACKUP_ENDPOINTS=json.dumps([f"http://copy{i}:7171" for i in range(copies)]),
+                                                     BACKUP_DATABASE_ENDPOINTS=json.dumps([f"http://copy{i}:8123" for i in range(copies)]),
+                                                     BACKUP_POD_NAMES=json.dumps([f"copy{i}" for i in range(copies)])),
+                                            capture_output=True, text=True, timeout=20)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("Verified completed full backup", result.stdout)
+                    if keep_last == "1":
+                        self.assertIn('"keep_last": 1', result.stdout)
+                        self.assertIn('"keep_days": 3', result.stdout)
+                        self.assertEqual(result.stderr, "")
+                    else:
+                        self.assertIn("Backup cleanup preview stopped: Cleanup needs a positive keep_last", result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertNotIn("Backup failed", result.stderr)
 
 
 class EntryPointTransport:
@@ -558,8 +624,7 @@ class CleanupChartTests(unittest.TestCase):
 
     def test_bad_cleanup_settings_are_rejected_with_specific_messages(self):
         from test_backup_chart import render
-        cases = [("clickhouse.replicasCount=1", "requires exactly two ClickHouse copies"),
-                 ("clickhouse.backup.enabled=false", "cleanup requires clickhouse.backup.enabled")]
+        cases = [("clickhouse.backup.enabled=false", "cleanup requires clickhouse.backup.enabled")]
         for key, minimum, invalid in (("keepLast", 1, ("0", "-1", "two", "1.5", "true")),
                                       ("keepDays", 0, ("-1", "30d", "0.5", "false")),
                                       ("timeoutSeconds", 60, ("0", "59", "60s", "60.5", "true"))):

@@ -2,7 +2,8 @@
 
 Optional cleanup reports run after verified scheduled backups, in the same Job.
 They do not change the backup schedule or delete files. The chart does not add
-an alerting system. Cleanup requires exactly two ClickHouse copies.
+an alerting system. Cleanup checks every configured ClickHouse copy and supports
+one or more copies.
 
 ```yaml
 clickhouse:
@@ -67,9 +68,9 @@ Backup cleanup entry: {"list":"delete","name":"ao-otel-full-20260101T000000Z-012
 Every name is written separately, so the growing candidate list does not make
 one increasingly long JSON line. Keep the summary and all entry lines to retain
 the full report. Local entries also include `copy`: `0` is the first ClickHouse
-replica and `1` is the second.
+replica, `1` is the second, `2` is the third, and so on.
 
-Both copies must be reachable and report matching remote records. Missing
+Every configured copy must be reachable and report matching remote records. Missing
 bases, broken remote metadata, busy copies, interrupted deletions, or records
 changing during the check stop the preview. These cases cannot produce a
 trustworthy removal list.
@@ -131,7 +132,7 @@ repairing backup files or restarting a backup container.
   catalog entry, not the backup's S3 data. Do not apply this procedure to an
   unverified or healthy remote backup, or force past a dependency error.
 - **A failed or cancelled deletion in API history.** The preview stops while
-  either copy's history contains a failed or cancelled `delete` command, even
+  any copy's history contains a failed or cancelled `delete` command, even
   if a later attempt succeeded. Inspect the affected backup and any partial
   removal first. Inspection alone does not clear the history. The tool keeps
   up to 1,000 finished actions by default (`general.status_history_size`);
@@ -150,7 +151,7 @@ does not show that the preview recovered.
 
 This chart does not delete backups. It rejects enabled cleanup with
 `dryRun: false`, and the preview program refuses execution before contacting
-either backup API. Keep the tool's automatic retention disabled and S3
+any backup API. Keep the tool's automatic retention disabled and S3
 lifecycle expiration disabled for both backup prefixes. The chart cannot
 inspect or change bucket lifecycle rules.
 

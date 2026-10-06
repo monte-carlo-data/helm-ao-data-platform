@@ -400,6 +400,42 @@ class BackupChartTests(unittest.TestCase):
                     self.assertEqual(service["spec"]["selector"]["clickhouse.altinity.com/shard"], "0")
                     self.assertTrue(service["spec"]["publishNotReadyAddresses"])
 
+    def test_cleanup_checks_every_configured_replica(self):
+        for count in (1, 2, 3):
+            for tls in (False, True):
+                with self.subTest(replicas=count, tls=tls):
+                    docs = render(f"clickhouse.replicasCount={count}",
+                                  "clickhouse.backup.cleanup.enabled=true",
+                                  "tls.enabled=" + str(tls).lower())
+                    chi = one(docs, "ClickHouseInstallation")
+                    name = chi["metadata"]["name"]
+                    cluster = chi["spec"]["configuration"]["clusters"][0]
+                    container = one(docs, "CronJob")["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]
+                    env = {item["name"]: item.get("value") for item in container["env"]}
+                    self.assertEqual(env["BACKUP_CLEANUP_ENABLED"], "true")
+                    self.assertEqual(env["BACKUP_CLEANUP_DRY_RUN"], "true")
+                    hosts = [f"{name}-backup-{index}" for index in range(count)]
+                    self.assertEqual(json.loads(env["BACKUP_ENDPOINTS"]),
+                                     [f"http://{host}:7171" for host in hosts])
+                    scheme, port = ("https", 8443) if tls else ("http", 8123)
+                    self.assertEqual(json.loads(env["BACKUP_DATABASE_ENDPOINTS"]),
+                                     [f"{scheme}://{host}:{port}" for host in hosts])
+                    self.assertEqual(json.loads(env["BACKUP_POD_NAMES"]),
+                                     [f"chi-{name}-{cluster['name']}-0-{index}-0" for index in range(count)])
+                    for index, host in enumerate(hosts):
+                        service = one(docs, "Service", host)
+                        self.assertEqual(service["spec"]["selector"]["clickhouse.altinity.com/replica"], str(index))
+                    scripts = one(docs, "ConfigMap", name + "-backup-job")["data"]
+                    self.assertIn("cleanup_backups.py", scripts)
+
+    def test_backup_copy_count_must_be_a_positive_integer(self):
+        for cleanup in (False, True):
+            for count in ("0", "-1", "1.5", "true", "abc"):
+                with self.subTest(replicas=count, cleanup=cleanup):
+                    with self.assertRaisesRegex(AssertionError, "clickhouse.replicasCount"):
+                        render(f"clickhouse.replicasCount={count}",
+                               "clickhouse.backup.cleanup.enabled=" + str(cleanup).lower())
+
     def test_backup_timeouts_and_job_resources_follow_settings(self):
         docs = render("clickhouse.backup.schedule.timeoutSeconds=7200",
                       "clickhouse.backup.schedule.startingDeadlineSeconds=300",

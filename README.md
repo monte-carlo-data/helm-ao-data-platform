@@ -939,7 +939,7 @@ helm upgrade ao-data-platform oci://registry-1.docker.io/montecarlodata/ao-data-
 | `clickhouse.backup.schedule.startingDeadlineSeconds` | `900` | Latest allowed start after a missed scheduled time, in seconds. |
 | `clickhouse.backup.schedule.image` | `python:3.12-slim-bookworm` with pinned digest | Backup Job runner image; changing it does not roll ClickHouse pods. |
 | `clickhouse.backup.schedule.resources` | requests: `25m` CPU / `32Mi` memory; limit: `128Mi` memory | Backup Job resources. |
-| `clickhouse.backup.cleanup.enabled` | `false` | Run a read-only retention report after a verified backup. Requires backups enabled and exactly two ClickHouse copies. |
+| `clickhouse.backup.cleanup.enabled` | `false` | Run a read-only retention report after a verified backup. Requires backups enabled; checks every configured ClickHouse copy, including single-copy clusters. |
 | `clickhouse.backup.cleanup.dryRun` | `true` | Must remain `true` when cleanup is enabled; deletion is rejected. |
 | `clickhouse.backup.cleanup.keepLast` | `2` | Integer >= 1. Keep this many newest individual backups, plus every base they require. |
 | `clickhouse.backup.cleanup.keepDays` | `0` | Integer >= 0. Also keep backups inside this many days, plus their bases. Use `30` for a 30-day production window. Zero disables the age window; the defaults keep the newest two individual backups and any bases they need. |

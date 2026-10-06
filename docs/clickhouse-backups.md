@@ -278,7 +278,8 @@ requires exactly two replicas and an idle, unsuspended CronJob with schedule
 Enable `clickhouse.backup.cleanup.enabled` to report which older backups fall
 outside `keepLast` and `keepDays` after each verified backup. It is disabled by
 default. The report preserves every required base and unrelated remote backup.
-It needs two available copies with matching remote catalogs. Known incomplete
+Every configured copy must be available and report matching remote catalogs;
+single-copy clusters are supported too. Known incomplete
 local entries and scheduler-owned local files without remote backups are listed
 separately; no files are removed. Other preview errors log
 `Backup cleanup preview stopped:` and leave the successful backup Job successful.

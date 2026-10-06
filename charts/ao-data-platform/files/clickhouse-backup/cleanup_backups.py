@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Preview retention after a verified backup without deleting any backup files.
 
-Call inside the same non-overlapping CronJob. Both copies and every dependency
+Call inside the same non-overlapping CronJob. Every copy and every dependency
 must be readable. Only this scheduler's names are eligible; unrelated backups
 and required bases are preserved.
 
@@ -116,12 +116,12 @@ def plan(remote, now, keep_last=2, keep_days=0, latest_backup=None):
 
 class Cleaner:
     def __init__(self, apis, keep_last=2, keep_days=0, timeout=600, clock=time.monotonic):
-        if len(apis) != 2 or timeout <= 0:
-            raise BackupError("Cleanup requires both ClickHouse copies and a positive timeout.")
-        if apis[0] is apis[1] or (getattr(apis[0], "endpoint", None)
-                                  and apis[0].endpoint == getattr(apis[1], "endpoint", None)):
-            raise BackupError("Cleanup requires two different ClickHouse copy endpoints.")
-        self.apis = apis
+        if not apis or timeout <= 0:
+            raise BackupError("Cleanup requires at least one ClickHouse copy and a positive timeout.")
+        endpoints = [api.endpoint for api in apis if getattr(api, "endpoint", None)]
+        if len({id(api) for api in apis}) != len(apis) or len(set(endpoints)) != len(endpoints):
+            raise BackupError("Cleanup requires different ClickHouse copy endpoints.")
+        self.apis = tuple(apis)
         self.keep_last = keep_last
         self.keep_days = keep_days
         self.clock = clock
@@ -136,7 +136,7 @@ class Cleaner:
         return self.apis[index].request(method, path)
 
     def idle(self):
-        for index in range(2):
+        for index in range(len(self.apis)):
             for row in self.request(index, "GET", "/backup/actions"):
                 state, command = row.get("status"), row.get("command")
                 if state not in ("success", "error", "cancel") or not isinstance(command, str) or not command:
@@ -146,10 +146,10 @@ class Cleaner:
 
     def snapshot(self):
         self.idle()
-        remote = [catalog(self.request(i, "GET", "/backup/list/remote"), "remote") for i in range(2)]
-        if remote[0] != remote[1]:
+        remote = [catalog(self.request(i, "GET", "/backup/list/remote"), "remote") for i in range(len(self.apis))]
+        if any(entries != remote[0] for entries in remote[1:]):
             raise BackupError("Cleanup stopped: the copies disagree about remote backups.")
-        local = [catalog(self.request(i, "GET", "/backup/list/local"), "local", remote[0]) for i in range(2)]
+        local = [catalog(self.request(i, "GET", "/backup/list/local"), "local", remote[0]) for i in range(len(self.apis))]
         for entries in local:
             for name, required in entries.items():
                 if name not in remote[0]:
@@ -166,7 +166,7 @@ class Cleaner:
     def unchanged(self, remote, local):
         # Do not report a retention decision from a catalog that changed while read.
         self.idle()
-        for index in range(2):
+        for index in range(len(self.apis)):
             if (catalog(self.request(index, "GET", "/backup/list/remote"), "remote") != remote
                     or catalog(self.request(index, "GET", "/backup/list/local"), "local", remote) != local[index]):
                 raise BackupError("Cleanup stopped: backup metadata changed during cleanup.")
