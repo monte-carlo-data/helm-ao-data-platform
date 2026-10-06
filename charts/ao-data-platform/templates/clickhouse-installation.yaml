@@ -394,8 +394,14 @@ spec:
     podTemplates:
       - name: clickhouse
         {{- /* User annotations (e.g. scraper opt-in) plus the chart-owned backup
-           revision, which wins on a key collision. */ -}}
+           revision. Backup Jobs read that annotation to confirm every pod loaded the
+           current API password, so a user-pinned copy would block all backups. */ -}}
         {{- $podAnnotations := deepCopy (.Values.clickhouse.podAnnotations | default dict) }}
+        {{- range $key, $_ := $podAnnotations }}
+        {{- if hasPrefix "backup.montecarlodata.com/" $key }}
+        {{- fail (printf "clickhouse.podAnnotations must not set %s: the chart manages backup.montecarlodata.com/ annotations. Remove it from your values." $key) }}
+        {{- end }}
+        {{- end }}
         {{- if .Values.clickhouse.backup.enabled }}
         {{- $_ := set $podAnnotations "backup.montecarlodata.com/password-revision" (toString .Values.clickhouse.backup.api.passwordRevision) }}
         {{- end }}

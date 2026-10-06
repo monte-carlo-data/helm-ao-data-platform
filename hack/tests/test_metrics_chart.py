@@ -181,11 +181,17 @@ class PodAnnotationTests(unittest.TestCase):
 
     def test_user_annotations_merge_with_the_backup_revision(self):
         revision = pod_annotations(chart.one(chart.render(), "ClickHouseInstallation"))[REVISION_ANNOTATION]
-        documents = render_annotations({"clickhouse": {**SCRAPE_ANNOTATIONS, REVISION_ANNOTATION: "stale"}},
-                                       backup=True)
-        # The chart-owned revision wins, so a user value cannot mask a password rotation.
+        documents = render_annotations({"clickhouse": SCRAPE_ANNOTATIONS}, backup=True)
         self.assertEqual(pod_annotations(chart.one(documents, "ClickHouseInstallation")),
                          {**SCRAPE_ANNOTATIONS, REVISION_ANNOTATION: revision})
+
+    def test_chart_owned_backup_annotations_are_rejected(self):
+        # Backup Jobs read the revision annotation to confirm every pod loaded the
+        # current API password; a pinned user copy would block every backup.
+        for backup in (True, False):
+            with self.subTest(backup=backup):
+                with self.assertRaisesRegex(AssertionError, "backup.montecarlodata.com/"):
+                    render_annotations({"clickhouse": {REVISION_ANNOTATION: "rev-1"}}, backup=backup)
 
 
 class CollectorMetricsTests(unittest.TestCase):
