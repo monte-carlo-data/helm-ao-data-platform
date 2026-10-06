@@ -26,6 +26,11 @@
 -- re-applies every /sql/*.sql with no ledger, so a superseded ALTER left in
 -- place would regress the view on every upgrade).
 --
+-- Release order: ship this only after the reader that consumes these prompts
+-- is deployed. That reader keeps every replayed message and budgets their
+-- previews. An older reader de-duplicates the replays and truncates later
+-- steps' previews.
+--
 -- Forward-only: MODIFY QUERY affects new inserts only.
 
 ALTER TABLE otel_traces.spans_normalized_mv ON CLUSTER '{cluster}'
