@@ -6,6 +6,8 @@
    so enforcing the same guard the gateway-*.yaml files use keeps an isolated render of just
    this file from silently emitting a wrong/absent appProtocol for an invalid provider. */ -}}
 {{- include "ao-data-platform.gatewayValidate" . -}}
+{{- include "ao-data-platform.backupValidate" . -}}
+{{- $ports := include "ao-data-platform.clickhousePorts" . | fromJson -}}
 apiVersion: "clickhouse.altinity.com/v1"
 kind: "ClickHouseInstallation"
 metadata:
@@ -15,7 +17,7 @@ metadata:
 spec:
   configuration:
     clusters:
-      - name: "otel"
+      - name: {{ include "ao-data-platform.clickhouseClusterName" . | quote }}
         # Auto-generated cluster secret for intra-cluster (replica→replica) query hops.
         # Without it, distributed queries such as clusterAllReplicas() authenticate the
         # remote hop as the `default` user — which this chart removes — and fail
@@ -40,10 +42,10 @@ spec:
     # No SQL users in the operator spec (YET-2680, Spike Finding 7): the operator
     # renders a password hash for any password-less users: entry, which cannot
     # coexist with the <auth_methods> the rotation mechanism needs — ClickHouse
-    # rejects the whole users config. Every user is defined completely in the
-    # users.d/auth-methods.xml fragment in `files:` below (networks, grants, and
-    # auth substituted from the mounted auth-methods secret), the same pattern
-    # users.d/probe_user.xml already uses.
+    # rejects the whole users config. Main users are defined in the
+    # users.d/auth-methods.xml fragment below. Optional backup/probe users have
+    # separate XML stores in backup-external-secret.yaml so missing backup Secrets
+    # do not affect main users.
     # Adding a ClickHouse user? Also update values.yaml, templates/external-secret.yaml
     # and the authMethodsUsers helper.
     {{- if .Values.clickhouse.readonlyUser.enabled }}
@@ -69,7 +71,7 @@ spec:
           secretKeyRef:
             name: {{ .Values.clickhouse.authMethods.secret }}
             key: auth.xml
-      # The complete definitions of every ClickHouse SQL user (YET-2680) — why
+      # The definitions of the main password-backed users — why
       # here and not the operator users: spec: see the comment above the profiles
       # section. Networks and grants are exactly what the users spec carried
       # before; auth comes from the mounted file via incl. include_from is read
@@ -323,6 +325,10 @@ spec:
             <defaults/>
           </http_handlers>
         </clickhouse>
+      {{- if .Values.clickhouse.backup.enabled }}
+      config.d/backup.xml: |
+        {{- include "ao-data-platform.backupDisk" . | nindent 8 }}
+      {{- end }}
       {{- if .Values.tls.enabled }}
       server.crt:
         valueFrom:
@@ -367,8 +373,8 @@ spec:
       # retention via `ALTER TABLE system.<log> MODIFY TTL` instead; see
       # templates/schema-job.yaml.
       {{- if .Values.tls.enabled }}
-      tcp_port_secure: "9440"
-      https_port: "8443"
+      tcp_port_secure: {{ $ports.tcpSecure | toString | quote }}
+      https_port: {{ $ports.https | toString | quote }}
       openSSL/server/certificateFile: /etc/clickhouse-server/secrets.d/server.crt/clickhouse-server-tls/tls.crt
       openSSL/server/privateKeyFile: /etc/clickhouse-server/secrets.d/server.key/clickhouse-server-tls/tls.key
       openSSL/server/caConfig: /etc/clickhouse-server/secrets.d/ca.crt/clickhouse-server-tls/ca.crt
@@ -384,12 +390,86 @@ spec:
     # load-bearing chart behavior, not optional tuning.
     podTemplates:
       - name: clickhouse
+        {{- if .Values.clickhouse.backup.enabled }}
+        metadata:
+          annotations:
+            backup.montecarlodata.com/password-revision: {{ .Values.clickhouse.backup.api.passwordRevision | quote }}
+        {{- end }}
         spec:
+          {{- if .Values.clickhouse.backup.enabled }}
+          serviceAccountName: {{ .Values.clickhouse.backup.serviceAccount.name }}
+          automountServiceAccountToken: false
+          securityContext:
+            # The backup process runs as group 101 and must write to the shared
+            # data volume, including before ClickHouse initializes a fresh volume.
+            fsGroup: 101
+            fsGroupChangePolicy: OnRootMismatch
+          volumes:
+            # Operator 0.26.0 supplies chi-<CHI>-common-configd and preserves
+            # our exact config.d/ mount path. See Chart.yaml for upgrade checks.
+            - name: backup-startup
+              configMap:
+                name: {{ include "ao-data-platform.chiName" . }}-backup-startup
+                optional: true
+            - name: backup-runtime
+              emptyDir:
+                medium: Memory
+                sizeLimit: 1Mi
+            - name: backup-auth-config
+              projected:
+                sources:
+                  - configMap:
+                      name: chi-{{ include "ao-data-platform.chiName" . }}-common-configd
+                  - configMap:
+                      name: {{ include "ao-data-platform.chiName" . }}-backup-auth
+                      optional: true
+                      items:
+                        - {key: backup-users.xml, path: backup-users.xml}
+            - name: backup-config
+              secret:
+                secretName: {{ .Values.clickhouse.backup.user.secret }}
+                optional: true
+                items:
+                  - {key: config.yml, path: config.yml}
+                  - {key: password, path: password}
+            - name: backup-api-credentials
+              secret:
+                secretName: {{ include "ao-data-platform.backupAPISecretName" . }}
+                optional: true
+            {{- range $kind := list "user" "probe" }}
+            - name: backup-{{ $kind }}-auth
+              projected:
+                sources:
+                  - configMap:
+                      name: {{ include "ao-data-platform.chiName" $ }}-backup-auth
+                      optional: true
+                      items:
+                        - {key: {{ printf "%s.xml" $kind | quote }}, path: users.xml}
+                  - secret:
+                      name: {{ (index $.Values.clickhouse.backup $kind).secret }}
+                      optional: true
+                      items:
+                        - {key: auth.xml, path: users.d/auth.xml}
+            {{- end }}
+          {{- end }}
           # `image` is required whenever this podTemplate emits a containers[]
           # entry — the Altinity operator does not merge container spec defaults.
           containers:
             - name: clickhouse
               image: {{ .Values.clickhouse.image }}
+              {{- if .Values.clickhouse.backup.enabled }}
+              volumeMounts:
+                - name: backup-auth-config
+                  # Match the operator's path exactly so it keeps this mount.
+                  mountPath: /etc/clickhouse-server/config.d/
+                  readOnly: true
+                - name: backup-user-auth
+                  mountPath: /etc/clickhouse-backup-auth/user
+                  readOnly: true
+                - name: backup-probe-auth
+                  mountPath: /etc/clickhouse-backup-auth/probe
+                  readOnly: true
+              {{- end }}
               {{- with .Values.clickhouse.resources }}
               resources:
                 {{- toYaml . | nindent 16 }}
@@ -401,10 +481,10 @@ spec:
                 httpGet:
                   path: /ping
                   {{- if .Values.tls.enabled }}
-                  port: 8443
+                  port: {{ int $ports.https }}
                   scheme: HTTPS
                   {{- else }}
-                  port: 8123
+                  port: {{ int $ports.http }}
                   {{- end }}
                 failureThreshold: 30
                 periodSeconds: 10
@@ -423,14 +503,17 @@ spec:
                 httpGet:
                   path: /ready
                   {{- if .Values.tls.enabled }}
-                  port: 8443
+                  port: {{ int $ports.https }}
                   scheme: HTTPS
                   {{- else }}
-                  port: 8123
+                  port: {{ int $ports.http }}
                   {{- end }}
                 periodSeconds: 10
                 timeoutSeconds: 5
                 failureThreshold: 3
+            {{- if .Values.clickhouse.backup.enabled }}
+            {{- include "ao-data-platform.backupContainer" . | nindent 12 }}
+            {{- end }}
           {{- with .Values.clickhouse.nodeSelector }}
           nodeSelector:
             {{- toYaml . | nindent 12 }}
@@ -487,7 +570,7 @@ spec:
           ports:
             {{- if .Values.tls.enabled }}
             - name: https
-              port: 8443
+              port: {{ int $ports.https }}
               {{- if and .Values.gateway.enabled (eq .Values.gateway.provider "gke") }}
               # GKE keys backend re-encryption + the LB health-check scheme off appProtocol,
               # so mark the ClickHouse HTTPS port: the Gateway's BackendTLSPolicy re-encrypts
@@ -495,12 +578,12 @@ spec:
               appProtocol: HTTPS
               {{- end }}
             - name: tcp-secure
-              port: 9440
+              port: {{ int $ports.tcpSecure }}
             {{- else }}
             - name: http
-              port: 8123
+              port: {{ int $ports.http }}
             - name: tcp
-              port: 9000
+              port: {{ int $ports.tcp }}
             {{- end }}
     volumeClaimTemplates:
       - name: data

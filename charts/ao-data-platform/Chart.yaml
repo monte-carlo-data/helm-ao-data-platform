@@ -1,9 +1,9 @@
 apiVersion: v2
 name: ao-data-platform
 description: Monte Carlo data platform — ClickHouse, OTel collector, and schema management
-# 5.1.0 — keeper.zoneSpread.minDomains reduced-HA opt-out + per-node voter anti-affinity
-# (rolls the Keeper voters once); see README "Upgrading to 5.1.0".
-version: 5.1.1
+# 5.2.0 adds optional scheduled ClickHouse backups; disabled by default.
+# See README "Upgrading to 5.2.0" and docs/clickhouse-backups.md before enabling.
+version: 5.2.0
 type: application
 # minDomains on the ClickHouse/Keeper zone topologySpreadConstraints is GA in
 # Kubernetes 1.30. Declare the floor so a render/install against an older API
@@ -14,6 +14,9 @@ type: application
 kubeVersion: ">=1.30.0-0"
 
 dependencies:
+  # Backup mounts depend on chi-<CHI>-common-configd, the exact config.d/
+  # mount taking precedence, and chi-<CHI>-<cluster>-0-<replica>-0 Pod names.
+  # Test a fresh CHI and disabling backups with the real operator before upgrading.
   - name: altinity-clickhouse-operator
     version: 0.26.0
     repository: https://docs.altinity.com/clickhouse-operator/

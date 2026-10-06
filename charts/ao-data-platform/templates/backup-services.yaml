@@ -1,0 +1,30 @@
+{{- include "ao-data-platform.backupValidate" . -}}
+{{- if .Values.clickhouse.backup.enabled }}
+{{- range $replica := (include "ao-data-platform.backupReplicas" . | fromJsonArray) }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ao-data-platform.chiName" $ }}-backup-{{ $replica }}
+  labels:
+    {{- include "ao-data-platform.labels" $ | nindent 4 }}
+spec:
+  type: ClusterIP
+  # See every replica during recovery; source selection separately checks freshness.
+  publishNotReadyAddresses: true
+  selector:
+    clickhouse.altinity.com/chi: {{ include "ao-data-platform.chiName" $ }}
+    clickhouse.altinity.com/cluster: {{ include "ao-data-platform.clickhouseClusterName" $ }}
+    # The CHI layout has one shard; this is its zero-based operator label.
+    clickhouse.altinity.com/shard: "0"
+    clickhouse.altinity.com/replica: {{ $replica | quote }}
+  ports:
+    - name: backup-api
+      port: 7171
+      targetPort: backup-api
+    - name: database-probe
+      {{- $ports := include "ao-data-platform.clickhousePorts" $ | fromJson }}
+      port: {{ ternary (int $ports.https) (int $ports.http) $.Values.tls.enabled }}
+      targetPort: {{ ternary (int $ports.https) (int $ports.http) $.Values.tls.enabled }}
+{{- end }}
+{{- end }}
