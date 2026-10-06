@@ -673,13 +673,6 @@ opentelemetry-collector:
               cert_file: /tls/otel/tls.crt
               key_file: /tls/otel/tls.key
               reload_interval: 10m
-      prometheus:
-        config:
-          scrape_configs:
-            - job_name: otel-collector
-              scrape_interval: 30s
-              static_configs:
-                - targets: ["${env:MY_POD_IP}:8888"]
 
     processors:
       memory_limiter:
@@ -724,6 +717,12 @@ opentelemetry-collector:
           receivers: [otlp]
           processors: [memory_limiter, batch]
           exporters: [clickhouse]
+        # The subchart's default metrics pipeline also lists its `prometheus`
+        # receiver, which scrapes the collector's own telemetry into the debug
+        # exporter. Lists replace rather than merge, so this drops the self-scrape.
+        # Scrape <pod-ip>:8888 from outside instead (see the README).
+        metrics:
+          receivers: [otlp]
       telemetry:
         logs:
           level: info
