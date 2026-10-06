@@ -281,7 +281,8 @@ clickhouse:
     enabled: false
   # Extra annotations on the ClickHouse pods, e.g. the opt-in annotations an
   # annotation-driven scraper reads (prometheus.io/scrape, prometheus.io/port: "9363").
-  # Changing them rolls the ClickHouse pods.
+  # Changing them rolls the ClickHouse pods. Keys under backup.montecarlodata.com/
+  # are chart-managed and fail the render.
   podAnnotations: {}
   hostname: ""    # if set, adds external-dns.alpha.kubernetes.io/hostname annotation
   service:

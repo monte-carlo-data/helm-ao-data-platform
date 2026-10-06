@@ -1003,7 +1003,7 @@ helm upgrade ao-data-platform oci://registry-1.docker.io/montecarlodata/ao-data-
 | `clickhouse.authMethods.externalSecret.secretStoreRef.kind` | `ClusterSecretStore` | Kind of the bundle's secret store reference. |
 | `clickhouse.authMethods.externalSecret.refreshInterval` | `1h` | How often ESO re-syncs the bundle. |
 | `clickhouse.metrics.enabled` | `false` | Serve native Prometheus metrics on port 9363 of each replica (not on the Service). Enabling rolls the ClickHouse pods. See [Metrics endpoints](#metrics-endpoints). |
-| `clickhouse.podAnnotations` | `{}` | Extra annotations on the ClickHouse pods, e.g. scraper opt-in annotations. Merged with the backup revision annotation, which wins on a collision. Changing them rolls the pods. |
+| `clickhouse.podAnnotations` | `{}` | Extra annotations on the ClickHouse pods, e.g. scraper opt-in annotations. Merged with the backup revision annotation; keys under `backup.montecarlodata.com/` are chart-managed and fail the render. Changing them rolls the pods. |
 | `clickhouse.hostname` | `""` | If set, adds `external-dns.alpha.kubernetes.io/hostname` annotation to the ClickHouse Service |
 | `clickhouse.service.type` | `ClusterIP` | ClickHouse Service type (`ClusterIP`, `LoadBalancer`) |
 | `clickhouse.service.annotations` | `{}` | Annotations on the ClickHouse Service (e.g. AWS NLB annotations) |
