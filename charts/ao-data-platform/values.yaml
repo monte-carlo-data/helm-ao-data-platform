@@ -273,6 +273,12 @@ clickhouse:
         name: ""
         kind: ""
       refreshInterval: 1h
+  # Native Prometheus endpoint (server metrics, events, and asynchronous metrics) on
+  # port 9363 of every replica. Scrape each pod rather than the Service: replicas
+  # report independent replication and merge state. Off by default; enabling it on an
+  # existing install changes the CHI, so the operator rolls the ClickHouse pods.
+  metrics:
+    enabled: false
   hostname: ""    # if set, adds external-dns.alpha.kubernetes.io/hostname annotation
   service:
     type: ClusterIP
