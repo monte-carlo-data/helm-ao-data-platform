@@ -393,10 +393,16 @@ spec:
     # load-bearing chart behavior, not optional tuning.
     podTemplates:
       - name: clickhouse
+        {{- /* User annotations (e.g. scraper opt-in) plus the chart-owned backup
+           revision, which wins on a key collision. */ -}}
+        {{- $podAnnotations := deepCopy (.Values.clickhouse.podAnnotations | default dict) }}
         {{- if .Values.clickhouse.backup.enabled }}
+        {{- $_ := set $podAnnotations "backup.montecarlodata.com/password-revision" (toString .Values.clickhouse.backup.api.passwordRevision) }}
+        {{- end }}
+        {{- with $podAnnotations }}
         metadata:
           annotations:
-            backup.montecarlodata.com/password-revision: {{ .Values.clickhouse.backup.api.passwordRevision | quote }}
+            {{- toYaml . | nindent 12 }}
         {{- end }}
         spec:
           {{- if .Values.clickhouse.backup.enabled }}

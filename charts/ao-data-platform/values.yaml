@@ -279,6 +279,10 @@ clickhouse:
   # existing install changes the CHI, so the operator rolls the ClickHouse pods.
   metrics:
     enabled: false
+  # Extra annotations on the ClickHouse pods, e.g. the opt-in annotations an
+  # annotation-driven scraper reads (prometheus.io/scrape, prometheus.io/port: "9363").
+  # Changing them rolls the ClickHouse pods.
+  podAnnotations: {}
   hostname: ""    # if set, adds external-dns.alpha.kubernetes.io/hostname annotation
   service:
     type: ClusterIP
@@ -389,6 +393,10 @@ keeper:
     #     podSelector:
     #       matchLabels:
     #         app.kubernetes.io/name: prometheus
+  # Extra annotations on the Keeper pods, e.g. the opt-in annotations an
+  # annotation-driven scraper reads (prometheus.io/scrape, prometheus.io/port: "9363").
+  # Changing them rolls the Keeper pods.
+  podAnnotations: {}
   # Keeper four-letter-word admin commands, exposed unauthenticated on the client port.
   # Trimmed from Keeper's built-in default — which includes cluster-affecting commands
   # like rcvr (force recovery mode) and rqld (request leadership) — down to the liveness

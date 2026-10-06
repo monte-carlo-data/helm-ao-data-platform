@@ -75,6 +75,11 @@ spec:
   templates:
     podTemplates:
       - name: keeper
+        {{- with .Values.keeper.podAnnotations }}
+        metadata:
+          annotations:
+            {{- toYaml . | nindent 12 }}
+        {{- end }}
         spec:
           # `image` is required whenever this podTemplate emits a containers[] entry —
           # the Altinity operator does not merge container spec defaults (same as the
