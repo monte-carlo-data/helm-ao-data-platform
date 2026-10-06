@@ -5,6 +5,7 @@ Set HELM to use a Helm binary outside PATH.
 """
 
 import copy
+import tempfile
 import unittest
 
 import yaml
@@ -148,6 +149,43 @@ class KeeperMetricsTests(unittest.TestCase):
         for key, document in by_key(self.default).items():
             if key not in {("ClickHouseKeeperInstallation", "otel"), ("NetworkPolicy", "keeper-otel")}:
                 self.assertEqual(document, enabled[key], key)
+
+
+SCRAPE_ANNOTATIONS = {"prometheus.io/scrape": "true", "prometheus.io/port": "9363"}
+REVISION_ANNOTATION = "backup.montecarlodata.com/password-revision"
+
+
+def render_annotations(component_annotations, backup=False):
+    """Render with podAnnotations passed through a values file, keeping every value a string."""
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml") as values:
+        yaml.safe_dump({component: {"podAnnotations": annotations}
+                        for component, annotations in component_annotations.items()}, values)
+        values.flush()
+        return chart.render(backup=backup, values_files=[values.name])
+
+
+def pod_annotations(installation):
+    return installation["spec"]["templates"]["podTemplates"][0].get("metadata", {}).get("annotations")
+
+
+class PodAnnotationTests(unittest.TestCase):
+    def test_no_annotations_by_default(self):
+        documents = render()
+        for kind in ("ClickHouseInstallation", "ClickHouseKeeperInstallation"):
+            self.assertIsNone(pod_annotations(chart.one(documents, kind)), kind)
+
+    def test_user_annotations_reach_both_pod_templates(self):
+        documents = render_annotations({"clickhouse": SCRAPE_ANNOTATIONS, "keeper": SCRAPE_ANNOTATIONS})
+        for kind in ("ClickHouseInstallation", "ClickHouseKeeperInstallation"):
+            self.assertEqual(pod_annotations(chart.one(documents, kind)), SCRAPE_ANNOTATIONS, kind)
+
+    def test_user_annotations_merge_with_the_backup_revision(self):
+        revision = pod_annotations(chart.one(chart.render(), "ClickHouseInstallation"))[REVISION_ANNOTATION]
+        documents = render_annotations({"clickhouse": {**SCRAPE_ANNOTATIONS, REVISION_ANNOTATION: "stale"}},
+                                       backup=True)
+        # The chart-owned revision wins, so a user value cannot mask a password rotation.
+        self.assertEqual(pod_annotations(chart.one(documents, "ClickHouseInstallation")),
+                         {**SCRAPE_ANNOTATIONS, REVISION_ANNOTATION: revision})
 
 
 class CollectorMetricsTests(unittest.TestCase):
