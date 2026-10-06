@@ -22,7 +22,7 @@ The ClickHouse instance ships with production hardening: a capped memory ceiling
 
 > **Chart-version bumps no longer recreate ClickHouse:** the ClickHouse operator propagates only a fixed allowlist of stable labels onto the resources it generates. A chart-version bump changes the volatile `helm.sh/chart` label, but that label is no longer stamped onto the StatefulSet's immutable `volumeClaimTemplates`, so the bump no longer forces a delete/recreate of the ClickHouse StatefulSet.
 
-> **Upgrading to 5.4.0:** optional Prometheus endpoints for ClickHouse (`clickhouse.metrics.enabled`) and Keeper (`keeper.metrics.enabled`) on port 9363. Both are off by default, and upgrading with them off leaves ClickHouse and Keeper unchanged. Enabling either changes its installation spec, so the operator rolls those pods once. With the Keeper NetworkPolicy on, Keeper metrics also require `keeper.metrics.networkPolicyFrom`. The collector no longer scrapes its own telemetry into its debug output, so the upgrade rolls the collector pods once; it still serves that telemetry on `<pod-ip>:8888`. See [Metrics endpoints](#metrics-endpoints).
+> **Upgrading to 5.4.0:** optional Prometheus endpoints for ClickHouse (`clickhouse.metrics.enabled`) and Keeper (`keeper.metrics.enabled`) on port 9363. Both are off by default, and upgrading with them off leaves ClickHouse and Keeper unchanged. Enabling either changes its installation spec, so the operator rolls those pods once. With the Keeper NetworkPolicy on, Keeper metrics also require `keeper.metrics.networkPolicyFrom`. New `clickhouse.podAnnotations` and `keeper.podAnnotations` (empty by default) carry the opt-in annotations that annotation-driven scrapers read. The collector no longer scrapes its own telemetry into its debug output, so the upgrade rolls the collector pods once; it still serves that telemetry on `<pod-ip>:8888`. See [Metrics endpoints](#metrics-endpoints).
 
 > **Upgrading to 5.2.0:** upgrading with backups disabled leaves ClickHouse unchanged. Enabling `clickhouse.backup.enabled` rolls the ClickHouse pods once, keeping their data volumes, and moves them to the backup AWS ServiceAccount; the ClickHouse server itself then has S3 write access to the backup bucket through IRSA. Enabling backups also sets `s3.use_environment_credentials=0`: ordinary `s3()` queries, S3-engine tables, and direct `BACKUP`/`RESTORE ... S3(...)` requests that depended on role or environment credentials for private S3 access will fail. The backup disk and other SQL paths retain access; see [credential changes and limits](docs/clickhouse-backups.md). It also adds an ingress NetworkPolicy selecting the ClickHouse pods, allowing the chart's database, replication, and metrics ports while restricting port 7171 to backup Jobs. Add any custom listener ports before enabling backups. Later backup container image or resource changes roll the ClickHouse pods again, and a failed backup container takes its replica out of client service. Install with the schedule paused, check prerequisites, then resume it; see [backup setup and current limitations](docs/clickhouse-backups.md).
 
@@ -245,9 +245,9 @@ writer safety here is deliberate.
 
 ClickHouse and Keeper can each serve native Prometheus metrics. Both are off by default,
 because enabling one changes the installation spec and the operator rolls those pods. The
-collector always serves its own telemetry. The chart doesn't pick a scraper or ship
-`PodMonitor`s or scrape annotations, so point whichever scraper the cluster runs at these
-pod-IP targets:
+collector always serves its own telemetry. The chart doesn't pick a scraper, ship
+`PodMonitor`s, or add scrape annotations; point whichever scraper the cluster runs at
+these pod-IP targets:
 
 | Component | Enable with | Target |
 |-----------|-------------|--------|
@@ -273,10 +273,23 @@ port, so a scraper never reaches 2181. The render fails if metrics are on with n
 listed, since the policy would block every scrape. No NetworkPolicy restricts the
 ClickHouse pods unless backups are enabled, and the backup policy already allows 9363.
 
-The collector's metrics port is not declared on its pod or Service. Scrapers that
-discover targets by annotation, Datadog autodiscovery, and an OTel `prometheus`
-receiver can scrape the pod IP directly. A Prometheus Operator `PodMonitor` needs a
-declared port or `portNumber`. The upstream switch
+How a scraper finds these pods depends on where its target-selection rule lives:
+
+- **Rule on the scraper side** (Prometheus or an OTel `prometheus` receiver using
+  Kubernetes discovery filtered by pod labels, or a Datadog check matched by container
+  image): works as shipped. The scraper's config names the pods and the port.
+- **Rule on the pod, as annotations** (the common `prometheus.io/scrape` convention used
+  by the community Prometheus chart's default pod job, Datadog's Prometheus-annotation
+  mode, or Datadog's own `ad.datadoghq.com/*` annotations): add the annotations your
+  scraper reads through `clickhouse.podAnnotations`, `keeper.podAnnotations`, and the
+  upstream `opentelemetry-collector.podAnnotations`, for example
+  `prometheus.io/scrape: "true"` and `prometheus.io/port: "9363"` (`"8888"` for the
+  collector). Changing pod annotations rolls those pods.
+- **Prometheus Operator `PodMonitor`**: selects pods by label and needs a declared
+  port. ClickHouse and Keeper declare theirs as `metrics` when enabled.
+
+The collector's metrics port is not declared on its pod or Service, so a `PodMonitor`
+for it needs `portNumber: 8888`. The upstream switch
 `opentelemetry-collector.ports.metrics.enabled: true` declares it, but it also adds
 8888 to the collector Service, which puts the collector's telemetry behind any load
 balancer in front of that Service. Leave it off when the Service is exposed outside
@@ -990,6 +1003,7 @@ helm upgrade ao-data-platform oci://registry-1.docker.io/montecarlodata/ao-data-
 | `clickhouse.authMethods.externalSecret.secretStoreRef.kind` | `ClusterSecretStore` | Kind of the bundle's secret store reference. |
 | `clickhouse.authMethods.externalSecret.refreshInterval` | `1h` | How often ESO re-syncs the bundle. |
 | `clickhouse.metrics.enabled` | `false` | Serve native Prometheus metrics on port 9363 of each replica (not on the Service). Enabling rolls the ClickHouse pods. See [Metrics endpoints](#metrics-endpoints). |
+| `clickhouse.podAnnotations` | `{}` | Extra annotations on the ClickHouse pods, e.g. scraper opt-in annotations. Merged with the backup revision annotation, which wins on a collision. Changing them rolls the pods. |
 | `clickhouse.hostname` | `""` | If set, adds `external-dns.alpha.kubernetes.io/hostname` annotation to the ClickHouse Service |
 | `clickhouse.service.type` | `ClusterIP` | ClickHouse Service type (`ClusterIP`, `LoadBalancer`) |
 | `clickhouse.service.annotations` | `{}` | Annotations on the ClickHouse Service (e.g. AWS NLB annotations) |
@@ -1004,6 +1018,7 @@ helm upgrade ao-data-platform oci://registry-1.docker.io/montecarlodata/ao-data-
 | `keeper.networkPolicy.enabled` | `true` | Ship a `NetworkPolicy` restricting Keeper ingress to the ClickHouse pods + operator (client port), Keeper peers (Raft), and, with metrics on, `keeper.metrics.networkPolicyFrom` (metrics port). Inert without a NetworkPolicy engine — see [Keeper network exposure and hardening](#keeper-network-exposure-and-hardening). |
 | `keeper.metrics.enabled` | `false` | Serve native Prometheus metrics on port 9363 of each Keeper voter. Enabling rolls the Keeper pods. With `keeper.networkPolicy.enabled`, also requires `keeper.metrics.networkPolicyFrom`. |
 | `keeper.metrics.networkPolicyFrom` | `[]` | NetworkPolicy peers (e.g. `namespaceSelector` + `podSelector`) admitted to Keeper's metrics port only, never the client port. Required when metrics and the NetworkPolicy are both on; the render fails otherwise. |
+| `keeper.podAnnotations` | `{}` | Extra annotations on the Keeper pods, e.g. scraper opt-in annotations. Changing them rolls the pods. |
 | `keeper.fourLetterWordAllowList` | `ruok,mntr,srvr,stat,conf` | Keeper four-letter-word commands served on the (unauthenticated) client port, trimmed from Keeper's broader built-in default. Must include `ruok` (liveness probe). Set `""` to fall back to Keeper's built-in default list. |
 | `llmWorker.replicaCount` | `1` | Number of `llm-worker` pods — `0` or `1` only (the template rejects `>1`; the worker has no job-claim semantics, so concurrent copies would double-process batches). Set to `0` to pause the worker declaratively (survives `helm upgrade`, unlike a manual `kubectl scale`). |
 | `llmWorker.image.repository` | `""` | Image repository for the `llm-worker` (required — e.g. `montecarlodata/ao-llm-worker`) |
