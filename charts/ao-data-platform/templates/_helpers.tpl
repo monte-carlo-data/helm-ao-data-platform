@@ -373,7 +373,7 @@ spec:
 Type normalization for values rendered into the ClickHouse and Keeper installations.
 The operator CRDs don't type-check pod, service or volume claim templates, so a
 number or bool where Kubernetes expects a string (`dedicated: true`, `--set
-...port=9363`) passes `helm upgrade`. The operator then decodes the installation into
+clickhouse.podAnnotations.prometheus\.io/port=9363`) passes `helm upgrade`. The operator then decodes the installation into
 typed Kubernetes structs, fails, and can no longer list, and so reconcile, any
 installation of that kind in its namespaces until the value is fixed. These helpers
 render the type the operator expects whatever form the user wrote, and render values
