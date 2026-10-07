@@ -21,11 +21,13 @@ HELM = os.environ.get("HELM", "helm")
 RELEASE = "ao-backup-test"
 
 
-def render(*overrides, backup=True):
+def render(*overrides, backup=True, values_files=()):
     command = [HELM, "template", RELEASE, str(CHART), "--namespace", "montecarlo",
                "-f", str(CHART / "ci/lint-values.yaml")]
     if backup:
         command += ["-f", str(CHART / "ci/backup-values.yaml")]
+    for values_file in values_files:
+        command += ["-f", str(values_file)]
     for override in overrides:
         command += ["--set", override]
     result = subprocess.run(command, text=True, capture_output=True, check=False)

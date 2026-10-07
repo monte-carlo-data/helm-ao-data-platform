@@ -1,4 +1,7 @@
 {{- if .Values.keeper.networkPolicy.enabled }}
+{{- if and .Values.keeper.metrics.enabled (not .Values.keeper.metrics.networkPolicyFrom) }}
+{{- fail "keeper.metrics.enabled is true but keeper.metrics.networkPolicyFrom is empty, so the Keeper NetworkPolicy would block every scraper. List the scraper pods in keeper.metrics.networkPolicyFrom, or set keeper.networkPolicy.enabled: false." }}
+{{- end }}
 # Network isolation for the Keeper ensemble. Keeper speaks the unauthenticated
 # ZooKeeper protocol: any pod that can reach the client port can read and write the
 # entire coordination tree (and issue the whitelisted four-letter-word commands), so
@@ -10,8 +13,11 @@
 #   - port 9182 (http_control readiness): probed by the kubelet from the node, which
 #     NetworkPolicy engines allow outside of policy; the liveness probe is a pod-local
 #     exec (ruok over loopback) and never crosses the network.
-#   - metrics: the operator configures no Keeper prometheus endpoint and its
-#     metrics-exporter monitors ClickHouse pods only.
+#
+# Metrics (port 9363, only with keeper.metrics.enabled) get their own rule admitting
+# only keeper.metrics.networkPolicyFrom, separate from the client-port rule so a
+# scraper never reaches 2181. The operator is not admitted to 9363: its
+# metrics-exporter scrapes ClickHouse pods only.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -50,4 +56,11 @@ spec:
       ports:
         - protocol: TCP
           port: 9444
+    {{- if .Values.keeper.metrics.enabled }}
+    - from:
+        {{- toYaml .Values.keeper.metrics.networkPolicyFrom | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: {{ int (include "ao-data-platform.clickhousePorts" . | fromJson).metrics }}
+    {{- end }}
 {{- end }}

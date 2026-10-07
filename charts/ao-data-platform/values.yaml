@@ -273,6 +273,17 @@ clickhouse:
         name: ""
         kind: ""
       refreshInterval: 1h
+  # Native Prometheus endpoint (server metrics, events, and asynchronous metrics) on
+  # port 9363 of every replica. Scrape each pod rather than the Service: replicas
+  # report independent replication and merge state. Off by default; enabling it on an
+  # existing install changes the CHI, so the operator rolls the ClickHouse pods.
+  metrics:
+    enabled: false
+  # Extra annotations on the ClickHouse pods, e.g. the opt-in annotations an
+  # annotation-driven scraper reads (prometheus.io/scrape, prometheus.io/port: "9363").
+  # Changing them rolls the ClickHouse pods. Keys under backup.montecarlodata.com/
+  # are chart-managed and fail the render.
+  podAnnotations: {}
   hostname: ""    # if set, adds external-dns.alpha.kubernetes.io/hostname annotation
   service:
     type: ClusterIP
@@ -359,13 +370,34 @@ keeper:
   # any pod that can reach the client port (2181) gets read/write on the entire
   # coordination tree — and network isolation (not protocol auth) is the standard
   # production posture for Keeper/ZooKeeper ensembles. This ships a NetworkPolicy
-  # restricting Keeper ingress to the ClickHouse server pods, the operator, and the
-  # Keeper Raft peers (see templates/keeper-networkpolicy.yaml). Enabled by default:
+  # restricting Keeper ingress to the ClickHouse server pods, the operator, the
+  # Keeper Raft peers, and (with metrics.enabled) metrics.networkPolicyFrom on 9363
+  # only (see templates/keeper-networkpolicy.yaml). Enabled by default:
   # on clusters without a NetworkPolicy engine the policy object is inert, so there is
   # no keeper-less-secure mode to opt into by accident. Disable only if the policy
   # conflicts with the cluster's CNI.
   networkPolicy:
     enabled: true
+  # Native Prometheus endpoint on port 9363 of every Keeper voter. Off by default;
+  # enabling it on an existing install changes the CHK, so the operator rolls the
+  # Keeper pods. With networkPolicy.enabled, list the scraper pods in
+  # networkPolicyFrom (NetworkPolicy peers, e.g. podSelector/namespaceSelector).
+  # They are admitted to 9363 only, never to the client port. The render fails if
+  # metrics and the policy are both on with no peers, since nothing could scrape.
+  metrics:
+    enabled: false
+    networkPolicyFrom: []
+    # networkPolicyFrom:
+    #   - namespaceSelector:
+    #       matchLabels:
+    #         kubernetes.io/metadata.name: monitoring
+    #     podSelector:
+    #       matchLabels:
+    #         app.kubernetes.io/name: prometheus
+  # Extra annotations on the Keeper pods, e.g. the opt-in annotations an
+  # annotation-driven scraper reads (prometheus.io/scrape, prometheus.io/port: "9363").
+  # Changing them rolls the Keeper pods.
+  podAnnotations: {}
   # Keeper four-letter-word admin commands, exposed unauthenticated on the client port.
   # Trimmed from Keeper's built-in default — which includes cluster-affecting commands
   # like rcvr (force recovery mode) and rqld (request leadership) — down to the liveness
@@ -650,13 +682,6 @@ opentelemetry-collector:
               cert_file: /tls/otel/tls.crt
               key_file: /tls/otel/tls.key
               reload_interval: 10m
-      prometheus:
-        config:
-          scrape_configs:
-            - job_name: otel-collector
-              scrape_interval: 30s
-              static_configs:
-                - targets: ["${env:MY_POD_IP}:8888"]
 
     processors:
       memory_limiter:
@@ -701,6 +726,12 @@ opentelemetry-collector:
           receivers: [otlp]
           processors: [memory_limiter, batch]
           exporters: [clickhouse]
+        # The subchart's default metrics pipeline also lists its `prometheus`
+        # receiver, which scrapes the collector's own telemetry into the debug
+        # exporter. Lists replace rather than merge, so this drops the self-scrape.
+        # Scrape <pod-ip>:8888 from outside instead (see the README).
+        metrics:
+          receivers: [otlp]
       telemetry:
         logs:
           level: info
