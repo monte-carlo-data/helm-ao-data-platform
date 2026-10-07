@@ -204,8 +204,6 @@ class PodAnnotationTests(unittest.TestCase):
                          {**SCRAPE_ANNOTATIONS, REVISION_ANNOTATION: revision})
 
     def test_chart_owned_backup_annotations_are_rejected(self):
-        # Backup Jobs read the revision annotation to confirm every pod loaded the
-        # current API password; a pinned user copy would block every backup.
         for backup in (True, False):
             with self.subTest(backup=backup):
                 with self.assertRaisesRegex(AssertionError, "backup.montecarlodata.com/"):
