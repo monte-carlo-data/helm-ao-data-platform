@@ -156,7 +156,7 @@ REVISION_ANNOTATION = "backup.montecarlodata.com/password-revision"
 
 
 def render_annotations(component_annotations, backup=False):
-    """Render with podAnnotations passed through a values file, keeping every value a string."""
+    """Render with podAnnotations passed through a values file, as users set them."""
     with tempfile.NamedTemporaryFile("w", suffix=".yaml") as values:
         yaml.safe_dump({component: {"podAnnotations": annotations}
                         for component, annotations in component_annotations.items()}, values)
@@ -178,6 +178,24 @@ class PodAnnotationTests(unittest.TestCase):
         documents = render_annotations({"clickhouse": SCRAPE_ANNOTATIONS, "keeper": SCRAPE_ANNOTATIONS})
         for kind in ("ClickHouseInstallation", "ClickHouseKeeperInstallation"):
             self.assertEqual(pod_annotations(chart.one(documents, kind)), SCRAPE_ANNOTATIONS, kind)
+
+    def test_non_string_annotation_values_render_as_strings(self):
+        # The operator decodes these into ObjectMeta, whose annotations are strings;
+        # a number or bool stops it from listing any installation.
+        expected = {"prometheus.io/port": "9363", "prometheus.io/scrape": "true"}
+        from_file = render_annotations({component: {"prometheus.io/port": 9363, "prometheus.io/scrape": True}
+                                        for component in ("clickhouse", "keeper")})
+        for kind in ("ClickHouseInstallation", "ClickHouseKeeperInstallation"):
+            self.assertEqual(pod_annotations(chart.one(from_file, kind)), expected, f"values file, {kind}")
+
+    def test_non_string_annotation_overrides_render_as_strings(self):
+        expected = {"prometheus.io/port": "9363", "prometheus.io/scrape": "true"}
+        overrides = [f"{component}.podAnnotations.prometheus\\.io/{key}={value}"
+                     for component in ("clickhouse", "keeper")
+                     for key, value in (("port", "9363"), ("scrape", "true"))]
+        documents = render(*overrides)
+        for kind in ("ClickHouseInstallation", "ClickHouseKeeperInstallation"):
+            self.assertEqual(pod_annotations(chart.one(documents, kind)), expected, f"--set, {kind}")
 
     def test_user_annotations_merge_with_the_backup_revision(self):
         revision = pod_annotations(chart.one(chart.render(), "ClickHouseInstallation"))[REVISION_ANNOTATION]

@@ -75,7 +75,13 @@ spec:
   templates:
     podTemplates:
       - name: keeper
-        {{- with .Values.keeper.podAnnotations }}
+        {{- /* Values are converted to strings: the operator decodes them into pod
+           metadata, and a number or bool stops it from reconciling. */ -}}
+        {{- $podAnnotations := dict }}
+        {{- range $key, $value := (.Values.keeper.podAnnotations | default dict) }}
+        {{- $_ := set $podAnnotations $key (toString $value) }}
+        {{- end }}
+        {{- with $podAnnotations }}
         metadata:
           annotations:
             {{- toYaml . | nindent 12 }}
