@@ -5,7 +5,6 @@ Set HELM to use a Helm binary outside PATH.
 """
 
 import copy
-import tempfile
 import unittest
 
 import yaml
@@ -159,11 +158,8 @@ REVISION_ANNOTATION = "backup.montecarlodata.com/password-revision"
 
 def render_annotations(component_annotations, backup=False):
     """Render with podAnnotations passed through a values file, as users set them."""
-    with tempfile.NamedTemporaryFile("w", suffix=".yaml") as values:
-        yaml.safe_dump({component: {"podAnnotations": annotations}
-                        for component, annotations in component_annotations.items()}, values)
-        values.flush()
-        return chart.render(backup=backup, values_files=[values.name])
+    return chart.render(backup=backup, values={component: {"podAnnotations": annotations}
+                                               for component, annotations in component_annotations.items()})
 
 
 def pod_annotations(installation):

@@ -4,6 +4,7 @@ Run after `helm dependency build charts/ao-data-platform` with PyYAML installed.
 Set HELM to use a Helm binary outside PATH. All credentials here are fake.
 """
 
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -21,16 +22,23 @@ HELM = os.environ.get("HELM", "helm")
 RELEASE = "ao-backup-test"
 
 
-def render(*overrides, backup=True, values_files=()):
+def render(*overrides, backup=True, values_files=(), values=None):
+    """Render the chart; `values` is written to a temporary file passed as the last -f."""
     command = [HELM, "template", RELEASE, str(CHART), "--namespace", "montecarlo",
                "-f", str(CHART / "ci/lint-values.yaml")]
     if backup:
         command += ["-f", str(CHART / "ci/backup-values.yaml")]
     for values_file in values_files:
         command += ["-f", str(values_file)]
-    for override in overrides:
-        command += ["--set", override]
-    result = subprocess.run(command, text=True, capture_output=True, check=False)
+    with contextlib.ExitStack() as stack:
+        if values is not None:
+            values_file = stack.enter_context(tempfile.NamedTemporaryFile("w", suffix=".yaml"))
+            yaml.safe_dump(values, values_file)
+            values_file.flush()
+            command += ["-f", values_file.name]
+        for override in overrides:
+            command += ["--set", override]
+        result = subprocess.run(command, text=True, capture_output=True, check=False)
     if result.returncode:
         raise AssertionError(result.stderr)
     return [doc for doc in yaml.safe_load_all(result.stdout) if doc]
