@@ -15,9 +15,9 @@
 #     exec (ruok over loopback) and never crosses the network.
 #
 # Metrics (port 9363, only with keeper.metrics.enabled) get their own rule admitting
-# only keeper.metrics.networkPolicyFrom. It is kept separate from the client-port rule
-# so a scraper never gains access to 2181. The operator's metrics-exporter monitors
-# ClickHouse pods only.
+# only keeper.metrics.networkPolicyFrom, separate from the client-port rule so a
+# scraper never reaches 2181. The operator is not admitted to 9363: its
+# metrics-exporter scrapes ClickHouse pods only.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

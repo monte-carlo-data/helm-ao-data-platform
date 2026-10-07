@@ -393,11 +393,11 @@ spec:
     # load-bearing chart behavior, not optional tuning.
     podTemplates:
       - name: clickhouse
-        {{- /* User annotations (e.g. scraper opt-in) plus the chart-owned backup
-           revision. Backup Jobs read that annotation to confirm every pod loaded the
-           current API password, so a user-pinned copy would block all backups. Values
-           are converted to strings: the operator decodes them into pod metadata, and
-           a number or bool stops it from reconciling. */ -}}
+        {{- /* The chart owns backup.montecarlodata.com/ keys: backup Jobs read the
+           revision annotation to confirm every pod loaded the current API password,
+           so a user-pinned copy would block all backups. Values are converted to
+           strings: the operator decodes them into pod metadata, and a number or bool
+           stops it from reconciling. */ -}}
         {{- $podAnnotations := dict }}
         {{- range $key, $value := (.Values.clickhouse.podAnnotations | default dict) }}
         {{- if hasPrefix "backup.montecarlodata.com/" $key }}
