@@ -395,16 +395,14 @@ spec:
       - name: clickhouse
         {{- /* The chart owns backup.montecarlodata.com/ keys: backup Jobs read the
            revision annotation to confirm every pod loaded the current API password,
-           so a user-pinned copy would block all backups. Values are converted to
-           strings: the operator decodes them into pod metadata, and a number or bool
-           stops it from reconciling. */ -}}
-        {{- $podAnnotations := dict }}
-        {{- range $key, $value := (.Values.clickhouse.podAnnotations | default dict) }}
+           so a user-pinned copy would block all backups. Values become strings; see
+           ao-data-platform.stringMap. */ -}}
+        {{- range $key, $_ := .Values.clickhouse.podAnnotations }}
         {{- if hasPrefix "backup.montecarlodata.com/" $key }}
         {{- fail (printf "clickhouse.podAnnotations must not set %s: the chart manages backup.montecarlodata.com/ annotations. Remove it from your values." $key) }}
         {{- end }}
-        {{- $_ := set $podAnnotations $key (toString $value) }}
         {{- end }}
+        {{- $podAnnotations := include "ao-data-platform.stringMap" .Values.clickhouse.podAnnotations | fromYaml }}
         {{- if .Values.clickhouse.backup.enabled }}
         {{- $_ := set $podAnnotations "backup.montecarlodata.com/password-revision" (toString .Values.clickhouse.backup.api.passwordRevision) }}
         {{- end }}
@@ -474,7 +472,7 @@ spec:
           # entry — the Altinity operator does not merge container spec defaults.
           containers:
             - name: clickhouse
-              image: {{ .Values.clickhouse.image }}
+              image: {{ include "ao-data-platform.yamlString" .Values.clickhouse.image }}
               {{- if .Values.clickhouse.metrics.enabled }}
               ports:
                 - name: metrics
@@ -540,11 +538,11 @@ spec:
             {{- end }}
           {{- with .Values.clickhouse.nodeSelector }}
           nodeSelector:
-            {{- toYaml . | nindent 12 }}
+            {{- include "ao-data-platform.stringMap" . | nindent 12 }}
           {{- end }}
           {{- with .Values.clickhouse.tolerations }}
           tolerations:
-            {{- toYaml . | nindent 12 }}
+            {{- include "ao-data-platform.tolerations" . | nindent 12 }}
           {{- end }}
           # Hard AZ spread — replicas land in distinct zones. Unlike the CHK's
           # spread (clickhouse-keeper-installation.yaml), this one is strict and
@@ -581,10 +579,10 @@ spec:
           {{- if or .Values.clickhouse.service.annotations .Values.clickhouse.hostname }}
           annotations:
             {{- with .Values.clickhouse.service.annotations }}
-            {{- toYaml . | nindent 12 }}
+            {{- include "ao-data-platform.stringMap" . | nindent 12 }}
             {{- end }}
             {{- if .Values.clickhouse.hostname }}
-            external-dns.alpha.kubernetes.io/hostname: {{ .Values.clickhouse.hostname }}
+            external-dns.alpha.kubernetes.io/hostname: {{ include "ao-data-platform.yamlString" .Values.clickhouse.hostname }}
             {{- end }}
           {{- else }}
           {}
@@ -613,7 +611,7 @@ spec:
       - name: data
         spec:
           {{- if .Values.clickhouse.storageClass }}
-          storageClassName: {{ .Values.clickhouse.storageClass }}
+          storageClassName: {{ include "ao-data-platform.yamlString" .Values.clickhouse.storageClass }}
           {{- end }}
           accessModes:
             - ReadWriteOnce
