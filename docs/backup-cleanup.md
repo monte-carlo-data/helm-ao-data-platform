@@ -58,11 +58,15 @@ example, this report keeps a full backup and its incremental, and proposes
 removing one older full backup:
 
 ```text
-Backup cleanup: {"mode":"dry-run","keep_last":2,"keep_days":0,"kept_count":2,"delete_count":1,"deleted_count":0,"broken_local_count":0,"local_only_count":0}
-Backup cleanup entry: {"list":"kept","name":"ao-otel-full-20260102T000000Z-4567abcd"}
-Backup cleanup entry: {"list":"kept","name":"ao-otel-incremental-20260102T040000Z-89abcdef"}
-Backup cleanup entry: {"list":"delete","name":"ao-otel-full-20260101T000000Z-0123abcd"}
+Backup cleanup: {"broken_local_count": 0, "delete_count": 1, "deleted_count": 0, "keep_days": 0, "keep_last": 2, "kept_count": 2, "local_only_count": 0, "mode": "dry-run"}
+Backup cleanup entry: {"list": "kept", "name": "ao-otel-full-20260102T000000Z-4567abcd"}
+Backup cleanup entry: {"list": "kept", "name": "ao-otel-incremental-20260102T040000Z-89abcdef"}
+Backup cleanup entry: {"list": "delete", "name": "ao-otel-full-20260101T000000Z-0123abcd"}
 ```
+
+For scripts or alerts, parse the text after `Backup cleanup: ` or
+`Backup cleanup entry: ` as JSON and read its fields. Do not match exact spacing
+or key order; those may change.
 
 `delete` entries are proposals in removal order; `deleted_count` is always zero.
 Every name is written separately, so the growing candidate list does not make

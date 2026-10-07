@@ -142,7 +142,9 @@ class Cleaner:
                 if state not in ("success", "error", "cancel") or not isinstance(command, str) or not command:
                     raise BackupError("Cleanup stopped: a copy is busy or its action history is unreadable.")
                 if command.startswith("delete ") and state != "success":
-                    raise BackupError("Cleanup stopped: a previous deletion failed; inspect it first.")
+                    raise BackupError("Cleanup stopped: a previous deletion failed or was cancelled; "
+                                      "it blocks previews until it leaves the action history "
+                                      "(see docs/backup-cleanup.md).")
 
     def snapshot(self):
         self.idle()
@@ -165,7 +167,6 @@ class Cleaner:
 
     def unchanged(self, remote, local):
         # Do not report a retention decision from a catalog that changed while read.
-        self.idle()
         for index in range(len(self.apis)):
             if (catalog(self.request(index, "GET", "/backup/list/remote"), "remote") != remote
                     or catalog(self.request(index, "GET", "/backup/list/local"), "local", remote) != local[index]):
