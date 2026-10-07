@@ -1,6 +1,4 @@
-{{/* Ports used by backup config, Services, NetworkPolicy, TLS, and scheduler endpoints.
-   `metrics` also sets the Prometheus endpoint and container port on both the
-   ClickHouse and Keeper pods, and the Keeper NetworkPolicy's scraper rule. */}}
+{{/* Ports used by backup config, Services, NetworkPolicy, TLS, and scheduler endpoints. */}}
 {{- define "ao-data-platform.clickhousePorts" -}}
 {{- dict "http" 8123 "https" 8443 "tcp" 9000 "tcpSecure" 9440 "interserver" 9009 "metrics" 9363 | toJson -}}
 {{- end -}}

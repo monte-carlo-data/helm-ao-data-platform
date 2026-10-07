@@ -71,8 +71,9 @@ class ClickHouseMetricsTests(unittest.TestCase):
         del container(stripped, "clickhouse")["ports"]
         self.assertEqual(stripped, self.chi_off)
 
-        enabled = by_key(self.enabled)
-        for key, document in by_key(self.default).items():
+        default, enabled = by_key(self.default), by_key(self.enabled)
+        self.assertEqual(enabled.keys(), default.keys())
+        for key, document in default.items():
             if key[0] != "ClickHouseInstallation":
                 self.assertEqual(document, enabled[key], key)
 
@@ -145,8 +146,9 @@ class KeeperMetricsTests(unittest.TestCase):
         self.assertEqual(keeper_settings(documents)["prometheus/port"], "9363")
 
     def test_enabling_changes_only_keeper_objects(self):
-        enabled = by_key(self.enabled)
-        for key, document in by_key(self.default).items():
+        default, enabled = by_key(self.default), by_key(self.enabled)
+        self.assertEqual(enabled.keys(), default.keys())
+        for key, document in default.items():
             if key not in {("ClickHouseKeeperInstallation", "otel"), ("NetworkPolicy", "keeper-otel")}:
                 self.assertEqual(document, enabled[key], key)
 
