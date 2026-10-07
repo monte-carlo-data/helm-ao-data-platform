@@ -75,16 +75,10 @@ spec:
   templates:
     podTemplates:
       - name: keeper
-        {{- /* Values are converted to strings: the operator decodes them into pod
-           metadata, and a number or bool stops it from reconciling. */ -}}
-        {{- $podAnnotations := dict }}
-        {{- range $key, $value := (.Values.keeper.podAnnotations | default dict) }}
-        {{- $_ := set $podAnnotations $key (toString $value) }}
-        {{- end }}
-        {{- with $podAnnotations }}
+        {{- with .Values.keeper.podAnnotations }}
         metadata:
           annotations:
-            {{- toYaml . | nindent 12 }}
+            {{- include "ao-data-platform.stringMap" . | nindent 12 }}
         {{- end }}
         spec:
           # `image` is required whenever this podTemplate emits a containers[] entry —
@@ -93,7 +87,7 @@ spec:
           # container (`clickhouse-keeper`).
           containers:
             - name: clickhouse-keeper
-              image: {{ .Values.keeper.image }}
+              image: {{ include "ao-data-platform.yamlString" .Values.keeper.image }}
               {{- if .Values.keeper.metrics.enabled }}
               ports:
                 - name: metrics
@@ -106,11 +100,11 @@ spec:
               {{- end }}
           {{- with .Values.keeper.nodeSelector }}
           nodeSelector:
-            {{- toYaml . | nindent 12 }}
+            {{- include "ao-data-platform.stringMap" . | nindent 12 }}
           {{- end }}
           {{- with .Values.keeper.tolerations }}
           tolerations:
-            {{- toYaml . | nindent 12 }}
+            {{- include "ao-data-platform.tolerations" . | nindent 12 }}
           {{- end }}
           # Hard AZ spread — by default one voter per zone. There is no cluster
           # autoscaler in the target environment, so the per-AZ Keeper node groups
@@ -160,7 +154,7 @@ spec:
       - name: keeper-data
         spec:
           {{- if .Values.keeper.storageClass }}
-          storageClassName: {{ .Values.keeper.storageClass }}
+          storageClassName: {{ include "ao-data-platform.yamlString" .Values.keeper.storageClass }}
           {{- end }}
           accessModes:
             - ReadWriteOnce
