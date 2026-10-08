@@ -86,6 +86,17 @@ clickhouse:
       resources:
         requests: {cpu: 25m, memory: 32Mi}
         limits: {memory: 128Mi}
+    cleanup:
+      # Preview checks every configured ClickHouse copy; all must be reachable.
+      enabled: false
+      # Preview only: stock clickhouse-backup 2.8.1 cannot safely remove native files.
+      # When cleanup is enabled, any value but true is rejected; this chart never deletes backups.
+      dryRun: true
+      keepLast: 2
+      # Also keep every backup from the last N days, plus their bases.
+      # 0 disables the age window so only keepLast applies. Use 30 for real data.
+      keepDays: 0
+      timeoutSeconds: 1800
   storageClass: ""
   storageSize: 100Gi
   # Data retention, in days, for the telemetry tables — the raw traces, the

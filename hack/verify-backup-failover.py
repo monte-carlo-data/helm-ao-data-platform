@@ -56,8 +56,12 @@ sent = []
 try:
     expected = os.environ["VERIFY_EXPECTED_FULL"]
     timeout = int(os.environ["VERIFY_TIMEOUT_SECONDS"])
+    common_path = Path("/scripts/backup_common.py")
+    common_sha = hashlib.sha256(common_path.read_bytes()).hexdigest() if common_path.is_file() else "absent"
     check(hashlib.sha256(Path("/scripts/run_backup.py").read_bytes()).hexdigest()
-          == os.environ["VERIFY_SCRIPT_SHA256"], "The installed scheduler changed after preparation.")
+          == os.environ["VERIFY_SCRIPT_SHA256"]
+          and common_sha == os.environ["VERIFY_COMMON_SHA256"],
+          "The installed scheduler changed after preparation.")
     now = window()
     endpoints = json.loads(os.environ["BACKUP_ENDPOINTS"])
     check(len(endpoints) == 2 and endpoints[0] != endpoints[1], "Two distinct backup endpoints are required.")
@@ -188,11 +192,15 @@ def prepare(args, now):
     config_name = next(v["configMap"]["name"] for v in pod["volumes"] if v["name"] == "script")
     config = json.loads(kubectl(args, "get", "configmap", config_name, "-o", "json"))
     script_sha = hashlib.sha256(config["data"]["run_backup.py"].encode()).hexdigest()
+    # Chart 5.2.0 has one script; later charts share helpers in a second file.
+    # Record absence too, so adding the shared file after preparation is detected.
+    common = config["data"].get("backup_common.py")
+    common_sha = hashlib.sha256(common.encode()).hexdigest() if common is not None else "absent"
     container["command"] = ["python3", "-c", POD_SCRIPT]
     container.pop("args", None)
     container["env"].extend({"name": key, "value": value} for key, value in {
         "VERIFY_EXPECTED_FULL": args.expected_full, "VERIFY_TIMEOUT_SECONDS": str(args.timeout_seconds),
-        "VERIFY_SCRIPT_SHA256": script_sha}.items())
+        "VERIFY_SCRIPT_SHA256": script_sha, "VERIFY_COMMON_SHA256": common_sha}.items())
     job_spec.update(backoffLimit=0, activeDeadlineSeconds=args.timeout_seconds)
     for key in ("selector", "manualSelector", "ttlSecondsAfterFinished"):
         job_spec.pop(key, None)
@@ -248,7 +256,8 @@ def main():
                             and job.get("status", {}).get("succeeded") == 1)
                 summary = dict(evidence[0], job=args.job_name, context=args.context, namespace=args.namespace,
                                started=job["status"].get("startTime"), completed=job["status"].get("completionTime"),
-                               scheduler_sha256=next(e["value"] for e in manifest["spec"]["template"]["spec"]["containers"][0]["env"] if e["name"] == "VERIFY_SCRIPT_SHA256"))
+                               scheduler_sha256=next(e["value"] for e in manifest["spec"]["template"]["spec"]["containers"][0]["env"] if e["name"] == "VERIFY_SCRIPT_SHA256"),
+                               common_sha256=next(e["value"] for e in manifest["spec"]["template"]["spec"]["containers"][0]["env"] if e["name"] == "VERIFY_COMMON_SHA256"))
                 if not complete:
                     summary.update(status="inconclusive", reason="The Job did not finish successfully. Stop and inspect; do not rerun automatically.")
                 with open(directory / (args.job_name + ".evidence.json"), "x", opener=lambda p, f: os.open(p, f, 0o600)) as output:

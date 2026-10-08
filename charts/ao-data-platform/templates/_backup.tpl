@@ -1,6 +1,8 @@
 {{- define "ao-data-platform.backupValidate" -}}
 {{- $b := .Values.clickhouse.backup -}}
+{{- if not (kindIs "bool" $b.cleanup.enabled) -}}{{- fail "clickhouse.backup.cleanup.enabled must be a boolean." -}}{{- end -}}
 {{- if $b.enabled -}}
+{{- if or (not (regexMatch "^[0-9]+$" (toString .Values.clickhouse.replicasCount))) (lt (int .Values.clickhouse.replicasCount) 1) -}}{{- fail "clickhouse.replicasCount must be a positive integer when backups are enabled." -}}{{- end -}}
 {{- if ne $b.provider "aws" -}}{{- fail "clickhouse.backup.provider currently supports only aws." -}}{{- end -}}
 {{- range $key := list "bucket" "region" "roleArn" "path" -}}
 {{- if not (index $b.aws $key) -}}{{- fail (printf "clickhouse.backup.aws.%s is required." $key) -}}{{- end -}}
@@ -33,6 +35,15 @@
 {{- fail "clickhouse.backup.networkPolicy.additionalPorts must contain TCP ports from 1 to 65535, excluding the protected backup port 7171." -}}
 {{- end -}}
 {{- end -}}
+{{- if $b.cleanup.enabled -}}
+{{- if ne (toString $b.cleanup.dryRun) "true" -}}{{- fail "Backup deletion is unavailable with stock clickhouse-backup 2.8.1; cleanup.dryRun must remain true." -}}{{- end -}}
+{{- range $key, $minimum := dict "keepLast" 1 "keepDays" 0 "timeoutSeconds" 60 -}}
+{{- $value := index $b.cleanup $key -}}
+{{- if or (not (regexMatch "^[0-9]+$" (toString $value))) (lt (int $value) $minimum) -}}{{- fail (printf "clickhouse.backup.cleanup.%s must be an integer >= %d." $key $minimum) -}}{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- else -}}
+{{- if $b.cleanup.enabled -}}{{- fail "Backup cleanup requires clickhouse.backup.enabled." -}}{{- end -}}
 {{- end -}}
 {{- end -}}
 
