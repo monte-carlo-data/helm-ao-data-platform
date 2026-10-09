@@ -18,7 +18,6 @@ import http.client
 import json
 import os
 from pathlib import Path
-import re
 import socket
 import ssl
 import sys
@@ -26,11 +25,13 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import uuid
+
+
+from backup_common import (BackupError, DELETION_UNAVAILABLE, REQUEST_TIMEOUT_SECONDS,
+                           SCHEDULED_NAME, broken_local_entry, scheduled_name)
 
 
 TABLES = "otel_traces.*"
-FULL_NAME = re.compile(r"ao-otel-full-(\d{8}T\d{6}Z)-[0-9a-f]{8}\Z")
 REVISION_ANNOTATION = "backup.montecarlodata.com/password-revision"
 REPLICA_QUERY = """SELECT t.database AS database, t.name AS table, t.engine AS engine,
     r.table AS replica_table, r.is_readonly AS is_readonly,
@@ -41,10 +42,6 @@ FROM system.tables AS t LEFT JOIN system.replicas AS r
 WHERE t.database = 'otel_traces' AND startsWith(t.engine, 'Replicated')
 SETTINGS output_format_json_quote_64bit_integers = 0
 FORMAT JSONEachRow"""
-
-
-class BackupError(Exception):
-    """A safe-to-log failure message, without server bodies or credentials."""
 
 
 class RevisionError(BackupError):
@@ -106,7 +103,7 @@ class API:
             headers={"Authorization": self.authorization, "Accept": "application/json"},
         )
         try:
-            with self.opener.open(request, timeout=30) as response:
+            with self.opener.open(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
                 payload = response.read(32 * 1024 * 1024 + 1)
             if len(payload) > 32 * 1024 * 1024:
                 raise BackupError("Backup API response exceeded the size limit.")
@@ -295,25 +292,17 @@ def full_base(catalog, now):
     candidates = []
     for row in catalog:
         name = row.get("name", "")
-        match = FULL_NAME.fullmatch(name) if isinstance(name, str) else None
-        if (not match or row.get("location") != "remote"
+        match = SCHEDULED_NAME.fullmatch(name) if isinstance(name, str) else None
+        if (not match or match[1] != "full" or row.get("location") != "remote"
                 or row.get("desc") != "directory, embedded" or row.get("required") != ""):
             continue
         try:
-            created = datetime.strptime(match[1], "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+            created = datetime.strptime(match[2], "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
         except ValueError:
             continue
         if created.date() == now.date() and created <= now:
             candidates.append((created, row["name"]))
     return max(candidates)[1] if candidates else None
-
-
-def broken_local_entry(row):
-    """Recognize the two incomplete-metadata descriptions emitted by v2.8.1."""
-    desc = row.get("desc")
-    return (row.get("location") == "local" and row.get("required") == ""
-            and isinstance(desc, str)
-            and (desc == "broken metadata.json not found" or desc.startswith("parse metadata.json error: ")))
 
 
 class Scheduler:
@@ -487,7 +476,7 @@ class Scheduler:
         now = now or datetime.now(timezone.utc)
         index, api, base = self.choose_copy(now)
         kind = "incremental" if base else "full"
-        name = f"ao-otel-{kind}-{now:%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:8]}"
+        name = scheduled_name(kind, now)
         print(f"Starting {kind} backup {name} on ClickHouse copy {index}.", flush=True)
         if base:
             self.prepare_base(api, base)
@@ -508,6 +497,18 @@ class Scheduler:
         return name
 
 
+def report_cleanup(result):
+    """Keep each log line small without omitting any name or changing its order."""
+    lists = ("kept", "delete", "deleted", "broken_local", "local_only")
+    summary = {key: result[key] for key in ("mode", "keep_last", "keep_days")}
+    summary.update({key + "_count": len(result[key]) for key in lists})
+    print("Backup cleanup: " + json.dumps(summary, sort_keys=True), flush=True)
+    for key in lists:
+        for entry in result[key]:
+            item = entry if isinstance(entry, dict) else {"name": entry}
+            print("Backup cleanup entry: " + json.dumps({"list": key, **item}, sort_keys=True), flush=True)
+
+
 def main():
     try:
         timeout = int(os.environ.get("BACKUP_TIMEOUT_SECONDS", "10800"))
@@ -515,14 +516,37 @@ def main():
         if timeout <= 0 or poll_seconds <= 0:
             raise BackupError("Backup timeout and polling interval must be positive seconds.")
         options = configured_options()
+        cleanup_enabled = os.environ.get("BACKUP_CLEANUP_ENABLED", "false") == "true"
+        if cleanup_enabled and os.environ.get("BACKUP_CLEANUP_DRY_RUN", "true") != "true":
+            raise BackupError(DELETION_UNAVAILABLE)
         apis, probes = configured_clients()
-        Scheduler(apis, probes, timeout, poll_seconds, **options).run()
-        return 0
+        name = Scheduler(apis, probes, timeout, poll_seconds, **options).run()
     except (KeyError, ValueError, OSError):
         print("Backup failed: check scheduler settings and the mounted password file.", file=sys.stderr)
+        return 1
     except BackupError as error:
         print(f"Backup failed: {error}", file=sys.stderr)
-    return 1
+        return 1
+
+    if cleanup_enabled:
+        # This report runs after a verified upload. Its failure must not turn
+        # that successful backup into a failed Job or invite another upload.
+        try:
+            from cleanup_backups import Cleaner
+            cleaner = Cleaner(apis, keep_last=int(os.environ.get("BACKUP_KEEP_LAST", "2")),
+                              keep_days=int(os.environ.get("BACKUP_KEEP_DAYS", "0")),
+                              timeout=int(os.environ.get("BACKUP_CLEANUP_TIMEOUT_SECONDS", "1800")))
+            result = cleaner.run(latest_backup=name, execute=False)
+            report_cleanup(result)
+            if result["broken_local"] or result["local_only"]:
+                print("Backup cleanup preview found local files needing attention; "
+                      "see broken_local and local_only in the report. No files were deleted.", file=sys.stderr)
+        except (KeyError, ValueError, OSError):
+            print("Backup cleanup preview stopped: check cleanup settings; the backup already completed.",
+                  file=sys.stderr)
+        except BackupError as error:
+            print(f"Backup cleanup preview stopped: {error}", file=sys.stderr)
+    return 0
 
 
 if __name__ == "__main__":

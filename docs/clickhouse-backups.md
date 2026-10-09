@@ -250,14 +250,16 @@ the first operation might still be running. Check the job and backup-container
 logs before retrying; concurrent or automatic retries could duplicate work.
 `schedule.timeoutSeconds` bounds the scheduler's wait (60 to 14400 seconds,
 default 10800). Kubernetes separately sets the Job's `activeDeadlineSeconds` to
-that value plus 60 seconds. These limits start from different events: scheduler
+that value plus 60 seconds and, when cleanup is enabled, `cleanup.timeoutSeconds`.
+These limits start from different events: scheduler
 startup and Job start, respectively. The stock tool requires its own ClickHouse
 timeout of four hours.
 Ending the Job does not cancel server-side work; check for a running operation
 before retrying. With `concurrencyPolicy: Forbid`, a Job that outlasts the cron interval causes scheduled
 runs to be skipped; leave time between the timeout and the next run.
 At the default four-hour interval, `timeoutSeconds` of 14340 or more leaves no
-gap before the Job deadline reaches that interval. Allow time for startup and
+gap before the Job deadline reaches that interval even with cleanup disabled.
+When cleanup is enabled, include its timeout in the total too. Allow time for startup and
 scheduling delays as well. A successful empty operation-status response means
 the backup process has lost the record, for example after a restart; the job
 stops with an explanation rather than waiting until the deadline. Inspect the
@@ -270,6 +272,24 @@ AWS permissions or network rules. Follow [the live backup test steps](verify-cli
 and record backup names and results in your change record. The copy-switch helper
 requires exactly two replicas and an idle, unsuspended CronJob with schedule
 `0 */4 * * *` in UTC; it does not support custom schedules.
+
+## Optional retention previews (5.3.0+)
+
+Enable `clickhouse.backup.cleanup.enabled` to report which older backups fall
+outside `keepLast` and `keepDays` after each verified backup. It is disabled by
+default. The report preserves every required base and unrelated remote backup.
+Every configured copy must be available and report matching remote catalogs;
+single-copy clusters are supported too. Known incomplete
+local entries and scheduler-owned local files without remote backups are listed
+separately; no files are removed. Other preview errors log
+`Backup cleanup preview stopped:` and leave the successful backup Job successful.
+
+Keep `cleanup.dryRun: true` when cleanup is enabled: this chart does not delete
+backups, and changing the image cannot enable deletion. See
+[why deletion is unavailable](backup-cleanup.md#why-deletion-is-unavailable)
+for the upstream limitation and [retention previews](backup-cleanup.md) for
+configuration and checks. The Job deadline includes `cleanup.timeoutSeconds`,
+so allow time for both backup and preview before the next scheduled run.
 
 ## Current limitations
 
@@ -292,21 +312,22 @@ requires exactly two replicas and an idle, unsuspended CronJob with schedule
   still needs enough disk space. Do not convert an existing data volume as part
   of enabling backups.
   Bucket lifecycle rules are separate and must not expire either backup prefix.
-  If manual pruning is necessary, check dependencies in the catalog first. For
-  this scheduler's usual daily chains, remove the whole UTC day's full and its
-  dependent incrementals, never the full alone. Manual backups can depend on an
-  older day's full; retain the base until every backup depending on it is removed.
-  Production enablement should wait for tested retention that removes selected
-  remote backups first, then their local pointer directories on every copy,
-  while preserving every backup still needed by a retained backup. The cleanup
-  work in https://github.com/monte-carlo-data/helm-ao-data-platform/pull/30 must
-  include that local cleanup. A preview alone does not limit this growth.
+  The cleanup preview in 5.3.0 does not limit this growth. On a copy with a
+  matching local backup, manual `delete remote` removes the remote catalog
+  prefix and leaves native S3 data for a later local deletion. That later step
+  skips native JSON files in 2.8.1. This chart has no supported retention or
+  local-pruning procedure; do not treat manual catalog removal as freeing S3
+  space. See [why deletion is unavailable](backup-cleanup.md#why-deletion-is-unavailable)
+  and [local files in the report](backup-cleanup.md#local-files-in-the-report).
 - **Restore is not yet supported or documented.** A successful backup Job is not
   proof that a restore works. The scheduled configuration disables cluster-wide
   backup/restore. Embedded mode ignores `restore_schema_on_cluster`; a separate
   administrator configuration and a tested restore procedure are still needed.
-- **No backup alerts.** Watch for failed `otel-backup` Jobs and check that expected
-  scheduled Jobs complete. A missing run may not produce a failed Job.
+- **No backup alerts.** Watch for failed `otel-backup` Jobs and for expected
+  scheduled Jobs that never ran; a skipped run produces no failed Job. Cleanup
+  preview problems do not fail a Job after a verified backup: watch for log
+  lines starting `Backup cleanup preview stopped:` and for the local-files
+  warning. This chart does not send alerts for those conditions.
 - **Freshness checks are a point-in-time check.** They exclude replicas with
   missing or delayed data before backup submission; pod Ready alone is not used.
   They do not prove that a restore succeeds or make concurrent writes a global
