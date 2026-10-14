@@ -188,14 +188,42 @@ class TolerationTests(unittest.TestCase):
         for kind in COMPONENTS.values():
             self.assertEqual(pod_spec(documents, kind)["tolerations"], tolerations, kind)
 
+    def test_zero_seconds_render_as_an_integer(self):
+        # 0 is falsy in templates, so a truthiness check would pass it through untouched.
+        for component, kind in COMPONENTS.items():
+            with self.subTest(kind=kind):
+                documents = render(values={component: {"tolerations": [
+                    {"key": "dedicated", "operator": "Exists", "effect": "NoExecute", "tolerationSeconds": 0},
+                ]}})
+                seconds = pod_spec(documents, kind)["tolerations"][0]["tolerationSeconds"]
+                self.assertIs(type(seconds), int)
+                self.assertEqual(seconds, 0)
+
     def test_non_integer_seconds_fail_the_render(self):
         # Converting "3OO" would give 0, which evicts immediately on a NoExecute taint.
+        # The message names the list, since both components share the helper.
         for component in COMPONENTS:
             with self.subTest(component=component):
-                with self.assertRaisesRegex(AssertionError, 'tolerationSeconds must be an integer, got "3OO"'):
+                with self.assertRaisesRegex(
+                        AssertionError,
+                        f'{component}\\.tolerations\\[1\\]\\.tolerationSeconds must be an integer, got "3OO"'):
                     render(values={component: {"tolerations": [
+                        {"key": "pool", "operator": "Exists", "effect": "NoSchedule"},
                         {"key": "dedicated", "operator": "Exists", "effect": "NoExecute", "tolerationSeconds": "3OO"},
                     ]}})
+
+    def test_empty_and_false_seconds_fail_the_render(self):
+        # Both are falsy in templates, so a truthiness check would render them as-is,
+        # and the operator can't decode either into an integer.
+        for component in COMPONENTS:
+            for value in ("", False):
+                with self.subTest(component=component, seconds=value):
+                    with self.assertRaisesRegex(
+                            AssertionError, f"{component}\\.tolerations\\[0\\]\\.tolerationSeconds must be an integer"):
+                        render(values={component: {"tolerations": [
+                            {"key": "dedicated", "operator": "Exists", "effect": "NoExecute",
+                             "tolerationSeconds": value},
+                        ]}})
 
 
 class ScalarTests(unittest.TestCase):

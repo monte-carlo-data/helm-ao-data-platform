@@ -104,7 +104,7 @@ spec:
           {{- end }}
           {{- with .Values.keeper.tolerations }}
           tolerations:
-            {{- include "ao-data-platform.tolerations" . | nindent 12 }}
+            {{- include "ao-data-platform.tolerations" (dict "tolerations" . "path" "keeper.tolerations") | nindent 12 }}
           {{- end }}
           # Hard AZ spread — by default one voter per zone. There is no cluster
           # autoscaler in the target environment, so the per-AZ Keeper node groups

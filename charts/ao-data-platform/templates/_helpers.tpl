@@ -422,22 +422,25 @@ long strings at spaces, which would break the field's indentation; those are quo
 
 {{/*
 A tolerations list as YAML, with `value` as a string and `tolerationSeconds` as an
-integer. Absent and null fields are left as they are: an Exists toleration must not
-gain a value. A non-integer tolerationSeconds fails the render rather than becoming 0,
-which would evict pods immediately on a NoExecute taint. The integer is parsed in
-base 10, so "0300" is 300 rather than octal 192.
+integer. Takes a dict: `tolerations`, the list, and `path`, its values path for error
+messages. Absent and null fields are left as they are: an Exists toleration must not
+gain a value. Any other tolerationSeconds that is not an integer, including "" and
+false, fails the render rather than reaching the operator, which can't decode it, or
+becoming 0, which would evict pods immediately on a NoExecute taint. The integer is
+parsed in base 10, so "0300" is 300 rather than octal 192.
 */}}
 {{- define "ao-data-platform.tolerations" -}}
+{{- $path := .path -}}
 {{- $tolerations := list -}}
-{{- range . -}}
-{{- $toleration := deepCopy . -}}
+{{- range $index, $entry := .tolerations -}}
+{{- $toleration := deepCopy $entry -}}
 {{- if not (kindIs "invalid" $toleration.value) -}}
 {{- $_ := set $toleration "value" (include "ao-data-platform.scalarString" $toleration.value) -}}
 {{- end -}}
-{{- with $toleration.tolerationSeconds -}}
-{{- $seconds := include "ao-data-platform.scalarString" . -}}
+{{- if and (hasKey $toleration "tolerationSeconds") (not (kindIs "invalid" $toleration.tolerationSeconds)) -}}
+{{- $seconds := include "ao-data-platform.scalarString" $toleration.tolerationSeconds -}}
 {{- if not (regexMatch "^-?[0-9]+$" $seconds) -}}
-{{- fail (printf "tolerationSeconds must be an integer, got %q." $seconds) -}}
+{{- fail (printf "%s[%d].tolerationSeconds must be an integer, got %q." $path $index $seconds) -}}
 {{- end -}}
 {{- $_ := set $toleration "tolerationSeconds" (atoi $seconds) -}}
 {{- end -}}

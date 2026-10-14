@@ -542,7 +542,7 @@ spec:
           {{- end }}
           {{- with .Values.clickhouse.tolerations }}
           tolerations:
-            {{- include "ao-data-platform.tolerations" . | nindent 12 }}
+            {{- include "ao-data-platform.tolerations" (dict "tolerations" . "path" "clickhouse.tolerations") | nindent 12 }}
           {{- end }}
           # Hard AZ spread — replicas land in distinct zones. Unlike the CHK's
           # spread (clickhouse-keeper-installation.yaml), this one is strict and
