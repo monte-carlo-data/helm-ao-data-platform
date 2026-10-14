@@ -90,8 +90,12 @@ def keeper_settings(documents):
     return chart.one(documents, "ClickHouseKeeperInstallation")["spec"]["configuration"].get("settings")
 
 
+def keeper_policy(documents):
+    return chart.one(documents, "NetworkPolicy", "keeper-otel")
+
+
 def keeper_ingress(documents):
-    return chart.one(documents, "NetworkPolicy", "keeper-otel")["spec"]["ingress"]
+    return keeper_policy(documents)["spec"]["ingress"]
 
 
 def rule_ports(rule):
@@ -128,14 +132,22 @@ class KeeperMetricsTests(unittest.TestCase):
             PROMETHEUS_SETTINGS)
 
     def test_scrapers_reach_metrics_but_never_the_client_port(self):
-        default_rules = keeper_ingress(self.default)
         rules = keeper_ingress(self.enabled)
-        self.assertEqual(rules[:len(default_rules)], default_rules)
+        # The metrics rule is appended; the rest of the policy matches the default.
+        stripped = copy.deepcopy(keeper_policy(self.enabled))
+        stripped["spec"]["ingress"].pop()
+        self.assertEqual(stripped, keeper_policy(self.default))
         metrics_rules = [rule for rule in rules if 9363 in rule_ports(rule)]
         self.assertEqual(metrics_rules, [{"from": SCRAPERS, "ports": [{"protocol": "TCP", "port": 9363}]}])
         client_rules = [rule for rule in rules if 2181 in rule_ports(rule)]
         self.assertEqual(len(client_rules), 1)
         self.assertNotIn(SCRAPERS[0], client_rules[0]["from"])
+
+    def test_scrapers_alone_do_not_open_the_metrics_port(self):
+        # The rule is gated on keeper.metrics.enabled, not on networkPolicyFrom.
+        documents = render(SCRAPERS_OVERRIDE, SCRAPERS_POD_OVERRIDE)
+        self.assertFalse([rule for rule in keeper_ingress(documents) if 9363 in rule_ports(rule)])
+        self.assertEqual(keeper_policy(documents), keeper_policy(self.default))
 
     def test_enabling_without_scrapers_fails_while_the_policy_is_on(self):
         with self.assertRaisesRegex(AssertionError, "keeper.metrics.networkPolicyFrom is empty"):
@@ -146,6 +158,14 @@ class KeeperMetricsTests(unittest.TestCase):
         self.assertEqual(keeper_settings(documents)["prometheus/port"], "9363")
 
     def test_enabling_changes_only_keeper_objects(self):
+        # Strip exactly what the flag adds; everything else must match the default.
+        stripped = copy.deepcopy(self.chk_on)
+        settings = stripped["spec"]["configuration"]["settings"]
+        for key in PROMETHEUS_SETTINGS:
+            del settings[key]
+        del container(stripped, "clickhouse-keeper")["ports"]
+        self.assertEqual(stripped, self.chk_off)
+
         default, enabled = by_key(self.default), by_key(self.enabled)
         self.assertEqual(enabled.keys(), default.keys())
         for key, document in default.items():
@@ -206,10 +226,12 @@ class PodAnnotationTests(unittest.TestCase):
                          {**SCRAPE_ANNOTATIONS, REVISION_ANNOTATION: revision})
 
     def test_chart_owned_backup_annotations_are_rejected(self):
-        for backup in (True, False):
-            with self.subTest(backup=backup):
-                with self.assertRaisesRegex(AssertionError, "backup.montecarlodata.com/"):
-                    render_annotations({"clickhouse": {REVISION_ANNOTATION: "rev-1"}}, backup=backup)
+        # The whole prefix is reserved, not just the revision key the chart sets today.
+        for key in (REVISION_ANNOTATION, "backup.montecarlodata.com/anything"):
+            for backup in (True, False):
+                with self.subTest(key=key, backup=backup):
+                    with self.assertRaisesRegex(AssertionError, "backup.montecarlodata.com/"):
+                        render_annotations({"clickhouse": {key: "rev-1"}}, backup=backup)
 
 
 class CollectorMetricsTests(unittest.TestCase):

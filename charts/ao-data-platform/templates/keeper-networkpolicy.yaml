@@ -1,6 +1,6 @@
 {{- if .Values.keeper.networkPolicy.enabled }}
 {{- if and .Values.keeper.metrics.enabled (not .Values.keeper.metrics.networkPolicyFrom) }}
-{{- fail "keeper.metrics.enabled is true but keeper.metrics.networkPolicyFrom is empty, so the Keeper NetworkPolicy would block every scraper. List the scraper pods in keeper.metrics.networkPolicyFrom, or set keeper.networkPolicy.enabled: false." }}
+{{- fail "keeper.metrics.enabled is true but keeper.metrics.networkPolicyFrom is empty, so the Keeper NetworkPolicy would block every scraper. List the scraper pods in keeper.metrics.networkPolicyFrom." }}
 {{- end }}
 # Network isolation for the Keeper ensemble. Keeper speaks the unauthenticated
 # ZooKeeper protocol: any pod that can reach the client port can read and write the
