@@ -221,6 +221,20 @@ class PodAnnotationTests(unittest.TestCase):
         self.assertEqual(pod_annotations(chart.one(documents, "ClickHouseInstallation")),
                          {**SCRAPE_ANNOTATIONS, REVISION_ANNOTATION: revision})
 
+    def test_null_annotations_are_dropped(self):
+        revision = pod_annotations(chart.one(chart.render(), "ClickHouseInstallation"))[REVISION_ANNOTATION]
+        documents = render_annotations({component: {"keep": 1, "drop": None}
+                                        for component in ("clickhouse", "keeper")}, backup=True)
+        self.assertEqual(pod_annotations(chart.one(documents, "ClickHouseInstallation")),
+                         {"keep": "1", REVISION_ANNOTATION: revision})
+        self.assertEqual(pod_annotations(chart.one(documents, "ClickHouseKeeperInstallation")), {"keep": "1"})
+
+    def test_all_null_annotations_keep_the_backup_revision(self):
+        revision = pod_annotations(chart.one(chart.render(), "ClickHouseInstallation"))[REVISION_ANNOTATION]
+        documents = render_annotations({"clickhouse": {"drop": None}}, backup=True)
+        self.assertEqual(pod_annotations(chart.one(documents, "ClickHouseInstallation")),
+                         {REVISION_ANNOTATION: revision})
+
     def test_chart_owned_backup_annotations_are_rejected(self):
         # The whole prefix is reserved, not just the revision key the chart sets today.
         for key in (REVISION_ANNOTATION, "backup.montecarlodata.com/anything"):

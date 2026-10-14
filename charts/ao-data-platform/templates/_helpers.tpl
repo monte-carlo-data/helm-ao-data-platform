@@ -391,7 +391,9 @@ a values-file number as in exponent form from 1e6 up (2592000 becomes "2.592e+06
 {{/*
 stringMap: a map (annotations, nodeSelector) with every value as a string, as YAML.
 Null values are dropped, not rendered as "<nil>": Helm keeps a null on a key the
-chart doesn't default, and null is how users unset one.
+chart doesn't default, and null is how users unset one. A map left empty renders as
+nothing rather than `{}`, because callers gate on the raw map and may append their own
+entries below this output.
 */}}
 {{- define "ao-data-platform.stringMap" -}}
 {{- $strings := dict -}}
@@ -400,7 +402,7 @@ chart doesn't default, and null is how users unset one.
 {{- $_ := set $strings $key (include "ao-data-platform.scalarString" $value) -}}
 {{- end -}}
 {{- end -}}
-{{- toYaml $strings -}}
+{{- with $strings }}{{ toYaml . }}{{ end -}}
 {{- end }}
 
 {{/*

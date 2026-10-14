@@ -74,6 +74,14 @@ class ServiceAnnotationTests(unittest.TestCase):
             self.assertEqual(service_annotations(documents),
                              {"external-dns.alpha.kubernetes.io/hostname": "2"})
 
+    def test_all_null_annotations_leave_only_the_hostname(self):
+        # A layered values file unsets an annotation with null. When that empties
+        # the map, the hostname must still render as the only annotation.
+        documents = render(values={"clickhouse": {"hostname": "ch.example.com",
+                                                  "service": {"annotations": {"foo": None}}}})
+        self.assertEqual(service_annotations(documents),
+                         {"external-dns.alpha.kubernetes.io/hostname": "ch.example.com"})
+
 
 class NodeSelectorTests(unittest.TestCase):
     EXPECTED = {"dedicated": "true", "pool-generation": "2"}
@@ -97,6 +105,14 @@ class NodeSelectorTests(unittest.TestCase):
                              for key, value in (("dedicated", "true"), ("pool-generation", "2"))])
         for kind in COMPONENTS.values():
             self.assertEqual(pod_spec(documents, kind)["nodeSelector"], self.EXPECTED, kind)
+
+    def test_null_values_are_dropped(self):
+        documents = render(values={component: {"nodeSelector": {"keep": True, "drop": None}}
+                                   for component in COMPONENTS})
+        for kind in COMPONENTS.values():
+            node_selector = pod_spec(documents, kind)["nodeSelector"]
+            self.assertEqual(node_selector["keep"], "true", kind)
+            self.assertNotIn("drop", node_selector, kind)
 
 
 class TolerationTests(unittest.TestCase):
