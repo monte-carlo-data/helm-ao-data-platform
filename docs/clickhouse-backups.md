@@ -229,7 +229,9 @@ the same namespace. A cluster with working NetworkPolicy enforcement is required
 other policies selecting these pods can also grant access. The API additionally
 requires its password. Selecting the ClickHouse pods also denies other ingress
 unless a rule allows it: the chart preserves its database, replication, and
-metrics ports. Add custom listener ports to
+metrics ports. Those rules allow all sources, so with
+`clickhouse.metrics.enabled` the Prometheus endpoint on 9363 is reachable from
+any pod; see [Metrics endpoints](../README.md#metrics-endpoints). Add custom listener ports to
 `clickhouse.backup.networkPolicy.additionalPorts`; these ports are open
 to all sources; the chart rejects port 7171 in that list.
 

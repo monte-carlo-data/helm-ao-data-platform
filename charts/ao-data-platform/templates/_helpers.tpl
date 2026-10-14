@@ -368,3 +368,78 @@ spec:
     {{- end }}
   {{- end }}
 {{- end }}
+
+{{/*
+Type normalization for values rendered into the ClickHouse and Keeper installations.
+The operator CRDs don't type-check pod, service or volume claim templates, so a
+number or bool where Kubernetes expects a string (`dedicated: true`, or
+`--set clickhouse.podAnnotations.prometheus\.io/port=9363`) passes `helm upgrade`.
+The operator then decodes the installation into typed Kubernetes structs, fails, and
+can no longer list, and so reconcile, any installation of that kind in its
+namespaces until the value is fixed. These helpers render the type the operator
+expects whatever form the user wrote, and render values that already have it
+byte-for-byte as plain `toYaml` would, so upgrades roll no pods.
+
+scalarString: a scalar as text. Sprig `toString` prints the float64 that Helm decodes
+a values-file number as in exponent form from 1e6 up (2592000 becomes "2.592e+06");
+`toJson` prints it as plain digits. Strings pass through unchanged.
+*/}}
+{{- define "ao-data-platform.scalarString" -}}
+{{- if kindIs "string" . }}{{ . }}{{ else }}{{ toJson . }}{{ end -}}
+{{- end }}
+
+{{/*
+stringMap: a map (annotations, nodeSelector) with every value as a string, as YAML.
+Null values are dropped, not rendered as "<nil>": Helm keeps a null on a key the
+chart doesn't default, and null is how users unset one.
+*/}}
+{{- define "ao-data-platform.stringMap" -}}
+{{- $strings := dict -}}
+{{- range $key, $value := . -}}
+{{- if not (kindIs "invalid" $value) -}}
+{{- $_ := set $strings $key (include "ao-data-platform.scalarString" $value) -}}
+{{- end -}}
+{{- end -}}
+{{- toYaml $strings -}}
+{{- end }}
+
+{{/*
+A scalar as a YAML string on one line, for `key: {{ include ... }}` positions. toYaml
+quotes only what YAML would otherwise read as another type ("2", "true"), but folds
+long strings at spaces, which would break the field's indentation; those are quoted.
+*/}}
+{{- define "ao-data-platform.yamlString" -}}
+{{- $text := include "ao-data-platform.scalarString" . -}}
+{{- $yaml := toYaml $text -}}
+{{- if contains "\n" $yaml -}}
+{{- $text | quote -}}
+{{- else -}}
+{{- $yaml -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+A tolerations list as YAML, with `value` as a string and `tolerationSeconds` as an
+integer. Absent and null fields are left as they are: an Exists toleration must not
+gain a value. A non-integer tolerationSeconds fails the render rather than becoming 0,
+which would evict pods immediately on a NoExecute taint. The integer is parsed in
+base 10, so "0300" is 300 rather than octal 192.
+*/}}
+{{- define "ao-data-platform.tolerations" -}}
+{{- $tolerations := list -}}
+{{- range . -}}
+{{- $toleration := deepCopy . -}}
+{{- if not (kindIs "invalid" $toleration.value) -}}
+{{- $_ := set $toleration "value" (include "ao-data-platform.scalarString" $toleration.value) -}}
+{{- end -}}
+{{- with $toleration.tolerationSeconds -}}
+{{- $seconds := include "ao-data-platform.scalarString" . -}}
+{{- if not (regexMatch "^-?[0-9]+$" $seconds) -}}
+{{- fail (printf "tolerationSeconds must be an integer, got %q." $seconds) -}}
+{{- end -}}
+{{- $_ := set $toleration "tolerationSeconds" (atoi $seconds) -}}
+{{- end -}}
+{{- $tolerations = append $tolerations $toleration -}}
+{{- end -}}
+{{- toYaml $tolerations -}}
+{{- end }}
