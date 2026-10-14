@@ -1,0 +1,12 @@
+{{- include "ao-data-platform.backupValidate" . -}}
+{{- if .Values.clickhouse.backup.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ao-data-platform.chiName" . }}-backup-startup
+  labels:
+    {{- include "ao-data-platform.labels" . | nindent 4 }}
+data:
+  start-backup.sh: |
+    {{- .Files.Get "files/clickhouse-backup/start-backup.sh" | nindent 4 }}
+{{- end }}

@@ -1065,7 +1065,7 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHECK 37 — Zone spread: replicas/voters across distinct zones (shared; see lib/verify-common.sh)
+# CHECK 37 — Zone/node spread (shared; see lib/verify-common.sh)
 # ─────────────────────────────────────────────────────────────────────────────
 verify_zone_spread
 

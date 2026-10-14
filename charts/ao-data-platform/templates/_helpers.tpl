@@ -263,14 +263,17 @@ grants indent. Call with the root context (`.`).
 {{- end }}
 
 {{/*
-The enabled ClickHouse users that carry a password, as a JSON array of
+The main ClickHouse users that carry a password, as a JSON array of
 {ch: <ClickHouse user name>, cfg: <values block>}. Consumed only by
 authMethodsExternalSecret below; the CHI's users.d fragment
 (templates/clickhouse-installation.yaml) hardcodes its own user elements and never
 reads this helper — the CI lint job (.circleci/config.yml) is what holds the two in
 sync. A drift means a user gets an `incl` with no matching substitution and
 ClickHouse rejects an empty <auth_methods>.
-Adding a ClickHouse user? Add it in all of: this helper, values.yaml, the
+Backup and backup_probe have isolated XML stores and deliberately stay outside
+this bundle: a backup credential lookup must not stall other users' rotation.
+Their user entries are defined in templates/backup-external-secret.yaml.
+Adding a main ClickHouse user? Add it in all of: this helper, values.yaml, the
 $extSecrets list in templates/external-secret.yaml, the users.d fragment in
 templates/clickhouse-installation.yaml, and the user lists in .circleci/config.yml.
 */}}

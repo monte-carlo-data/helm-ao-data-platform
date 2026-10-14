@@ -2,6 +2,10 @@
 
 Helm chart for the Monte Carlo data plane for Agent Observability.
 
+Optional scheduled ClickHouse backups are available in chart 5.2.0. See
+[backup setup and checks](docs/clickhouse-backups.md). They are disabled by default;
+restore is not yet documented.
+
 ## Chart
 
 ### ao-data-platform
@@ -18,6 +22,14 @@ The ClickHouse instance ships with production hardening: a capped memory ceiling
 
 > **Chart-version bumps no longer recreate ClickHouse:** the ClickHouse operator propagates only a fixed allowlist of stable labels onto the resources it generates. A chart-version bump changes the volatile `helm.sh/chart` label, but that label is no longer stamped onto the StatefulSet's immutable `volumeClaimTemplates`, so the bump no longer forces a delete/recreate of the ClickHouse StatefulSet.
 
+> **Upgrading to 5.3.0:** optional backup retention previews report proposed removals with `cleanup.dryRun: true`. They are disabled by default, and this chart does not delete backups. Upgrading from 5.2.0 with the same settings does not restart ClickHouse or Keeper pods; the cleanup changes affect the backup Job scripts and CronJob. A failed preview is reported separately and does not fail an already verified backup. See [cleanup previews](docs/backup-cleanup.md) before enabling.
+>
+> **Upgrading to 5.2.0:** upgrading with backups disabled leaves ClickHouse unchanged. Enabling `clickhouse.backup.enabled` rolls the ClickHouse pods once, keeping their data volumes, and moves them to the backup AWS ServiceAccount; the ClickHouse server itself then has S3 write access to the backup bucket through IRSA. Enabling backups also sets `s3.use_environment_credentials=0`: ordinary `s3()` queries, S3-engine tables, and direct `BACKUP`/`RESTORE ... S3(...)` requests that depended on role or environment credentials for private S3 access will fail. The backup disk and other SQL paths retain access; see [credential changes and limits](docs/clickhouse-backups.md). It also adds an ingress NetworkPolicy selecting the ClickHouse pods, allowing the chart's database, replication, and metrics ports while restricting port 7171 to backup Jobs. Add any custom listener ports before enabling backups. Later backup container image or resource changes roll the ClickHouse pods again, and a failed backup container takes its replica out of client service. Install with the schedule paused, check prerequisites, then resume it; see [backup setup and current limitations](docs/clickhouse-backups.md).
+
+> Enabling backups also sets `fsGroup: 101` so the backup container can write to the shared data volume. The first restart may walk existing files to update permissions, extending startup on a large volume; a single-copy installation is unavailable during that restart. `OnRootMismatch` skips that work only when the volume root already has the required group and permissions, subject to the storage driver's behavior. Local backup pointer files keep growing on this same volume; check space and available file entries on every copy. A cleanup preview does not stop that growth. See [local disk growth](docs/backup-cleanup.md#local-disk-growth-and-future-deletion).
+>
+> **Upgrading to 5.1.0:** the Keeper zone spread gains an explicit reduced-HA opt-out and a per-node hardening. `keeper.zoneSpread.minDomains` (default: unset = `replicasCount`, the existing one-voter-per-zone guarantee) lets clusters with fewer zones than voters schedule anyway — e.g. 3 voters on a 2-AZ cluster pack 2+1 (`maxSkew: 1` still forbids 3+0, and `DoNotSchedule` stays). This is a deliberate weaker posture, not a tuning knob: **losing the AZ holding 2 voters drops the ensemble below quorum**, turning ClickHouse readonly until that AZ recovers — a 3-AZ ensemble survives any single-AZ loss. The CHK pod template also gains required pod anti-affinity on `kubernetes.io/hostname` (one voter per node), so co-zoned voters can't share a node where one node failure would cost two of them. That podTemplate change **rolls the Keeper voters once** on upgrade (one at a time; each re-syncs from the Raft quorum — safe, but not a no-op). This affects no cluster on 4.3.0 or later: the zone floor already forces distinct zones, hence distinct nodes, so the roll lands each voter back where it was. The only way to hit the new rule is a pre-4.3.0 install upgrading directly with the opt-out set in the same step — its co-located voters then stick `Pending` on the roll until the packed AZ has enough eligible nodes (the same node-group + PVC procedure as the 4.3.0 note below).
+>
 > **Upgrading to 5.0.0:** a breaking major release — the ClickHouse SQL users leave the CHI `users:` spec for a static `users.d` fragment whose auth is substituted from an ESO-assembled secret, so each user can hold two valid passwords during a rotation. The upgrade rolls ClickHouse **once** (the pod template gains the auth-methods secret mount); every rotation after that is restartless. Direct consumers who set `clickhouse.<user>.externalSecret` need **no value changes**; consumers who patched the CHI `users:` spec must move their changes into the fragment — see [Upgrading to 5.0.0](#upgrading-to-500--users-leave-the-chi-users-spec).
 >
 > **Upgrading to 4.6.0:** adds the conversation turn rollup schema — the turn columns on `conversations_normalized`, the `conversation_rollup_watermarks` cursor table, and the `spans_normalized.ingested_at` arrival stamp — and grants the `monte_carlo` user INSERT on the two new-write tables (`conversations_normalized` and `conversation_rollup_watermarks`), plus `READ ON REMOTE` and `SYSTEM SYNC REPLICA` on `conversations_normalized`, for the Monte Carlo-side rollup writer, which requires this version or later. Mind the rollback direction: the schema is applied state and survives a rollback, but the grants are release state, re-rendered from the deployed chart. A `helm rollback` below 4.6.0 revokes that whole grant set — the INSERTs, the cluster reads (the writer's ledger anti-join, cursor read and duplicate assertion all go through `clusterAllReplicas`), and the exact-guarantee sync — while the tables and any written turns remain: the writer starts failing ACCESS_DENIED against a cluster whose schema is intact, and only the verify scripts' grant assertions see it.
@@ -82,16 +94,36 @@ rather than ClickHouse's built-in `{uuid}` default.
   eligible nodes — 3 voters tolerate losing one; use `1` for dev. `minDomains` (below)
   requires one zone per voter, so odd is not license to go above the AZ count: 3 voters
   in 3 AZs is fine, but 5 voters in a 3-AZ region — which pre-4.3.0 just packed as
-  2/2/1 — no longer schedules, and the excess stays `Pending` permanently.
+  2/2/1 — no longer schedules, and the excess stays `Pending` permanently (unless
+  `keeper.zoneSpread.minDomains` opts down — see below).
 - **Hard per-AZ spread:** the CHK pod template applies a `DoNotSchedule` topology spread on
-  `topology.kubernetes.io/zone` with `minDomains` set to the voter count, so a 3-voter
-  ensemble demands schedulable nodes in three distinct zones. `minDomains` is what enforces
+  `topology.kubernetes.io/zone` with `minDomains` by default set to the voter count, so a
+  3-voter ensemble demands schedulable nodes in three distinct zones. `minDomains` is what enforces
   it: `maxSkew: 1` alone would let all voters pack into a single eligible zone — a zone with
   no eligible node is not a zero-count domain, it is not a domain at all — so without it an
   under-zoned ensemble co-locates silently. A voter with no zone to land in stays `Pending`
   — expected on single-AZ or local clusters; set `keeper.replicasCount: 1` there. The spread
   is deliberately hard: packing two voters into one AZ would forfeit the ensemble's
   single-AZ-failure tolerance.
+- **Reduced-HA opt-out for under-zoned clusters:** `keeper.zoneSpread.minDomains` lowers
+  the zone floor below the voter count when the cluster simply doesn't have enough AZs —
+  e.g. 3 voters with `minDomains: 2` on a 2-AZ cluster schedule 2+1 (`maxSkew: 1` still
+  forces the flattest packing the zones allow, never 3+0, and the spread stays
+  `DoNotSchedule`). Understand what is being traded away: **losing the AZ that holds 2 of
+  the 3 voters drops the ensemble below quorum**, and ClickHouse turns readonly until that
+  AZ recovers — whereas the default one-per-zone layout survives any single-AZ loss. Prefer
+  a third zone whenever one exists; use the opt-out only when the topology genuinely can't
+  provide one. Values outside `1..replicasCount` fail at render time.
+- **One voter per node, always:** the CHK pod template also carries required pod
+  anti-affinity on `kubernetes.io/hostname`, so no two voters share a node and a single
+  node failure costs at most one voter. Anti-affinity, deliberately not a hostname
+  topology spread: spread constraints enforce balance, not distinctness — once every
+  eligible node holds a voter, a second voter on an occupied node is within `maxSkew: 1`
+  and packs silently, whereas anti-affinity leaves it `Pending` until a voter-free node
+  exists. Under the default zone spread the rule is implied (distinct zones ⇒ distinct
+  nodes); under the opt-out it is what keeps the co-zoned voters apart — with 2+1 across
+  two AZs, any single *node* failure still leaves a quorum of 2. The 2-voter AZ therefore
+  needs (at least) two eligible nodes, or its second voter waits `Pending`.
 - Keeper persists only coordination metadata (Raft log + snapshots), so its PVCs are small
   (`keeper.storageSize`, default `10Gi`) and a replaced voter re-syncs from the quorum.
 - Pin voters to dedicated nodes with `keeper.nodeSelector` / `keeper.tolerations`, same
@@ -414,7 +446,7 @@ helm upgrade --install ao-data-platform charts/ao-data-platform/ -n montecarlo -
 
 For a full post-deploy check, run `hack/verify-deployment-aws.sh -n <namespace> -r <region>` —
 it verifies pods, ClickHouse, the OTel collector, certs, zone spread (replicas/voters in
-distinct AZs), and the NLB/DNS endpoints.
+enough distinct AZs — honoring `keeper.zoneSpread.minDomains` — and on distinct nodes), and the NLB/DNS endpoints.
 
 ## Deploying to Azure (AKS)
 
@@ -483,7 +515,7 @@ with `kubectl get gateway,httproute,certificate -n montecarlo`.
 
 For a full post-deploy check, run `hack/verify-deployment-azure.sh -n <namespace>` — it
 auto-detects gateway vs internal-LB mode and verifies pods, ClickHouse, the OTel collector,
-certs, zone spread (replicas/voters in distinct AZs), and (in gateway mode) the
+certs, zone spread (replicas/voters in enough distinct AZs — honoring `keeper.zoneSpread.minDomains` — and on distinct nodes), and (in gateway mode) the
 Gateway/HTTPRoute/BackendTLSPolicy resources.
 
 ## Deploying to GCP (GKE)
@@ -559,25 +591,50 @@ enabling the gateway with `tls.enabled=false` fails the render. Verify with
 
 For a full post-deploy check, run `hack/verify-deployment-gcp.sh -n <namespace>` — it verifies
 pods, ClickHouse, the OTel collector, certs, StorageClass, zone spread (replicas/voters in
-distinct AZs), and the Gateway/HTTPRoute/BackendTLSPolicy + GCPBackendPolicy/HealthCheckPolicy
+enough distinct AZs — honoring `keeper.zoneSpread.minDomains` — and on distinct nodes), and the Gateway/HTTPRoute/BackendTLSPolicy + GCPBackendPolicy/HealthCheckPolicy
 resources.
 
 ## CI / CD
 
 CircleCI runs on every push:
 
-- **Lint** — `helm lint charts/ao-data-platform` on every branch and on `v*` tag pushes.
-- **Publish (dev)** — `dev` branch pushes publish two pre-release artifacts to Docker Hub: `0.0.0-latest` (floating, overwritten every push) and `0.0.0-dev.g<short-sha>` (immutable, one per commit).
+- **Checks** — Helm lint, shell syntax and ShellCheck, chart-render checks, and the Python test suites (including the backup scheduler and live-test helper) on every branch and on `v*` tag pushes.
+- **Publish (dev)** — `dev` branch pushes publish two pre-release artifacts to Docker Hub: `0.0.0-latest` (floating, overwritten every push) and `<chart-version>-dev.g<full-commit-sha>` (one exact version per commit).
 - **Publish (release)** — `v*` git tag pushes on `main`-ancestor commits publish the numbered version to Docker Hub.
 
 ### Versioning
 
 Two flows, by branch/tag:
 
-- **Dev (continuous):** every push to the `dev` branch publishes a `0.0.0-latest` floating tag and a `0.0.0-dev.g<short-sha>` immutable per-commit tag as pre-releases. The floating tag is for consumers that always want the tip of dev; the per-commit tag preserves history so you can pin or roll back. `0.0.0-` pre-releases are excluded from normal semver version constraints.
+- **Dev (continuous):** every push to `dev` publishes `<chart-version>-dev.g<full-commit-sha>`, using `version:` from `Chart.yaml` (for example, `5.2.0-dev.g<full-commit-sha>`). Pin that exact version for testing and rollback. The Terraform module compares only the numeric `major.minor.patch` part: `5.2.0-dev.g<sha>` meets a `5.2.0` feature minimum, while `5.1.0-dev.g<sha>` does not. It does not use prerelease ordering for this feature check. CI also keeps publishing `0.0.0-latest` for existing consumers, but it changes on every push and does not satisfy the module's backup-version checks.
 - **Release (tag-driven):** to cut a release, push a `v<semver>` git tag (e.g. `v1.5.0`). CI strips the leading `v` and publishes that version. Tags on commits that are not ancestors of `origin/main` are refused at the start of the publish job. `main` branch pushes alone (without a tag) do not publish anything.
 
-The `version:` field in `Chart.yaml` is overridden by CI for dev publishes. For tagged releases, CI enforces that `Chart.yaml` `version:` matches the tag (minus the leading `v`) — bump `Chart.yaml` and merge to `main` before pushing the `v<semver>` tag, or the publish job will refuse.
+Dev publishing appends the commit suffix without editing `Chart.yaml`; its base
+version must be a release number such as `5.2.0`. Run
+`bash hack/dev-chart-version.sh` to print the exact version for the current commit
+without building or publishing anything. Other branches and PRs run checks only
+unless publishing is explicitly requested as described below. For tagged releases,
+CI enforces that `Chart.yaml` `version:` matches the
+tag (minus the leading `v`) — bump `Chart.yaml` and merge to `main` before pushing
+the `v<semver>` tag, or the publish job will refuse.
+
+To publish a reviewed PR branch for testing, run a new CircleCI pipeline on that
+branch with the boolean parameter `publish_dev_chart` set to `true`. In the UI,
+select the PR's branch in **Run pipeline** and add that parameter. Through the
+project's API v2 trigger endpoint, use a body such as:
+
+```json
+{"branch": "your-reviewed-pr-branch", "parameters": {"publish_dev_chart": true}}
+```
+
+The `publish-branch-chart` workflow runs the full lint/tests job before publishing
+only that commit's version with the existing Docker publishing context. It does
+not update `dev`, `main`, a release tag, or `0.0.0-latest`; `main`, `dev`, and tag
+triggers are excluded from this manual workflow. Confirm the pipeline's commit
+matches the reviewed PR head before using its chart. The parameter defaults to
+`false`, so ordinary PR pushes do not publish.
+CircleCI's parameter documentation:
+https://circleci.com/docs/guides/orchestrate/selecting-a-workflow-to-run-using-pipeline-parameters/
 
 ### Publishing
 
@@ -597,7 +654,7 @@ helm pull oci://registry-1.docker.io/montecarlodata/ao-data-platform --version 2
 
 ## ClickHouse user model
 
-The chart provisions a least-privilege ClickHouse user per access path. Privileges are enforced
+The chart provisions a separate ClickHouse user per access path with the grants listed below. Privileges are enforced
 declaratively via config-level grants in the `ClickHouseInstallation` (no SQL-RBAC bootstrap). The
 materialized views run under `schema_owner` as their `DEFINER`, so the ingest user needs no access
 to the normalized target tables. The stock `default` superuser is removed.
@@ -610,6 +667,8 @@ to the normalized target tables. The stock `default` superuser is removed.
 | `monte_carlo` | reader bundle¹, `READ ON REMOTE`⁴, `SYSTEM SYNC REPLICA` on `conversations_normalized` | `INSERT` on `llm_inputs`/`llm_batches`/`conversation_eval_scores`/`span_eval_scores`/`conversation_cluster_assignments`/`conversations_normalized`/`conversation_rollup_watermarks` | Monte Carlo (data-source monitoring + agent observability, incl. the conversation rollup writer) | always |
 | `probe` | `system.replicas` + table visibility (`SHOW TABLES` on `otel_traces.*`; no data reads) | — (`readonly=2` profile) | the `/ready` readiness handler (see [Writer-safe readiness](#writer-safe-readiness-ready)) | always (passwordless; no ExternalSecret) |
 | `readonly_user` | reader bundle¹ | — (`readonly=2`, so JDBC `SET` works) | humans / MCP / JDBC clients | `clickhouse.readonlyUser.enabled=true` |
+| `backup` | `SELECT ON system.*` (including all users' query log text); `SHOW TABLES` / `SHOW DATABASES` on `otel_traces.*` | `BACKUP` on `otel_traces.*`; no restore or table changes | backup container over loopback only | `clickhouse.backup.enabled=true` |
+| `backup_probe` | `SELECT ON system.replicas`; `SHOW TABLES` / `SHOW DATABASES` on `otel_traces.*`; no table data | — | scheduled backup Job, to check whether a replica has caught up | `clickhouse.backup.enabled=true` |
 | `admin` | all | all + user management + `SYSTEM` | break-glass DBA (not service-to-service; loopback-only by default) | `clickhouse.admin.enabled=true` |
 
 ¹ **reader bundle** = `SELECT` on `otel_traces.*`, `system.tables/parts/query_log`,
@@ -634,8 +693,9 @@ construction and the broadest grant in the release; the per-caller network ACL i
 what scopes who can wield it. `SYSTEM SYNC REPLICA` backs the exact-guarantee read in the
 watermark note above.
 
-Each password-backed user has an ExternalSecret sourcing its password from your secret store (see the
-per-user `*.externalSecret` values below). Network *reachability* is typically restricted one layer
+Each password-backed database user has an ExternalSecret sourcing its password from your secret store
+(see the per-user `*.externalSecret` values below). Backup and probe users have separate
+optional authentication files; their secret-store failures do not block the shared user bundle. Network *reachability* is typically restricted one layer
 up at the load balancer; per-caller CH-user-level network scoping is handled separately.
 
 `monte_carlo` can now write a source table (`conversations_normalized`, for the turn rollup), not
@@ -652,12 +712,18 @@ set `clickhouse.readonlyUser.enabled=true` to use them.
 
 ### ClickHouse credential rotation (chart 5.0.0+)
 
-The chart renders each password-backed user's auth as an `<auth_methods>` element substituted
+The chart renders the main database users' auth as `<auth_methods>` elements substituted
 from a single ESO-assembled Secret (`ao-clickhouse-auth-methods`, mounted at
 `/etc/clickhouse-server/secrets.d/auth-methods.xml/<secret>/auth.xml`). That element can hold
 **two** valid passwords for a user at once, which is what makes rotation downtime-free: add the
 new password while the old one still works, then retire the old one after every client has
-re-read its credentials.
+re-read its credentials. The optional `backup` and `backup_probe` users use the same
+two-password process in separate Secrets and separate XML user stores; a failed
+backup Secret lookup does not freeze the main bundle. Their definitions live in
+`templates/backup-external-secret.yaml`, outside the main user list. The backup
+container keeps its database password until restart, so restart it before retiring
+the old database password. The backup API has a separate
+revision-controlled pod roll, described in [backup setup](docs/clickhouse-backups.md).
 
 The secret-store layout is two secrets per user:
 
@@ -842,6 +908,45 @@ helm upgrade ao-data-platform oci://registry-1.docker.io/montecarlodata/ao-data-
 | `clickhouse.readonlyUser.externalSecret.remoteRef.version` | `""` | Version of the readonly_user secret (required for Fake provider) |
 | `clickhouse.readonlyUser.externalSecret.refreshInterval` | `1h` | How often ESO syncs the readonly_user secret |
 | `clickhouse.readonlyUser.externalSecret.previousKey` | `""` | Previous-password key for `readonly_user` — same semantics as `clickhouse.otel.externalSecret.previousKey`. |
+| `clickhouse.backup.enabled` | `false` | Install scheduled backups, the backup database user, and a container in every ClickHouse pod. Enabling rolls the pods; see [backup setup](docs/clickhouse-backups.md). |
+| `clickhouse.backup.provider` | `aws` | Backup storage provider; only AWS is supported. |
+| `clickhouse.backup.sidecar.image` | Official `altinity/clickhouse-backup:2.8.1` with its pinned digest | Standard Altinity image. Registry mirrors are allowed with the same verified 2.8.1 digest; see `values.yaml`. Changing it rolls ClickHouse pods. |
+| `clickhouse.backup.aws.bucket` | `""` | Existing S3 backup bucket; required when enabled. |
+| `clickhouse.backup.aws.region` | `""` | Bucket's AWS region; required when enabled. |
+| `clickhouse.backup.aws.roleArn` | `""` | Existing IRSA role ARN; required when enabled. Both ClickHouse and the backup container use this role. |
+| `clickhouse.backup.aws.path` | `clickhouse` | S3 prefix: native backup data uses `<path>/native/`, and the catalog uses `<path>/catalog/`. Neither prefix may have lifecycle expiration. |
+| `clickhouse.backup.serviceAccount.name` | `clickhouse-backup` | Dedicated Kubernetes ServiceAccount created by the chart and named in the role's trust policy; cannot be `default`. |
+| `clickhouse.backup.user.secret` | `ao-clickhouse-backup-credentials` | Kubernetes Secret created by External Secrets for the database password and backup configuration. This is separate from the API password Secret. |
+| `clickhouse.backup.user.externalSecret.secretStoreRef.name` | `""` | Store for the backup database password; required when enabled. |
+| `clickhouse.backup.user.externalSecret.secretStoreRef.kind` | `ClusterSecretStore` | Kind of the backup password store reference. |
+| `clickhouse.backup.user.externalSecret.remoteRef.key` | `""` | External secret key holding the backup database password; required when enabled. |
+| `clickhouse.backup.user.externalSecret.remoteRef.property` | `""` | Property within a JSON secret (optional). |
+| `clickhouse.backup.user.externalSecret.remoteRef.version` | `""` | Version of the backup database secret (required for Fake provider). |
+| `clickhouse.backup.user.externalSecret.refreshInterval` | `1h` | How often External Secrets syncs the backup database password and configuration. |
+| `clickhouse.backup.user.externalSecret.previousKey` | `""` | Previous database-password key; follows `clickhouse.otel.externalSecret.previousKey`. Does not rotate the API password. |
+| `clickhouse.backup.probe.secret` | `ao-clickhouse-backup-probe-credentials` | Separate Kubernetes Secret for the authenticated replica-freshness probe. Missing or empty credentials disable this user without blocking ClickHouse startup. |
+| `clickhouse.backup.probe.networksIp` | `["0.0.0.0/0", "::/0"]` | Allowed source networks for the read-only freshness check; narrow to backup Job networks when known. |
+| `clickhouse.backup.probe.externalSecret.*` | same shape as `backup.user.externalSecret.*` | Store reference, current and optional previous password keys, and refresh interval for `backup_probe`. Required when backups are enabled. |
+| `clickhouse.backup.api.existingSecret` | `""` | Existing Secret containing separate API `password` and `revision` keys. Set exactly one of this value or `api.externalSecret`. |
+| `clickhouse.backup.api.passwordRevision` | `""` | Required revision matching the API Secret. Changing it rolls ClickHouse pods; Jobs refuse to send credentials during mismatched revisions. See [API rotation](docs/clickhouse-backups.md#install-with-the-schedule-paused). |
+| `clickhouse.backup.api.externalSecret` | Empty store/key, `1h` refresh | Set `secretStoreRef.name` and `remoteRef.key` to enable. Source JSON must contain both `password` and `revision`; leave `remoteRef.property` empty. |
+| `clickhouse.backup.api.secret` | `""` | Target Secret name for the external API source; defaults to `<CHI>-backup-api`. |
+| `clickhouse.backup.schedule.cron` | `0 */4 * * *` | UTC schedule. The first successful run each day is full; later runs use that full as their base. |
+| `clickhouse.backup.schedule.suspend` | `false` | Pause new scheduled Jobs. Does not stop existing work or prevent the installation's pod roll; set `true` for initial setup. |
+| `clickhouse.backup.schedule.timeoutSeconds` | `10800` | Scheduler wait limit in seconds, from 60 to 14400. The Kubernetes Job deadline adds 60 seconds and, when cleanup is enabled, `cleanup.timeoutSeconds`. The tool separately uses a fixed four-hour timeout. Keep that total below the schedule interval, with time for startup and scheduling delays, or `Forbid` can skip scheduled Jobs. |
+| `clickhouse.backup.schedule.maxReplicaDelaySeconds` | `5` | Largest replication delay allowed before backup, in seconds. Nonnegative integer. |
+| `clickhouse.backup.schedule.freshnessRetrySeconds` | `30` | How long to retry a delayed copy before trying another, in seconds. Zero checks once. |
+| `clickhouse.backup.schedule.startingDeadlineSeconds` | `900` | Latest allowed start after a missed scheduled time, in seconds. |
+| `clickhouse.backup.schedule.image` | `python:3.12-slim-bookworm` with pinned digest | Backup Job runner image; changing it does not roll ClickHouse pods. |
+| `clickhouse.backup.schedule.resources` | requests: `25m` CPU / `32Mi` memory; limit: `128Mi` memory | Backup Job resources. |
+| `clickhouse.backup.cleanup.enabled` | `false` | Run a read-only retention report after a verified backup. Requires backups enabled; checks every configured ClickHouse copy, including single-copy clusters. |
+| `clickhouse.backup.cleanup.dryRun` | `true` | Must remain `true` when cleanup is enabled; deletion is rejected. |
+| `clickhouse.backup.cleanup.keepLast` | `2` | Integer >= 1. Keep this many newest individual backups, plus every base they require. |
+| `clickhouse.backup.cleanup.keepDays` | `0` | Integer >= 0. Also keep backups inside this many days, plus their bases. Use `30` for a 30-day production window. Zero disables the age window; the defaults keep the newest two individual backups and any bases they need. |
+| `clickhouse.backup.cleanup.timeoutSeconds` | `1800` | Integer >= 60. Time allowed for the preview; added to `schedule.timeoutSeconds + 60` for the Job deadline. Keep the total below the schedule interval with room for startup. |
+| `clickhouse.backup.sidecar.resources` | requests: `100m` CPU / `128Mi` memory; limit: `512Mi` memory | Backup container resources; changing these rolls ClickHouse pods. |
+| `clickhouse.backup.sidecar.goMemoryLimit` | `400MiB` | Go's soft memory target for the backup container. Keep it below `clickhouse.backup.sidecar.resources.limits.memory`. |
+| `clickhouse.backup.networkPolicy.additionalPorts` | `[]` | Extra TCP listeners allowed from all sources when backups are enabled. Port 7171 is reserved for backup Jobs and rejected here; requires NetworkPolicy enforcement. |
 | `clickhouse.authMethods.secret` | `ao-clickhouse-auth-methods` | Name of the K8s Secret (created by ESO) holding the assembled auth-methods substitution file. |
 | `clickhouse.authMethods.externalSecret.secretStoreRef.name` | `""` (→ `otel`'s) | Store for the bundle ExternalSecret; defaults to the `otel` user's store when empty. |
 | `clickhouse.authMethods.externalSecret.secretStoreRef.kind` | `ClusterSecretStore` | Kind of the bundle's secret store reference. |
@@ -849,7 +954,8 @@ helm upgrade ao-data-platform oci://registry-1.docker.io/montecarlodata/ao-data-
 | `clickhouse.hostname` | `""` | If set, adds `external-dns.alpha.kubernetes.io/hostname` annotation to the ClickHouse Service |
 | `clickhouse.service.type` | `ClusterIP` | ClickHouse Service type (`ClusterIP`, `LoadBalancer`) |
 | `clickhouse.service.annotations` | `{}` | Annotations on the ClickHouse Service (e.g. AWS NLB annotations) |
-| `keeper.replicasCount` | `3` | Number of Keeper voters. Should be odd (Raft quorum) and must not exceed the number of availability zones with eligible nodes; 3 for production HA, `1` for dev/single-AZ clusters (the default 3 require nodes in three zones — see the Keeper section). Also sets `minDomains` on the voter zone spread, so a count above the AZ ceiling leaves the excess voters `Pending` permanently rather than packing an AZ. |
+| `keeper.replicasCount` | `3` | Number of Keeper voters. Should be odd (Raft quorum) and must not exceed the number of availability zones with eligible nodes; 3 for production HA, `1` for dev/single-AZ clusters (the default 3 require nodes in three zones — see the Keeper section). Also sets `minDomains` on the voter zone spread (unless `keeper.zoneSpread.minDomains` opts down), so a count above the AZ ceiling leaves the excess voters `Pending` permanently rather than packing an AZ. |
+| `keeper.zoneSpread.minDomains` | `null` | Minimum distinct zones the voters must occupy; `null` means `replicasCount` (one voter per zone). Setting it lower is an explicit reduced-HA opt-out for clusters with fewer AZs than voters — e.g. `2` schedules 3 voters as 2+1 across 2 AZs (never 3+0; the spread stays hard and voters still land on distinct nodes), but losing the 2-voter AZ drops the ensemble below quorum. Must be `1..replicasCount`; out-of-range values fail render. See [Keeper sizing and scheduling](#keeper-sizing-and-scheduling). |
 | `keeper.image` | `clickhouse/clickhouse-keeper:26.4.3` | Keeper image; pinned to track the ClickHouse server release line. |
 | `keeper.storageClass` | `""` | StorageClass for the Keeper PVCs (empty = cluster default). |
 | `keeper.storageSize` | `10Gi` | PVC size per Keeper voter. Keeper stores only Raft log + snapshots, so a small volume is ample. |
@@ -927,8 +1033,9 @@ the same node, so no anti-affinity rule is needed.
 
 The Keeper voters follow the same pattern via `keeper.nodeSelector` /
 `keeper.tolerations` (e.g. a `dedicated: keeper` node group). Their one-voter-per-AZ
-topology spread is built into the CHK pod template and is not configurable through
-values — the node groups you pin them to must span the required zones.
+topology spread is built into the CHK pod template — the node groups you pin them to
+must span the required zones; `keeper.zoneSpread.minDomains` is the only knob, and it
+only lowers the zone floor (see [Keeper sizing and scheduling](#keeper-sizing-and-scheduling)).
 
 If you are not partitioning nodes, either set `clickhouse.nodeSelector` +
 `clickhouse.tolerations` to target your own dedicated node group, or restore

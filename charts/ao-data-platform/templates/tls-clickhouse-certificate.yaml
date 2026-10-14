@@ -16,6 +16,13 @@ spec:
     - clickhouse-otel
     - clickhouse-otel.{{ .Release.Namespace }}
     - clickhouse-otel.{{ .Release.Namespace }}.svc.cluster.local
+    {{- if .Values.clickhouse.backup.enabled }}
+    {{- range $replica := (include "ao-data-platform.backupReplicas" . | fromJsonArray) }}
+    - {{ include "ao-data-platform.chiName" $ }}-backup-{{ $replica }}
+    - {{ include "ao-data-platform.chiName" $ }}-backup-{{ $replica }}.{{ $.Release.Namespace }}
+    - {{ include "ao-data-platform.chiName" $ }}-backup-{{ $replica }}.{{ $.Release.Namespace }}.svc.cluster.local
+    {{- end }}
+    {{- end }}
   issuerRef:
     {{- include "ao-data-platform.issuerRef" . | nindent 4 }}
 {{- end }}

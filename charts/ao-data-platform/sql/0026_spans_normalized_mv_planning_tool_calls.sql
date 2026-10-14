@@ -1,0 +1,21 @@
+-- Render a Cortex planning step's own tool calls as completion tool_calls.
+--
+-- SUPERSEDED BY 0027, AND DELIBERATELY INERT. The SELECT this file used to
+-- install now lives in 0027_spans_normalized_mv_planning_messages.sql, the
+-- last writer of this view. schema-job.yaml re-runs every /sql/*.sql on
+-- install AND upgrade with no ledger, so a superseded ALTER ... MODIFY QUERY
+-- left here would restore the older SELECT for the window between this file
+-- and 0027. See 0021's header for the full reasoning. The file is retained
+-- to hold the numbering.
+--
+-- What that superseded SELECT added, carried forward into 0027:
+--   * The extraction COALESCE drops planning.tool_execution.results and
+--     planning.tool_selection.name. tool_execution.results is the turn's
+--     cumulative tool output, an input to the step, not its output.
+--   * tool_calls gains a Snowflake arm built from
+--     planning.tool_selection.{id,name,argument.name,argument.value}.
+--   * Discovery keeps idx=0 for a step whose tool_selection.name is a
+--     non-empty array, so a tool-only step has one completion with an empty
+--     message and its tool calls.
+--
+-- Mirrored from monolith 0019_spans_normalized_mv_planning_tool_calls.sql.

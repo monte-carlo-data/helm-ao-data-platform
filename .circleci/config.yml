@@ -1,5 +1,13 @@
 version: 2.1
 
+parameters:
+  run_backup_runtime:
+    type: boolean
+    default: false
+  publish_dev_chart:
+    type: boolean
+    default: false
+
 defaults:
   - &dockerhub_context
     - docker
@@ -30,6 +38,17 @@ commands:
             echo "$DOCKER_PASSWORD" \
               | helm registry login registry-1.docker.io --username "$DOCKER_LOGIN" --password-stdin
 
+  build-and-publish-dev-version:
+    steps:
+      - run:
+          name: Build and publish the exact dev chart version
+          command: |
+            DEV_VERSION=$(bash hack/dev-chart-version.sh)
+            helm dependency build charts/ao-data-platform
+            helm package charts/ao-data-platform --version "$DEV_VERSION"
+            helm push "ao-data-platform-${DEV_VERSION}.tgz" "oci://registry-1.docker.io/montecarlodata"
+            echo "Published ${DEV_VERSION}"
+
 jobs:
   lint:
     docker:
@@ -37,18 +56,18 @@ jobs:
     steps:
       - checkout
       - run:
-          name: Shell syntax check (hack/)
+          name: Shell syntax check
           # 700+ lines of `set -euo pipefail` deploy-verification shell only run against a
           # live cluster, so a parse error would otherwise surface mid-deploy. Fail fast on
           # any syntax error (noexec parse — no cluster or side effects).
           command: |
-            for f in hack/*.sh hack/lib/*.sh; do
+            for f in hack/*.sh hack/lib/*.sh charts/ao-data-platform/files/clickhouse-backup/*.sh; do
               [ -e "$f" ] || continue
               bash -n "$f" || { echo "syntax error in $f"; exit 1; }
             done
-            echo "hack/ shell syntax OK."
+            echo "Shell syntax OK."
       - run:
-          name: Shellcheck (hack/)
+          name: Shellcheck
           # bash -n only catches parse errors; shellcheck catches the runtime classes
           # these scripts have actually shipped — e.g. a command substitution without
           # `|| true` dying under `set -euo pipefail` before its diagnostic prints.
@@ -58,8 +77,8 @@ jobs:
           command: |
             sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
             shellcheck --version
-            shellcheck -x -P SCRIPTDIR hack/*.sh hack/lib/*.sh
-            echo "hack/ shellcheck OK."
+            shellcheck -x -P SCRIPTDIR hack/*.sh hack/lib/*.sh charts/ao-data-platform/files/clickhouse-backup/*.sh
+            echo "Shellcheck OK."
       - install-helm
       - add-helm-repos
       - run:
@@ -68,6 +87,13 @@ jobs:
       - run:
           name: Lint chart
           command: helm lint charts/ao-data-platform
+      - run:
+          name: Test scheduled backups and chart access rules
+          command: |
+            sudo apt-get update -qq && sudo apt-get install -y -qq python3-venv
+            python3 -m venv /tmp/ao-backup-tests
+            /tmp/ao-backup-tests/bin/pip install PyYAML==6.0.3
+            PYTHONDONTWRITEBYTECODE=1 /tmp/ao-backup-tests/bin/python -m unittest discover -s hack/tests -v
       - run:
           name: Kubernetes 1.29 render fails the kubeVersion floor
           # Chart.yaml declares kubeVersion: ">=1.30.0-0" so minDomains (GA in 1.30)
@@ -581,7 +607,7 @@ jobs:
           # a broken minDomains derivation would let an under-zoned cluster pack an AZ.
           command: |
             facts=$(awk '
-              /^---$/ { chi = 0; chk = 0; zk = 0; set = 0; chcs = 0; kpcs = 0 }
+              /^---$/ { chi = 0; chk = 0; zk = 0; set = 0; chcs = 0; kpcs = 0; kaff = 0 }
               /^kind: "ClickHouseInstallation"$/       { chi = 1 }
               /^kind: "ClickHouseKeeperInstallation"$/ { chk = 1 }
               chi && /^    [a-zA-Z]/   { zk = 0; set = 0 }
@@ -602,6 +628,10 @@ jobs:
               chk && /^              minDomains: /          { print "kpminDomains=" $2; kpcs = 1 }
               chk && kpcs && /^              topologyKey: /       { print "kpkey=" $2 }
               chk && kpcs && /^              whenUnsatisfiable: / { print "kpwhen=" $2; kpcs = 0 }
+              chk && /^            podAntiAffinity:/ { kaff = 1 }
+              chk && kaff && /^              requiredDuringSchedulingIgnoredDuringExecution:/ { print "kpaffreq=1" }
+              chk && kaff && /^                - topologyKey: /                              { print "kpaffkey=" $3 }
+              chk && kaff && /^                      clickhouse-keeper.altinity.com\/chk: /  { print "kpaffsel=" $2; kaff = 0 }
             ' rendered.yaml)
             assert_fact() {
               if ! echo "$facts" | grep -qxF "$1"; then
@@ -629,8 +659,87 @@ jobs:
             assert_fact 'chkey=topology.kubernetes.io/zone'
             assert_fact 'kpwhen=DoNotSchedule'
             assert_fact 'kpkey=topology.kubernetes.io/zone'
+            # The CHK's hostname anti-affinity is the one-voter-per-node guarantee that
+            # keeps co-zoned voters (under a keeper.zoneSpread.minDomains opt-out) off a
+            # shared node. It must stay *required* — kpaffreq only renders on the
+            # requiredDuringScheduling list, so a downgrade to preferred (which packs
+            # instead of Pending) drops the fact — on the hostname key, selecting the
+            # CHK's own voter label.
+            assert_fact 'kpaffreq=1'
+            assert_fact 'kpaffkey=kubernetes.io/hostname'
+            assert_fact 'kpaffsel=otel'
+            if [ "$(echo "$facts" | grep -c '^kpminDomains=')" -ne 1 ]; then
+              echo "Expected exactly one minDomains in the CHK topologySpreadConstraints (on the zone constraint only)."
+              echo "Extracted facts were:"
+              echo "$facts"
+              exit 1
+            fi
             assert_fact 'fourlw="ruok,mntr,srvr,stat,conf"'
             echo "ClickHouse replication wiring rendered correctly."
+      - run:
+          name: Keeper zone-spread override renders, and out-of-range values fail
+          # keeper.zoneSpread.minDomains is the documented reduced-HA opt-out (voters
+          # packed 2+1 across 2 AZs). Assert the override actually reaches the CHK's
+          # zone constraint (a misnamed key would silently render the replicasCount
+          # default — the exact drift the assert above pins for the default path),
+          # that it does NOT leak into the CHI's spread (the opt-out is Keeper-only),
+          # and that the template's render-time validation rejects out-of-range and
+          # non-integer values (0 is rejected by the API server; above replicasCount
+          # demands more zones than there are voters; booleans and strings via --set,
+          # float64s via --set-json — the latter is how a values file delivers
+          # numbers, and what Helm's int would silently truncate) instead of
+          # shipping them to the cluster.
+          command: |
+            helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --set keeper.zoneSpread.minDomains=2 > override.yaml
+            if ! grep -qE '^              minDomains: 2$' override.yaml; then
+              echo "keeper.zoneSpread.minDomains=2 did not reach the rendered CHK zone constraint."
+              exit 1
+            fi
+            # ci/lint-values.yaml sets clickhouse.replicasCount: 3 — the CHI spread
+            # must still derive minDomains from that, untouched by the keeper override.
+            if ! grep -qE '^              minDomains: 3$' override.yaml; then
+              echo "The CHI zone constraint no longer renders minDomains from clickhouse.replicasCount under a keeper-only override."
+              exit 1
+            fi
+            if grep -qE '^              minDomains: 5$' override.yaml; then
+              echo "A rendered minDomains still tracks keeper.replicasCount (5) despite the override."
+              exit 1
+            fi
+            # 6 > the lint-values voter count of 5. true is a bool; 2.9 arrives as
+            # the string "2.9" (--set only types ints/bools/null), covering quoted
+            # string input — the float64 path is the --set-json cases below.
+            for bad in 0 6 true 2.9; do
+              if helm template charts/ao-data-platform \
+                -f charts/ao-data-platform/ci/lint-values.yaml \
+                --set keeper.zoneSpread.minDomains=$bad > /dev/null 2>&1; then
+                echo "Expected the render to fail with keeper.zoneSpread.minDomains=$bad, but it succeeded."
+                exit 1
+              fi
+            done
+            # --set-json delivers real JSON types, matching how a values file
+            # delivers numbers (float64): an integer-valued float64 must be
+            # accepted, and a fractional float64 must fail — it is the only case
+            # that exercises the template's printf float guard, without which
+            # 2.9 would silently truncate to minDomains: 2.
+            # Render to a file rather than piping into grep -q: under CI's
+            # pipefail, grep -q's early exit SIGPIPEs helm and fails the
+            # pipeline even when the line matched.
+            helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --set-json 'keeper.zoneSpread.minDomains=2' > override-json.yaml
+            if ! grep -qE '^              minDomains: 2$' override-json.yaml; then
+              echo "float64 integer keeper.zoneSpread.minDomains=2 (--set-json) was rejected or did not render."
+              exit 1
+            fi
+            if helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml \
+              --set-json 'keeper.zoneSpread.minDomains=2.9' > /dev/null 2>&1; then
+              echo "Expected the render to fail with float keeper.zoneSpread.minDomains=2.9 (--set-json), but it succeeded."
+              exit 1
+            fi
+            echo "Keeper zone-spread override rendered correctly and invalid values failed."
       - run:
           name: Verify rendered readiness probe and probe-user wiring
           # The /ready chain has several links that drop out silently: the handler
@@ -876,6 +985,59 @@ jobs:
             assert_marker vertex  gcp   --set llmWorker.vertex.project=p
             echo "schema-job seeds the correct cloud/provider marker for every provider."
 
+  backup-runtime:
+    # Bind-mounted fixtures must share a filesystem with the Docker daemon.
+    machine:
+      image: ubuntu-2404:2026.05.1
+    resource_class: medium
+    environment:
+      FORCE_BACKUP_RUNTIME: "<< pipeline.parameters.run_backup_runtime >>"
+      PUBLISH_BACKUP_CHART: "<< pipeline.parameters.publish_dev_chart >>"
+    steps:
+      - checkout
+      - run:
+          name: Select backup runtime checks
+          command: |
+            if [ "$FORCE_BACKUP_RUNTIME" = true ] || [ "$PUBLISH_BACKUP_CHART" = true ] || [ -n "${CIRCLE_TAG:-}" ]; then
+              exit 0
+            fi
+            if [ "${CIRCLE_BRANCH:-}" = main ] || [ "${CIRCLE_BRANCH:-}" = dev ]; then
+              exit 0
+            fi
+            # Check the whole branch diff. If history is unavailable, run the
+            # checks instead of silently treating a shallow checkout as safe.
+            git fetch --quiet origin main --depth=200 || exit 0
+            base=$(git merge-base HEAD origin/main) || exit 0
+            if [ "$base" = "$(git rev-parse HEAD)" ]; then
+              base=$(git rev-parse HEAD^) || exit 0
+            fi
+            # Read the whole list and let grep consume all input. Otherwise
+            # pipefail can mistake a broken pipe for an unrelated change.
+            changed=$(git diff --name-only "$base" HEAD) || exit 0
+            if ! printf '%s\n' "$changed" | grep -E '^(\.circleci/|charts/ao-data-platform/|hack/tests/|hack/verify-backup-failover\.py)' >/dev/null; then
+              echo "No backup chart, script, or test changes; skipping Docker checks."
+              circleci-agent step halt
+            fi
+      - install-helm
+      - add-helm-repos
+      - run:
+          name: Prepare public runtime-test dependencies
+          command: |
+            sudo apt-get update -qq && sudo apt-get install -y -qq python3-venv
+            python3 -m venv /tmp/backup-runtime-tests
+            /tmp/backup-runtime-tests/bin/pip install PyYAML==6.0.3
+            helm dependency build charts/ao-data-platform
+            docker pull clickhouse/clickhouse-server:26.4.3
+            docker pull altinity/clickhouse-backup:2.8.1@sha256:08016b048f7e6035c048501315c2a788e5a782f15f168e042c7bd48d5a388cc4
+            docker pull python:3.12-slim-bookworm@sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e
+            docker pull chainguard/minio@sha256:0f95aa412a12351a95bb43c3b54b66440eb0aa022bb3f3458942678a489e915b
+      - run:
+          name: Test stock backup startup and scheduled full/incremental backups
+          no_output_timeout: 15m
+          command: |
+            RUN_BACKUP_RUNTIME=1 PYTHONDONTWRITEBYTECODE=1 /tmp/backup-runtime-tests/bin/python \
+              -m unittest discover -s hack/tests/runtime -p test_backup_runtime.py -v
+
   publish-dev:
     docker:
       - image: cimg/base:current
@@ -884,17 +1046,23 @@ jobs:
       - install-helm
       - login-dockerhub
       - add-helm-repos
+      - build-and-publish-dev-version
       - run:
-          name: Build and publish dev chart (latest + per-commit)
+          name: Update the shared dev chart
           command: |
-            SHORT_SHA=$(git rev-parse --short=7 HEAD)
-            DEV_VERSION="0.0.0-dev.g${SHORT_SHA}"
-            helm dependency build charts/ao-data-platform
-            helm package charts/ao-data-platform --version "$DEV_VERSION"
-            helm push "ao-data-platform-${DEV_VERSION}.tgz" "oci://registry-1.docker.io/montecarlodata"
             helm package charts/ao-data-platform --version "0.0.0-latest"
             helm push "ao-data-platform-0.0.0-latest.tgz" "oci://registry-1.docker.io/montecarlodata"
-            echo "Published ${DEV_VERSION} and 0.0.0-latest"
+            echo "Published 0.0.0-latest"
+
+  publish-dev-commit:
+    docker:
+      - image: cimg/base:current
+    steps:
+      - checkout
+      - install-helm
+      - login-dockerhub
+      - add-helm-repos
+      - build-and-publish-dev-version
 
   publish-tag:
     docker:
@@ -934,14 +1102,21 @@ jobs:
 
 workflows:
   build:
+    when:
+      not: << pipeline.parameters.publish_dev_chart >>
     jobs:
       - lint:
+          filters:
+            tags:
+              only: /^v.*/
+      - backup-runtime:
           filters:
             tags:
               only: /^v.*/
       - publish-dev:
           requires:
             - lint
+            - backup-runtime
           context: *dockerhub_context
           filters:
             branches:
@@ -949,9 +1124,35 @@ workflows:
       - publish-tag:
           requires:
             - lint
+            - backup-runtime
           context: *dockerhub_context
           filters:
             branches:
               ignore: /.*/
             tags:
               only: /^v.*/
+  publish-branch-chart:
+    when: << pipeline.parameters.publish_dev_chart >>
+    jobs:
+      - lint:
+          filters:
+            branches:
+              ignore: [main, dev]
+            tags:
+              ignore: /.*/
+      - backup-runtime:
+          filters:
+            branches:
+              ignore: [main, dev]
+            tags:
+              ignore: /.*/
+      - publish-dev-commit:
+          requires:
+            - lint
+            - backup-runtime
+          context: *dockerhub_context
+          filters:
+            branches:
+              ignore: [main, dev]
+            tags:
+              ignore: /.*/
