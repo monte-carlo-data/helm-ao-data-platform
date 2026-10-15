@@ -5,7 +5,6 @@ Set HELM to use a Helm binary outside PATH.
 """
 
 import copy
-import tempfile
 import unittest
 
 import yaml
@@ -179,11 +178,8 @@ REVISION_ANNOTATION = "backup.montecarlodata.com/password-revision"
 
 def render_annotations(component_annotations, backup=False):
     """Render with podAnnotations passed through a values file, as users set them."""
-    with tempfile.NamedTemporaryFile("w", suffix=".yaml") as values:
-        yaml.safe_dump({component: {"podAnnotations": annotations}
-                        for component, annotations in component_annotations.items()}, values)
-        values.flush()
-        return chart.render(backup=backup, values_files=[values.name])
+    return chart.render(backup=backup, values={component: {"podAnnotations": annotations}
+                                               for component, annotations in component_annotations.items()})
 
 
 def pod_annotations(installation):
@@ -224,6 +220,20 @@ class PodAnnotationTests(unittest.TestCase):
         documents = render_annotations({"clickhouse": SCRAPE_ANNOTATIONS}, backup=True)
         self.assertEqual(pod_annotations(chart.one(documents, "ClickHouseInstallation")),
                          {**SCRAPE_ANNOTATIONS, REVISION_ANNOTATION: revision})
+
+    def test_null_annotations_are_dropped(self):
+        revision = pod_annotations(chart.one(chart.render(), "ClickHouseInstallation"))[REVISION_ANNOTATION]
+        documents = render_annotations({component: {"keep": 1, "drop": None}
+                                        for component in ("clickhouse", "keeper")}, backup=True)
+        self.assertEqual(pod_annotations(chart.one(documents, "ClickHouseInstallation")),
+                         {"keep": "1", REVISION_ANNOTATION: revision})
+        self.assertEqual(pod_annotations(chart.one(documents, "ClickHouseKeeperInstallation")), {"keep": "1"})
+
+    def test_all_null_annotations_keep_the_backup_revision(self):
+        revision = pod_annotations(chart.one(chart.render(), "ClickHouseInstallation"))[REVISION_ANNOTATION]
+        documents = render_annotations({"clickhouse": {"drop": None}}, backup=True)
+        self.assertEqual(pod_annotations(chart.one(documents, "ClickHouseInstallation")),
+                         {REVISION_ANNOTATION: revision})
 
     def test_chart_owned_backup_annotations_are_rejected(self):
         # The whole prefix is reserved, not just the revision key the chart sets today.
