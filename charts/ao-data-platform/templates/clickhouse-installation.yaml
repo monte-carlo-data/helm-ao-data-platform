@@ -379,6 +379,9 @@ spec:
       openSSL/server/privateKeyFile: /etc/clickhouse-server/secrets.d/server.key/clickhouse-server-tls/tls.key
       openSSL/server/caConfig: /etc/clickhouse-server/secrets.d/ca.crt/clickhouse-server-tls/ca.crt
       {{- end }}
+      {{- if .Values.clickhouse.metrics.enabled }}
+      {{- include "ao-data-platform.prometheusSettings" . | nindent 6 }}
+      {{- end }}
   defaults:
     templates:
       dataVolumeClaimTemplate: data
@@ -390,10 +393,25 @@ spec:
     # load-bearing chart behavior, not optional tuning.
     podTemplates:
       - name: clickhouse
+        {{- /* The chart owns backup.montecarlodata.com/ keys: backup Jobs read the
+           revision annotation to confirm every pod loaded the current API password,
+           so a user-pinned copy would block all backups. Values are converted to
+           strings: the operator decodes them into pod metadata, and a number or bool
+           stops it from reconciling. */ -}}
+        {{- $podAnnotations := dict }}
+        {{- range $key, $value := (.Values.clickhouse.podAnnotations | default dict) }}
+        {{- if hasPrefix "backup.montecarlodata.com/" $key }}
+        {{- fail (printf "clickhouse.podAnnotations must not set %s: the chart manages backup.montecarlodata.com/ annotations. Remove it from your values." $key) }}
+        {{- end }}
+        {{- $_ := set $podAnnotations $key (toString $value) }}
+        {{- end }}
         {{- if .Values.clickhouse.backup.enabled }}
+        {{- $_ := set $podAnnotations "backup.montecarlodata.com/password-revision" (toString .Values.clickhouse.backup.api.passwordRevision) }}
+        {{- end }}
+        {{- with $podAnnotations }}
         metadata:
           annotations:
-            backup.montecarlodata.com/password-revision: {{ .Values.clickhouse.backup.api.passwordRevision | quote }}
+            {{- toYaml . | nindent 12 }}
         {{- end }}
         spec:
           {{- if .Values.clickhouse.backup.enabled }}
@@ -457,6 +475,12 @@ spec:
           containers:
             - name: clickhouse
               image: {{ .Values.clickhouse.image }}
+              {{- if .Values.clickhouse.metrics.enabled }}
+              ports:
+                - name: metrics
+                  containerPort: {{ int $ports.metrics }}
+                  protocol: TCP
+              {{- end }}
               {{- if .Values.clickhouse.backup.enabled }}
               volumeMounts:
                 - name: backup-auth-config
