@@ -177,6 +177,8 @@ spec:
                 <query>GRANT INSERT ON otel_traces.span_eval_scores</query>
                 <query>GRANT INSERT ON otel_traces.trajectory_trigger_ledger</query>
                 <query>GRANT INSERT ON otel_traces.conversation_cluster_assignments</query>
+                <query>GRANT INSERT ON otel_traces.agent_feedback</query>
+                <query>GRANT INSERT ON otel_traces.agent_turn_links</query>
                 <!-- conversations_normalized + conversation_rollup_watermarks: the conversation
                      turn rollup writer (AO-1108). The reader bundle above already carries SELECT
                      on the whole database, so the widening here is write access to conversation
