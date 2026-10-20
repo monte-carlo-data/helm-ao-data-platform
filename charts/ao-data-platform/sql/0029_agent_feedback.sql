@@ -1,7 +1,7 @@
--- End-user feedback on agent responses (thumbs up/down and whether a comment was
--- left), written by Monte Carlo (monte_carlo user) for agents whose platform
--- stores feedback outside the trace spans, such as Snowflake Cortex agents.
--- Comment text and the rating user are not stored here.
+-- End-user feedback on agent responses (thumbs up/down, whether a comment was left,
+-- and the categories the user picked), written by Monte Carlo (monte_carlo user)
+-- for agents whose platform stores feedback outside the trace spans, such as
+-- Snowflake Cortex agents. Comment text and the rating user are not stored here.
 --
 -- Feedback names the rated turn by request_id, not by trace. agent_turn_links maps
 -- each request_id to its trace, and reads join the two tables on
@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS otel_traces.agent_feedback ON CLUSTER '{cluster}'
     -- NULL when the feedback carries no usable rating.
     `positive` Nullable(Bool),
     `has_comment` Bool,
+    `categories` Array(String) DEFAULT [],
     `submitted_at` DateTime64(6),
     `collected_at` DateTime64(6)
 )
