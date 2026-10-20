@@ -10,8 +10,10 @@
 -- ReplicatedReplacingMergeTree(recorded_at) collapses a retried run's
 -- duplicate rows at merge. The anti-join does not need FINAL: a duplicate key
 -- has no effect. The TTL follows clickhouse.ttlDays like the other
--- annotations (the schema Job's ALTER is the source of truth on upgrades): a
--- trigger older than its spans cannot fall in a trigger window again.
+-- annotations (the schema Job's ALTER is the source of truth on upgrades). It
+-- keys on trigger_start, like spans_normalized's on start_time, so a row
+-- expires with its trigger span, and an expired span cannot fall in a trigger
+-- window again.
 CREATE TABLE IF NOT EXISTS otel_traces.trajectory_trigger_ledger ON CLUSTER '{cluster}'
 (
     `monitor_uuid` UUID,

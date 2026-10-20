@@ -228,6 +228,7 @@ verify_clickhouse_user_model() {
   # privilege check follows the consolidation.
   expect_privilege "monte_carlo writes conversation turns"     monte_carlo "$MC_PW" "INSERT ON otel_traces.conversations_normalized"
   expect_privilege "monte_carlo publishes the rollup cursor"   monte_carlo "$MC_PW" "INSERT ON otel_traces.conversation_rollup_watermarks"
+  expect_privilege "monte_carlo writes the trajectory trigger ledger" monte_carlo "$MC_PW" "INSERT ON otel_traces.trajectory_trigger_ledger"
   # ADD COLUMN IF NOT EXISTS matches by name only, so the table loop's existence check cannot
   # see a wrong-shaped column: a cluster where a draft 0022/0024 was hand-applied during
   # development keeps it forever and the schema job exits 0. Assert the shape the writer relies
