@@ -81,6 +81,23 @@ def project(directory, files):
             link.symlink_to("..data/" + name, target_is_directory=(generation / name).is_dir())
 
 
+def sync_projected_volumes(name, root, volumes):
+    """Apply rotating file projections on Docker's Linux filesystem.
+
+    macOS bind mounts can keep resolving the old ..data symlink generation.
+    """
+    payload = {}
+    args = ["run", "--rm", "-i", "--name", name + "-projector", "--network", "none"]
+    for kind, volume in volumes.items():
+        args += ["--mount", f"type=volume,source={volume},target=/projection/{kind}"]
+        generation = (root / kind / "..data").resolve()
+        payload[kind] = {str(path.relative_to(generation)): path.read_text()
+                         for path in generation.rglob("*") if path.is_file()}
+    script = "import json, sys, uuid\nfrom pathlib import Path\n" + inspect.getsource(replace) + inspect.getsource(project)
+    script += "\nfor kind, files in json.load(sys.stdin).items():\n    project(Path('/projection') / kind, files)\n"
+    docker(*args, PYTHON_IMAGE, "python", "-c", script, input=json.dumps(payload))
+
+
 def local_s3_request(method, path, access_key, secret_key):
     """Sign a request to the disposable MinIO server using only the stdlib."""
     from datetime import datetime, timezone
@@ -174,18 +191,7 @@ class Database:
             self.sync_credentials()
 
     def sync_credentials(self):
-        # Write rotating projections on Docker's Linux filesystem. Host bind
-        # mounts on macOS do not reliably preserve stat() across ..data swaps.
-        payload = {}
-        args = ["run", "--rm", "-i", "--name", self.name + "-projector", "--network", "none"]
-        for kind, volume in self.auth_volumes.items():
-            args += ["--mount", f"type=volume,source={volume},target=/projection/{kind}"]
-            generation = (self.root / kind / "..data").resolve()
-            payload[kind] = {str(path.relative_to(generation)): path.read_text()
-                             for path in generation.rglob("*") if path.is_file()}
-        script = "import json, sys, uuid\nfrom pathlib import Path\n" + inspect.getsource(replace) + inspect.getsource(project)
-        script += "\nfor kind, files in json.load(sys.stdin).items():\n    project(Path('/projection') / kind, files)\n"
-        docker(*args, PYTHON_IMAGE, "python", "-c", script, input=json.dumps(payload))
+        sync_projected_volumes(self.name, self.root, self.auth_volumes)
 
     def start(self, wait=True):
         self.sync_credentials()
@@ -256,6 +262,7 @@ class BackupRuntimeTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
         self.sequence = 0
+        self.wrapper_projections = {}
 
     def db(self, *, documents=None, **options):
         self.sequence += 1
@@ -351,21 +358,30 @@ except backup.ReplicaError:
                 self.assertIs(type(row[field]), int)
         self.assertNotEqual(database.query("SELECT * FROM otel_traces.plain", user="backup_probe").returncode, 0)
 
-    def start_wrapper(self, database, *, revision="revision-1"):
+    def start_wrapper(self, database, *, revision="revision-1", projected_credentials=False):
         name = "backup-runtime-api-" + uuid.uuid4().hex[:10]
         config, api = self.root / "config", self.root / "api"
         config.mkdir(mode=0o755, exist_ok=True)
         api.mkdir(mode=0o755, exist_ok=True)
         project(self.root / "scripts", {"start-backup.sh": WRAPPER.read_text()})
-        self.addCleanup(lambda: docker("rm", "-f", "-v", name, check=False))
+        volumes = {kind: name + "-" + kind for kind in ("config", "api")} if projected_credentials else {}
+        for volume in volumes.values():
+            self.addCleanup(lambda volume=volume: docker("volume", "rm", volume, check=False))
+        self.addCleanup(lambda: docker("rm", "-f", "-v", name, name + "-projector", check=False))
+        if volumes:
+            for kind in volumes:
+                self.wrapper_projections[self.root / kind] = (name, self.root, volumes)
+            sync_projected_volumes(name, self.root, volumes)
         args = ["run", "-d", "--name", name, "--network", "container:" + database.name,
                "--user", "101:101", "--read-only", "--tmpfs", "/tmp:rw,size=33554432,uid=101,gid=101",
                "--tmpfs", "/tmp/clickhouse-backup:rw,size=1048576,uid=101,gid=101",
                "--env", "BACKUP_PASSWORD_REVISION=" + revision,
-               "--mount", f"type=bind,source={config},target=/etc/clickhouse-backup,readonly",
-               "--mount", f"type=bind,source={api},target=/etc/clickhouse-backup-api,readonly",
                "--mount", f"type=bind,source={self.root / 'scripts'},target=/scripts,readonly",
                "--entrypoint", "/bin/sh"]
+        for kind, directory, target in (("config", config, "/etc/clickhouse-backup"),
+                                         ("api", api, "/etc/clickhouse-backup-api")):
+            source = f"type=volume,source={volumes[kind]}" if volumes else f"type=bind,source={directory}"
+            args += ["--mount", source + f",target={target},readonly"]
         if database.data_volume:
             args += ["--mount", f"type=volume,source={database.data_volume},target=/var/lib/clickhouse"]
         docker(*args, BACKUP_IMAGE, "/scripts/start-backup.sh")
@@ -381,6 +397,8 @@ except backup.ReplicaError:
 
     def update_projection(self, directory, files):
         project(directory, files)
+        if directory in self.wrapper_projections:
+            sync_projected_volumes(*self.wrapper_projections[directory])
         # The next poll must explain this update, not an earlier missing key.
         return datetime.now(timezone.utc).isoformat()
 
@@ -435,7 +453,7 @@ except urllib.error.HTTPError as error:
     def test_stock_wrapper_waits_for_database_configuration_and_password(self):
         database = self.db()
         project(self.root / "api", {"password": "dummy-api-password", "revision": "revision-1"})
-        name = self.start_wrapper(database)
+        name = self.start_wrapper(database, projected_credentials=True)
         self.assert_waiting(name, "database configuration is missing")
         source = self.config_source()
         # The rendered source may omit/empty its YAML password: the separate
@@ -454,13 +472,13 @@ except urllib.error.HTTPError as error:
         # password file is present and nonempty.
         self.assertEqual(yaml.safe_load(source["config.yml"])["clickhouse"]["password"], "")
         self.assertTrue(source["password"])
-        project(self.root / "config", source)
+        self.update_projection(self.root / "config", source)
         self.assert_started(name, database)
 
     def test_stock_wrapper_waits_for_empty_or_mismatched_api_credentials(self):
         database = self.db()
         project(self.root / "config", self.config_source())
-        name = self.start_wrapper(database)
+        name = self.start_wrapper(database, projected_credentials=True)
         self.assert_waiting(name, "API revision is missing or does not match")
         since = self.update_projection(self.root / "api", {"password": "", "revision": "revision-1"})
         self.assert_waiting(name, "API password is empty", since=since)
@@ -468,7 +486,7 @@ except urllib.error.HTTPError as error:
         self.assert_waiting(name, "API revision is missing or does not match", since=since)
         since = self.update_projection(self.root / "api", {"password": "dummy-api-password", "revision": "revision-1\n"})
         self.assert_waiting(name, "API revision is missing or does not match", since=since)
-        project(self.root / "api", {"password": "dummy-api-password", "revision": "revision-1"})
+        self.update_projection(self.root / "api", {"password": "dummy-api-password", "revision": "revision-1"})
         self.assert_started(name, database)
 
     def test_stock_wrapper_requires_an_expected_revision(self):
