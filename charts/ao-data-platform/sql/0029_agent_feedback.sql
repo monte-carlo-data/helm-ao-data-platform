@@ -1,7 +1,6 @@
--- End-user feedback on agent responses (thumbs up/down, whether a comment was left,
--- and the categories the user picked), written by Monte Carlo (monte_carlo user)
--- for agents whose platform stores feedback outside the trace spans, such as
--- Snowflake Cortex agents. Comment text and the rating user are not stored here.
+-- Snowflake Cortex end-user feedback on agent responses (thumbs up/down and whether a
+-- comment was left), written by Monte Carlo (monte_carlo user). Comment text and the
+-- rating user are not stored here.
 --
 -- Feedback names the rated turn by request_id, not by trace. agent_turn_links maps
 -- each request_id to its trace, and reads join the two tables on
