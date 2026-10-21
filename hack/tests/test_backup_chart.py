@@ -438,6 +438,52 @@ class BackupChartTests(unittest.TestCase):
                     scripts = one(docs, "ConfigMap", name + "-backup-job")["data"]
                     self.assertIn("cleanup_backups.py", scripts)
 
+    def test_local_cleanup_is_opt_in_and_does_not_change_database_pods(self):
+        baseline = render()
+        baseline_chi = one(baseline, "ClickHouseInstallation")
+        baseline_scripts = one(baseline, "ConfigMap", "otel-backup-job")["data"]
+        self.assertNotIn("cleanup_local_backups.py", baseline_scripts)
+        for execute in (False, True):
+            docs = render("clickhouse.backup.localCleanup.enabled=true",
+                          "clickhouse.backup.localCleanup.dryRun=" + str(not execute).lower())
+            self.assertEqual(one(docs, "ClickHouseInstallation"), baseline_chi)
+            self.assertEqual(one(docs, "ClickHouseKeeperInstallation"), one(baseline, "ClickHouseKeeperInstallation"))
+            job = one(docs, "CronJob")["spec"]["jobTemplate"]["spec"]
+            self.assertEqual(job["activeDeadlineSeconds"], 10800 + 1800 + 60)
+            env = {x["name"]: x.get("value") for x in job["template"]["spec"]["containers"][0]["env"]}
+            self.assertEqual(env["BACKUP_LOCAL_CLEANUP_ENABLED"], "true")
+            self.assertEqual(env["BACKUP_LOCAL_CLEANUP_DRY_RUN"], str(not execute).lower())
+            self.assertEqual(env["BACKUP_LOCAL_KEEP_FULL_BACKUP_DAYS"], "2")
+            self.assertNotIn("BACKUP_CLEANUP_ENABLED", env)
+            scripts = one(docs, "ConfigMap", "otel-backup-job")["data"]
+            self.assertIn("cleanup_local_backups.py", scripts)
+            self.assertIn("cleanup_backups.py", scripts)
+            self.assertNotEqual(scripts["cleanup_local_backups.py"].strip(), "")
+
+    def test_local_cleanup_rejects_invalid_settings_and_still_blocks_s3_deletion(self):
+        for setting in ("keepFullBackupDays=1", "keepFullBackupDays=-2", "keepFullBackupDays=2.5",
+                        "timeoutSeconds=59", "timeoutSeconds=60.5", "dryRun=invalid"):
+            with self.subTest(setting=setting), self.assertRaisesRegex(AssertionError, "localCleanup"):
+                render("clickhouse.backup.localCleanup.enabled=true", "clickhouse.backup.localCleanup." + setting)
+        with self.assertRaisesRegex(AssertionError, "requires clickhouse.backup.enabled"):
+            render("clickhouse.backup.localCleanup.enabled=true", backup=False)
+        with self.assertRaisesRegex(AssertionError, "cleanup.dryRun must remain true"):
+            render("clickhouse.backup.localCleanup.enabled=true", "clickhouse.backup.localCleanup.dryRun=false",
+                   "clickhouse.backup.cleanup.enabled=true", "clickhouse.backup.cleanup.dryRun=false")
+
+    def test_both_cleanup_timeouts_are_included_in_job_and_notes(self):
+        docs = render("clickhouse.backup.localCleanup.enabled=true", "clickhouse.backup.cleanup.enabled=true")
+        self.assertEqual(one(docs, "CronJob")["spec"]["jobTemplate"]["spec"]["activeDeadlineSeconds"], 14460)
+        values = yaml.safe_load((CHART / "values.yaml").read_text())
+        values["clickhouse"]["backup"]["enabled"] = True
+        values["clickhouse"]["backup"]["cleanup"]["enabled"] = True
+        values["clickhouse"]["backup"]["localCleanup"]["enabled"] = True
+        notes = render_secret_template((CHART / "templates/NOTES.txt").read_text(), {
+            "Values": values, "Release": {"Namespace": "render-test"},
+        })
+        self.assertIn("WARNING:", notes)
+        self.assertIn("1800 seconds for local backup cleanup", notes)
+
     def test_backup_copy_count_must_be_a_positive_integer(self):
         for cleanup in (False, True):
             for count in ("0", "-1", "1.5", "true", "abc"):

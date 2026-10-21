@@ -20,7 +20,7 @@ Verify the deployment:
   kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/name=opentelemetry-collector
 {{- if .Values.clickhouse.backup.enabled }}
 {{- $b := .Values.clickhouse.backup }}
-{{- $deadline := add (int $b.schedule.timeoutSeconds) (ternary (int $b.cleanup.timeoutSeconds) 0 $b.cleanup.enabled) 60 }}
+{{- $deadline := add (int $b.schedule.timeoutSeconds) (ternary (int $b.cleanup.timeoutSeconds) 0 $b.cleanup.enabled) (ternary (int $b.localCleanup.timeoutSeconds) 0 $b.localCleanup.enabled) 60 }}
 
 Backups: the scheduler waits up to {{ $b.schedule.timeoutSeconds }}
 seconds. Kubernetes sets the Job deadline to {{ $deadline }}
@@ -29,6 +29,10 @@ not cancel server-side work. A job still running
 at the next scheduled time causes that run to be skipped (concurrencyPolicy: Forbid).
 {{- if $b.cleanup.enabled }}
 The Job deadline includes {{ $b.cleanup.timeoutSeconds }} seconds for the cleanup preview.
+{{- end }}
+{{- if $b.localCleanup.enabled }}
+The Job deadline includes {{ $b.localCleanup.timeoutSeconds }} seconds for local backup cleanup.
+Local cleanup {{ if $b.localCleanup.dryRun }}only previews removals{{ else }}removes older database-disk records while preserving completed S3 backups{{ end }}.
 {{- end }}
 {{- if and (eq $b.schedule.cron "0 */4 * * *") (ge $deadline 14400) }}
 WARNING: the Job deadline reaches or exceeds the four-hour schedule interval.
