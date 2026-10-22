@@ -645,7 +645,7 @@ class CleanupChartTests(unittest.TestCase):
         from test_backup_chart import render
         for value in ("false", "not-boolean", "1"):
             with self.subTest(value=value), self.assertRaisesRegex(
-                    AssertionError, "deletion is unavailable.*dryRun must remain true"):
+                    AssertionError, "count-and-age supports preview only|dryRun must be a boolean"):
                 render("clickhouse.backup.cleanup.enabled=true", "clickhouse.backup.cleanup.dryRun=" + value)
 
     def test_cleanup_enabled_requires_a_boolean(self):

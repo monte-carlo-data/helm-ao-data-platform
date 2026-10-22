@@ -1,8 +1,8 @@
 # Scheduled ClickHouse backups
 
-This uses ClickHouse `26.4.3` and the standard Altinity clickhouse-backup `2.8.1`
+This uses ClickHouse `26.4.3` and the standard Altinity clickhouse-backup `2.8.2`
 image. The chart pins the published multi-platform digest; it does not build or
-patch the backup software. Source: https://github.com/Altinity/clickhouse-backup/tree/v2.8.1
+patch the backup software. Source: https://github.com/Altinity/clickhouse-backup/tree/v2.8.2
 
 A chart-supplied startup script waits for nonempty database and API passwords,
 checks the API revision, and validates a private copy of the configuration with
@@ -183,7 +183,7 @@ schedule after the roll and verify a backup. Suspending first also avoids failed
 Jobs during this planned change; suspension does not stop work already running.
 
 Use only dummy passwords for denied-access tests and never put credentials in
-`?user=&pass=` URLs. Stock Altinity 2.8.1 can log submitted passwords when
+`?user=&pass=` URLs. The stock backup API can log submitted passwords when
 authentication fails. The scheduler checks revisions before sending passwords,
 and rotation must stay paused until all copies use the new revision. Restrict
 access to backup-container logs as well as the API.
@@ -289,12 +289,25 @@ local entries and scheduler-owned local files without remote backups are listed
 separately; no files are removed. Other preview errors log
 `Backup cleanup preview stopped:` and leave the successful backup Job successful.
 
-Keep `cleanup.dryRun: true` when cleanup is enabled: this option does not delete
-S3 backups, and changing the image cannot enable S3 deletion. See
-[why deletion is unavailable](backup-cleanup.md#why-deletion-is-unavailable)
-for the upstream limitation and [retention previews](backup-cleanup.md) for
-configuration and checks. The Job deadline includes `cleanup.timeoutSeconds`,
-so allow time for both backup and preview before the next scheduled run.
+This existing count-and-age policy remains preview-only. See
+[backup cleanup](backup-cleanup.md) for the report and the separate whole-set
+policy below. The Job deadline includes `cleanup.timeoutSeconds`, so allow time
+for both backup and cleanup before the next scheduled run.
+
+## Optional S3 deletion (5.8.0+)
+
+`cleanup.retentionPolicy: daily-weekly` selects complete full-backup/incremental
+sets. The default windows keep daily sets from the latest seven UTC dates and
+one available day per older UTC week through thirty dates. Start with
+`cleanup.dryRun: true`. Explicitly setting it to `false` permits deletion after
+a verified backup. Every copy must run the verified Altinity 2.8.2 image.
+
+The cleaner removes expired local records first while their S3 files still
+exist, then removes the S3 backup. This also works when the separate local
+cleanup already removed those records. Saved S3 object versions require their
+own optional expiry rule to stop accumulating. See
+[backup cleanup](backup-cleanup.md) for the exact retention rules, removal
+checks, and tests to run before enabling deletion.
 
 ## Optional database-disk record cleanup (5.7.0+)
 
@@ -308,8 +321,8 @@ have been removed. This option does not enable S3 deletion.
 
 ## Current limitations
 
-- **No automatic S3 retention.** Both built-in keep-counts are zero, so the backup
-  tool never automatically deletes S3 backups. With the default schedule, expect roughly one full backup's
+- **Cleanup is off by default.** Both built-in keep-counts remain zero. Without
+  enabling the separate cleanup options, expect roughly one full backup's
   storage growth per day, plus incremental data and metadata; watch bucket size.
   The native S3 disk also keeps small pointer files on the database's data volume
   under `/var/lib/clickhouse/disks/backups_s3/`. A full backup adds pointers for
@@ -326,14 +339,12 @@ have been removed. This option does not enable S3 deletion.
   prefer a StorageClass using XFS, which allocates file entries as needed; it
   still needs enough disk space. Do not convert an existing data volume as part
   of enabling backups.
-  Bucket lifecycle rules are separate and must not expire either backup prefix.
-  The cleanup preview in 5.3.0 does not limit this growth. On a copy with a
-  matching local backup, manual `delete remote` removes the remote catalog
-  prefix and leaves native S3 data for a later local deletion. That later step
-  skips native JSON files in 2.8.1. This chart has no supported S3 retention procedure; do not treat manual
-  catalog removal as freeing S3 space. The separate local-cleanup option removes
-  older database-disk records only while their completed S3 backups remain. See [why deletion is unavailable](backup-cleanup.md#why-deletion-is-unavailable)
-  and [local files in the report](backup-cleanup.md#local-files-in-the-report).
+  Do not use bucket rules that expire current files by age: those rules do not
+  understand full/incremental dependencies. The optional S3 cleaner selects
+  complete sets; the separate local cleaner can remove records while their
+  S3 backups stay. An optional bucket rule can expire saved older S3 versions
+  after a chosen recovery period. See
+  [backup cleanup](backup-cleanup.md#native-files-and-saved-s3-versions).
 - **Restore is not yet supported or documented.** A successful backup Job is not
   proof that a restore works. The scheduled configuration disables cluster-wide
   backup/restore. Embedded mode ignores `restore_schema_on_cluster`; a separate
@@ -341,7 +352,7 @@ have been removed. This option does not enable S3 deletion.
 - **No backup alerts.** Watch for failed `otel-backup` Jobs and for expected
   scheduled Jobs that never ran; a skipped run produces no failed Job. Cleanup
   preview problems do not fail a Job after a verified backup: watch for log
-  lines starting `Backup cleanup preview stopped:` or
+  lines starting `Backup cleanup preview stopped:`, `Backup cleanup stopped:`, or
   `Backup local cleanup stopped:` and for the local-files warning. This chart does not send alerts for those conditions.
 - **Freshness checks are a point-in-time check.** They exclude replicas with
   missing or delayed data before backup submission; pod Ready alone is not used.
@@ -350,7 +361,7 @@ have been removed. This option does not enable S3 deletion.
 
 ## Interrupted base downloads
 
-Stock 2.8.1 writes `metadata.json` last when downloading a backup. An interrupted
+The backup software writes `metadata.json` last when downloading a backup. An interrupted
 download can leave a local entry described as `broken metadata.json not found`
 or `parse metadata.json error: ...`. The scheduler can work around that entry as
 described above, but it does not remove the files.

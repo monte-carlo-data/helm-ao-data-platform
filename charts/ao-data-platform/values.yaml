@@ -29,8 +29,8 @@ clickhouse:
     enabled: false
     provider: aws
     sidecar:
-      # Official Altinity 2.8.1 image, pinned to its multi-platform digest.
-      image: altinity/clickhouse-backup:2.8.1@sha256:08016b048f7e6035c048501315c2a788e5a782f15f168e042c7bd48d5a388cc4
+      # Official Altinity 2.8.2 image, pinned to its multi-platform digest.
+      image: altinity/clickhouse-backup:2.8.2@sha256:bc32794f2bd95d780bf6a0fea093d0ee463ec8e7dc486ccb845ce47b3406fad5
       goMemoryLimit: "400MiB"
       resources:
         requests: {cpu: 100m, memory: 128Mi}
@@ -87,15 +87,21 @@ clickhouse:
         requests: {cpu: 25m, memory: 32Mi}
         limits: {memory: 128Mi}
     cleanup:
-      # Preview checks every configured ClickHouse copy; all must be reachable.
+      # Runs after a verified backup; every configured copy must be reachable.
       enabled: false
-      # Preview only: stock clickhouse-backup 2.8.1 cannot safely remove native files.
-      # When cleanup is enabled, any value but true is rejected; S3 deletion stays off.
+      # Review a preview first. Deletion requires daily-weekly and the 2.8.2 image.
       dryRun: true
+      # Keep the existing preview policy unless whole-set retention is selected.
+      retentionPolicy: count-and-age
+      # count-and-age preview settings:
       keepLast: 2
       # Also keep every backup from the last N days, plus their bases.
       # 0 disables the age window so only keepLast applies. Use 30 for real data.
       keepDays: 0
+      # daily-weekly settings: every recent UTC day, then one day's complete
+      # sets per older Monday-Sunday week, within historyDays including today.
+      dailyDays: 7
+      historyDays: 30
       timeoutSeconds: 1800
     localCleanup:
       # Remove older local records only when their completed S3 backups exist.

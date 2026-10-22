@@ -11,7 +11,7 @@ clickhouse:
     serviceAccount:
       name: ci-clickhouse-backup
     sidecar:
-      image: altinity/clickhouse-backup:2.8.1@sha256:08016b048f7e6035c048501315c2a788e5a782f15f168e042c7bd48d5a388cc4
+      image: altinity/clickhouse-backup:2.8.2@sha256:bc32794f2bd95d780bf6a0fea093d0ee463ec8e7dc486ccb845ce47b3406fad5
     user:
       externalSecret:
         secretStoreRef:

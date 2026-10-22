@@ -51,8 +51,8 @@ class AlternatePortDatabase(runtime.Database):
                               check=False, timeout=30)
 
 
-@unittest.skipUnless(os.environ.get("RUN_BACKUP_RUNTIME") == "1", "opt-in local Docker test")
-class LocalBackupCleanupRuntimeTests(runtime.BackupRuntimeHelpers, unittest.TestCase):
+class LocalBackupCleanupRuntimeHelpers(runtime.BackupRuntimeHelpers):
+    """Two-copy fixtures shared by local and remote cleanup checks."""
     def failover_actions(self, rows):
         # Execute only the documented helper's history parser, never its live
         # backup test. Feed it histories returned by the actual stock server.
@@ -172,6 +172,9 @@ print(json.dumps(result, sort_keys=True))
         result = runtime.docker("exec", database.name, "du", "-sk", path)
         return int(result.stdout.split()[0]) * 1024
 
+
+@unittest.skipUnless(os.environ.get("RUN_BACKUP_RUNTIME") == "1", "opt-in local Docker test")
+class LocalBackupCleanupRuntimeTests(LocalBackupCleanupRuntimeHelpers, unittest.TestCase):
     def test_local_cleanup_preserves_s3_recovery_and_next_incremental(self):
         storage, credentials = self.start_s3()
         databases = [self.start_copy(storage, credentials, index) for index in range(2)]

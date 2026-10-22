@@ -20,8 +20,10 @@
 {{- if not (regexMatch "^[a-zA-Z0-9_-]+(/[a-zA-Z0-9_-]+)*$" $b.aws.path) -}}{{- fail "clickhouse.backup.aws.path must contain safe directory names without leading or trailing slashes." -}}{{- end -}}
 {{- if or (not $b.serviceAccount.name) (eq $b.serviceAccount.name "default") -}}{{- fail "clickhouse.backup.serviceAccount.name must be a dedicated account, not default." -}}{{- end -}}
 {{- if not $b.user.secret -}}{{- fail "clickhouse.backup.user.secret must name the backup credentials Secret." -}}{{- end -}}
-{{/* The startup wrapper and scheduler were verified against this exact stock build; mirrors must preserve its digest. */}}
-{{- if not (regexMatch "^[^[:space:]@]+@sha256:08016b048f7e6035c048501315c2a788e5a782f15f168e042c7bd48d5a388cc4$" $b.sidecar.image) -}}{{- fail "clickhouse.backup.sidecar.image must use the verified Altinity 2.8.1 digest; another registry or repository is allowed." -}}{{- end -}}
+{{/* Preserve the older image for previews/local cleanup; S3 deletion requires the fixed build. */}}
+{{- $fixedImage := regexMatch "^[^[:space:]@]+@sha256:bc32794f2bd95d780bf6a0fea093d0ee463ec8e7dc486ccb845ce47b3406fad5$" $b.sidecar.image -}}
+{{- $previousImage := regexMatch "^[^[:space:]@]+@sha256:08016b048f7e6035c048501315c2a788e5a782f15f168e042c7bd48d5a388cc4$" $b.sidecar.image -}}
+{{- if not (or $fixedImage $previousImage) -}}{{- fail "clickhouse.backup.sidecar.image must use a verified Altinity 2.8.1 or 2.8.2 digest; another registry or repository is allowed." -}}{{- end -}}
 {{- if not $b.probe.secret -}}{{- fail "clickhouse.backup.probe.secret is required." -}}{{- end -}}
 {{- if not (regexMatch "^[a-zA-Z0-9._-]+$" (toString $b.api.passwordRevision)) -}}{{- fail "clickhouse.backup.api.passwordRevision must be a nonempty revision using letters, digits, dots, underscores, or hyphens." -}}{{- end -}}
 {{- $externalAPI := not (empty (dig "secretStoreRef" "name" "" ($b.api.externalSecret | default dict))) -}}
@@ -44,10 +46,22 @@
 {{- end -}}
 {{- end -}}
 {{- if $b.cleanup.enabled -}}
-{{- if ne (toString $b.cleanup.dryRun) "true" -}}{{- fail "S3 backup deletion is unavailable with stock clickhouse-backup 2.8.1; cleanup.dryRun must remain true." -}}{{- end -}}
+{{- if not (kindIs "bool" $b.cleanup.dryRun) -}}{{- fail "clickhouse.backup.cleanup.dryRun must be a boolean." -}}{{- end -}}
+{{- if not (has $b.cleanup.retentionPolicy (list "count-and-age" "daily-weekly")) -}}{{- fail "clickhouse.backup.cleanup.retentionPolicy must be count-and-age or daily-weekly." -}}{{- end -}}
+{{- if not $b.cleanup.dryRun -}}
+{{- if ne $b.cleanup.retentionPolicy "daily-weekly" -}}{{- fail "S3 deletion requires cleanup.retentionPolicy=daily-weekly; count-and-age supports preview only." -}}{{- end -}}
+{{- if not $fixedImage -}}{{- fail "S3 deletion requires the verified Altinity 2.8.2 image digest." -}}{{- end -}}
+{{- end -}}
 {{- range $key, $minimum := dict "keepLast" 1 "keepDays" 0 "timeoutSeconds" 60 -}}
 {{- $value := index $b.cleanup $key -}}
 {{- if or (not (regexMatch "^[0-9]+$" (toString $value))) (lt (int $value) $minimum) -}}{{- fail (printf "clickhouse.backup.cleanup.%s must be an integer >= %d." $key $minimum) -}}{{- end -}}
+{{- end -}}
+{{- if eq $b.cleanup.retentionPolicy "daily-weekly" -}}
+{{- range $key := list "dailyDays" "historyDays" -}}
+{{- $value := index $b.cleanup $key -}}
+{{- if or (not (regexMatch "^[0-9]+$" (toString $value))) (lt (int $value) 1) -}}{{- fail (printf "clickhouse.backup.cleanup.%s must be a positive integer." $key) -}}{{- end -}}
+{{- end -}}
+{{- if lt (int $b.cleanup.historyDays) (int $b.cleanup.dailyDays) -}}{{- fail "clickhouse.backup.cleanup.historyDays must be at least dailyDays." -}}{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- else -}}
