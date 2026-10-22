@@ -8,8 +8,8 @@
 -- either order and in different writes.
 --
 -- service_name matches spans_normalized. agent_mcon tells apart agents that share
--- a service_name. Writes may repeat a row; reads keep the newest submitted_at per
--- trace with LIMIT 1 BY, as for the eval score tables (0013, 0018).
+-- a service_name. Writes may repeat a row in either table. Reads keep the newest
+-- submitted_at per trace with LIMIT 1 BY, which also drops repeated links.
 -- The 30-day TTL matches the spans; the schema Job's ttlDays ALTER is the source
 -- of truth on upgrades.
 CREATE TABLE IF NOT EXISTS otel_traces.agent_feedback ON CLUSTER '{cluster}'
