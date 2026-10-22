@@ -21,7 +21,7 @@ import time
 
 
 POD_SCRIPT = r'''
-import contextlib, hashlib, io, json, os, sys
+import contextlib, hashlib, io, json, os, re, sys
 from datetime import datetime, timezone
 from pathlib import Path
 sys.path.insert(0, "/scripts")
@@ -43,14 +43,31 @@ def catalog(api, where):
 def actions(api):
     # v2.8.1 /backup/status shows only the last action; /actions shows all history.
     rows = api.request("GET", "/backup/actions")
-    check(all(isinstance(r.get("command"), str) and r.get("status") in
+    check(isinstance(rows, list) and all(isinstance(r, dict)
+              and isinstance(r.get("command"), str) and r["command"].strip() and r.get("status") in
               ("success", "error", "cancel", "in progress") for r in rows), "Unexpected action history.")
     check(not any(r.get("status") == "in progress" for r in rows),
           "A backup command is already running; stop and inspect it.")
     mutations = [r for r in rows if r["command"].split(" ", 1)[0] not in ("list", "tables")]
-    check(all(isinstance(r.get("operation_id"), str) and r["operation_id"] for r in mutations),
-          "An operation ID is missing; action history cannot be verified.")
-    return sorted((r["operation_id"], r["command"], r.get("start", ""), r["status"]) for r in mutations)
+    history = []
+    for row in mutations:
+        identifier = row.get("operation_id", "")
+        local_delete = re.fullmatch(r"delete local ao-otel-(?:full|incremental)-\d{8}T\d{6}Z-[0-9a-f]{8}",
+                                    row["command"])
+        if local_delete:
+            # v2.8.1 records synchronous deletion without an operation ID.
+            # Keep its completed record in comparisons; never ignore deletion.
+            check(row["status"] == "success" and all(isinstance(row.get(key), str) and row[key]
+                  for key in ("start", "finish")),
+                  "A local deletion is incomplete or unreadable; stop and inspect it.")
+        check(isinstance(identifier, str) and (identifier or local_delete),
+              "An operation ID is missing; action history cannot be verified.")
+        history.append((identifier, row["command"], row.get("start", ""), row["status"], row.get("finish", "")))
+    check(len(history) == len(set(history)), "Duplicate action history cannot be verified.")
+    return sorted(history)
+
+def deletions(history):
+    return [row for row in history if row[1].startswith("delete ")]
 
 sent = []
 try:
@@ -78,7 +95,10 @@ try:
           "Copy 1 already has this full backup; use a future full to test downloading it.")
     baseline0 = actions(real[0])
     check(bool(baseline0), "Copy 0's operation history is empty; this check would be inconclusive.")
-    actions(real[1])
+    baseline1_deletions = deletions(actions(real[1]))
+    def check_copy_one_deletions():
+        check(deletions(actions(real[1])) == baseline1_deletions,
+              "Copy 1's deletion history changed; stop and inspect it.")
     for api in real:
         check(catalog(api, "remote") == before, "The remote catalog changed during preflight.")
     selected = []
@@ -101,7 +121,7 @@ try:
             window()
             check(selected == [1], "The scheduler must select copy 1 exactly once.")
             check(actions(real[0]) == baseline0, "Copy 0's action history changed.")
-            actions(real[1])
+            check_copy_one_deletions()
             for api in real:
                 check(catalog(api, "remote") == before, "Another backup changed the remote catalog.")
             operation = "download" if path == "/backup/download/" + expected else "create_remote"
@@ -130,7 +150,7 @@ try:
           "Copy 1's downloaded full metadata or new backup is missing.")
     check(name not in catalog(real[0], "local") and actions(real[0]) == baseline0,
           "Copy 0 created work or its action history changed.")
-    actions(real[1])
+    check_copy_one_deletions()
     check(sent == ["download", "create_remote"], "The test did not submit exactly the expected two operations.")
     print("EVIDENCE " + json.dumps({"status":"passed", "selected_copy":1,
           "backup":name, "type":"incremental", "required":expected,

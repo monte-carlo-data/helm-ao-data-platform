@@ -45,6 +45,11 @@ def metadata(name=FULL, location="remote", required=""):
             "desc":"directory, embedded" if location == "remote" else "embedded"}
 
 
+def completed_local_delete():
+    return {"command": "delete local ao-otel-full-20260926T000000Z-12345678",
+            "status": "success", "start": "2026-09-28 20:00:00", "finish": "2026-09-28 20:00:01"}
+
+
 class CopyAPI:
     def __init__(self, remote, first=False, unavailable=False):
         self.remote = remote
@@ -75,7 +80,7 @@ class CopyAPI:
         if path == "/backup/actions":
             return list(self.history)
         if path == "/backup/status":
-            return [h for h in self.history if h["operation_id"] == query["operationid"]] if query else self.history[-1:]
+            return [h for h in self.history if h.get("operation_id") == query["operationid"]] if query else self.history[-1:]
         if path == "/backup/tables":
             return [{"database":"otel_traces", "name":"spans"}]
         if path == "/backup/list/remote":
@@ -167,6 +172,95 @@ class PodTests(unittest.TestCase):
         self.assertEqual(result["required"], FULL)
         self.assertEqual(self.copies[0].posts, [])
         self.assertEqual([p[0] for p in self.copies[1].posts], ["/backup/download/" + FULL, "/backup/create_remote"])
+
+    def test_completed_local_deletions_without_ids_on_both_copies_allow_verification(self):
+        for copy in self.copies:
+            copy.history.append(completed_local_delete())
+        result = self.run_pod()
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(result["copy0_mutations"], 0)
+        self.assertEqual(self.copies[0].posts, [])
+        self.assertEqual(len(self.copies[1].posts), 2)
+
+    def test_incomplete_or_failed_local_deletion_blocks_before_any_post(self):
+        for changes in ({"status": "error"}, {"status": "cancel"}, {"start": ""},
+                        {"finish": ""}, {"finish": None}):
+            with self.subTest(changes=changes):
+                self.setUp()
+                self.copies[0].history.append({**completed_local_delete(), **changes})
+                self.assert_inconclusive(self.run_pod(),
+                    "A local deletion is incomplete or unreadable; stop and inspect it.")
+                self.assertEqual(self.copies[0].posts + self.copies[1].posts, [])
+
+    def test_running_local_deletion_without_id_still_blocks_before_any_post(self):
+        self.copies[1].history.append({**completed_local_delete(), "status": "in progress"})
+        self.assert_inconclusive(self.run_pod(), "A backup command is already running; stop and inspect it.")
+        self.assertEqual(self.copies[0].posts + self.copies[1].posts, [])
+
+    def test_duplicate_local_deletion_records_are_not_treated_as_unambiguous(self):
+        self.copies[0].history.extend([completed_local_delete(), completed_local_delete()])
+        self.assert_inconclusive(self.run_pod(), "Duplicate action history cannot be verified.")
+        self.assertEqual(self.copies[0].posts + self.copies[1].posts, [])
+
+    def test_other_mutations_and_unexpected_deletions_still_require_operation_ids(self):
+        commands = ["create_remote " + FULL, "download " + FULL, "restore " + FULL,
+                    "delete remote " + FULL, "delete local manual", "delete local " + FULL + " --force"]
+        for command in commands:
+            with self.subTest(command=command):
+                self.setUp()
+                self.copies[1].history.append({**completed_local_delete(), "command": command})
+                self.assert_inconclusive(self.run_pod(),
+                    "An operation ID is missing; action history cannot be verified.")
+                self.assertEqual(self.copies[0].posts + self.copies[1].posts, [])
+
+    def test_local_deletion_history_changes_on_either_copy_stop_before_first_post(self):
+        original = scheduler.Scheduler.prepare_base
+        for copy_index in (0, 1):
+            for change in ("add", "remove", "finish"):
+                with self.subTest(copy=copy_index, change=change):
+                    self.setUp()
+                    if change != "add":
+                        self.copies[copy_index].history.append(completed_local_delete())
+                    def prepare_base(instance, api, name):
+                        history = self.copies[copy_index].history
+                        if change == "add":
+                            history.append(completed_local_delete())
+                        elif change == "remove":
+                            history.pop()
+                        else:
+                            history[-1]["finish"] = "2026-09-28 20:00:02"
+                        return original(instance, api, name)
+                    with mock.patch.object(scheduler.Scheduler, "prepare_base", prepare_base):
+                        result = self.run_pod()
+                    self.assert_inconclusive(result, "Copy 0's action history changed." if copy_index == 0
+                        else "Copy 1's deletion history changed; stop and inspect it.")
+                    self.assertEqual(self.copies[0].posts + self.copies[1].posts, [])
+
+    def test_local_deletion_after_download_stops_before_creating_backup(self):
+        original = self.copies[1].request
+        def request(method, path, query=None):
+            response = original(method, path, query)
+            if method == "POST" and path == "/backup/download/" + FULL:
+                self.copies[1].history.append(completed_local_delete())
+            return response
+        with mock.patch.object(self.copies[1], "request", request):
+            result = self.run_pod()
+        self.assert_inconclusive(result, "Copy 1's deletion history changed; stop and inspect it.", requests_sent=1)
+        self.assertEqual([post[0] for post in self.copies[1].posts], ["/backup/download/" + FULL])
+        self.assertEqual(self.copies[0].posts, [])
+
+    def test_local_deletion_after_upload_prevents_claiming_success(self):
+        original = self.copies[1].request
+        def request(method, path, query=None):
+            response = original(method, path, query)
+            if method == "POST" and path == "/backup/create_remote":
+                self.copies[1].history.append(completed_local_delete())
+            return response
+        with mock.patch.object(self.copies[1], "request", request):
+            result = self.run_pod()
+        self.assert_inconclusive(result, "Copy 1's deletion history changed; stop and inspect it.", requests_sent=2)
+        self.assertEqual(len(self.copies[1].posts), 2)
+        self.assertEqual(self.copies[0].posts, [])
 
     def test_either_changed_script_blocks_before_api_access(self):
         for script in ("run_backup.py", "backup_common.py"):

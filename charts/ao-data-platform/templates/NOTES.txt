@@ -25,8 +25,10 @@ Verify the deployment:
 Backups: the scheduler waits up to {{ $b.schedule.timeoutSeconds }}
 seconds. Kubernetes sets the Job deadline to {{ $deadline }}
 seconds; the backup tool separately has a four-hour timeout. Ending the Job does
-not cancel server-side work. A job still running
-at the next scheduled time causes that run to be skipped (concurrencyPolicy: Forbid).
+not cancel server-side work. A Job still running at the next scheduled time
+delays that run (concurrencyPolicy: Forbid). It can start up to
+{{ $b.schedule.startingDeadlineSeconds }} seconds late; after that, the missed
+run is skipped (startingDeadlineSeconds: {{ $b.schedule.startingDeadlineSeconds }}).
 {{- if $b.cleanup.enabled }}
 The Job deadline includes {{ $b.cleanup.timeoutSeconds }} seconds for the cleanup preview.
 {{- end }}
@@ -36,7 +38,7 @@ Local cleanup {{ if $b.localCleanup.dryRun }}only previews removals{{ else }}rem
 {{- end }}
 {{- if and (eq $b.schedule.cron "0 */4 * * *") (ge $deadline 14400) }}
 WARNING: the Job deadline reaches or exceeds the four-hour schedule interval.
-Shorten the timeout or allow for skipped scheduled runs.
+Shorten the timeout or allow for delayed, and possibly skipped, scheduled runs.
 {{- else if ne $b.schedule.cron "0 */4 * * *" }}
 You changed the schedule; check that the Job deadline is shorter than its interval.
 {{- end }}

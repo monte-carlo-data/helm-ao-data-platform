@@ -1,17 +1,20 @@
 """Opt-in local cleanup checks with stock ClickHouse, Altinity, and MinIO.
 
 RUN_BACKUP_RUNTIME=1 HELM=/path/to/helm python3 -m unittest discover \
-    -s hack/tests/runtime -p test_local_backup_cleanup_runtime.py -v
+    -s hack/tests/runtime -p 'test*runtime.py' -v
 
 All data and credentials are generated here. No ports are published, and the
 containers share a Docker network namespace with no external network access.
 Only the containers and volumes created by this test are removed.
 """
 
+import ast
 from datetime import datetime, timedelta, timezone
 import inspect
 import json
 import os
+import re
+from types import SimpleNamespace
 import unittest
 
 import yaml
@@ -49,13 +52,28 @@ class AlternatePortDatabase(runtime.Database):
 
 
 @unittest.skipUnless(os.environ.get("RUN_BACKUP_RUNTIME") == "1", "opt-in local Docker test")
-class LocalBackupCleanupRuntimeTests(unittest.TestCase):
-    setUpClass = classmethod(runtime.BackupRuntimeTests.setUpClass.__func__)
-    setUp = runtime.BackupRuntimeTests.setUp
-    runtime_python = runtime.BackupRuntimeTests.runtime_python
-    start_s3 = runtime.BackupRuntimeTests.start_s3
-    config_source = runtime.BackupRuntimeTests.config_source
-    assert_clean_logs = runtime.BackupRuntimeTests.assert_clean_logs
+class LocalBackupCleanupRuntimeTests(runtime.BackupRuntimeHelpers, unittest.TestCase):
+    def failover_actions(self, rows):
+        # Execute only the documented helper's history parser, never its live
+        # backup test. Feed it histories returned by the actual stock server.
+        path = runtime.CHART.parents[1] / "hack/verify-backup-failover.py"
+        module = ast.parse(path.read_text())
+        script = next(ast.literal_eval(node.value) for node in module.body
+                      if isinstance(node, ast.Assign)
+                      and any(isinstance(target, ast.Name) and target.id == "POD_SCRIPT"
+                              for target in node.targets))
+        names = {"CheckFailed", "check", "actions"}
+        definitions = [node for node in ast.parse(script).body
+                       if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in names]
+        self.assertEqual({node.name for node in definitions}, names)
+        namespace = {"re": re}
+        exec(compile(ast.Module(body=definitions, type_ignores=[]), str(path), "exec"), namespace)
+
+        def request(method, endpoint):
+            self.assertEqual((method, endpoint), ("GET", "/backup/actions"))
+            return rows
+
+        return namespace["actions"](SimpleNamespace(request=request))
 
     def sql(self, database, statement):
         result = database.query(statement)
@@ -76,14 +94,10 @@ class LocalBackupCleanupRuntimeTests(unittest.TestCase):
         config["clickhouse"]["port"] = database.tcp_port
         config["api"]["listen"] = "0.0.0.0:" + str(7171 + index)
         source["config.yml"] = yaml.safe_dump(config)
-        original_root = self.root
-        try:
-            self.root = database.root / "sidecar"
-            runtime.project(self.root / "config", source)
-            runtime.project(self.root / "api", {"password": "dummy-api-password", "revision": "revision-1"})
-            sidecar = runtime.BackupRuntimeTests.start_wrapper(self, database)
-        finally:
-            self.root = original_root
+        sidecar_root = database.root / "sidecar"
+        runtime.project(sidecar_root / "config", source)
+        runtime.project(sidecar_root / "api", {"password": "dummy-api-password", "revision": "revision-1"})
+        sidecar = self.start_wrapper(database, sidecar_root)
         self.client(storage, """
 import time
 deadline = time.monotonic() + 60
@@ -201,6 +215,17 @@ print('downloaded')
         self.assertEqual({(item["copy"], item["name"]) for item in cleaned["deleted"]}, expected_deleted)
         for copy in range(2):
             self.assertEqual(self.local_names(storage, copy), names - set(groups[0]))
+            history = json.loads(self.client(
+                storage, "print(json.dumps(api.request('GET', '/backup/actions')))", copy=copy))
+            deleted = [row for row in history if row["command"].startswith("delete local ")]
+            self.assertEqual({row["command"] for row in deleted},
+                             {"delete local " + name for name in groups[0]})
+            self.assertTrue(all(row["status"] == "success" and not row.get("operation_id")
+                                for row in deleted))
+            accepted = self.failover_actions(history)
+            self.assertEqual({row[1] for row in accepted if row[1].startswith("delete local ")},
+                             {row["command"] for row in deleted},
+                             "The copy-switch check must retain and accept completed local deletions")
         disk_bytes_after = [self.local_record_bytes(database) for database in databases]
         for old, current in zip(disk_bytes_before, disk_bytes_after):
             self.assertLess(current, old, "Local cleanup must free backup records on each database disk")

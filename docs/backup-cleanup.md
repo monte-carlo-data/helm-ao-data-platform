@@ -91,9 +91,11 @@ because its preview failed. This chart does not send preview alerts.
 The Job deadline is `schedule.timeoutSeconds + cleanup.timeoutSeconds + 60`,
 plus `localCleanup.timeoutSeconds` when database-disk cleanup is also enabled.
 Keep it below the scheduled interval, with time for startup and scheduling
-delays. Otherwise an unfinished Job can cause the next scheduled run to be
-skipped. Defaults allow 10800 seconds for backup and 1800 for preview, with a
-60-second allowance, on a four-hour schedule.
+delays. Otherwise an unfinished Job delays the next scheduled run. It can
+still start within the configured start deadline (900 seconds, or 15 minutes,
+by default); after that the missed run is skipped. Defaults allow 10800 seconds
+for backup and 1800 for preview, with a 60-second allowance, on a four-hour
+schedule.
 
 ## Local files in the report
 

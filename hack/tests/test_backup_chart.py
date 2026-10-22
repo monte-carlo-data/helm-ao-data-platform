@@ -484,6 +484,21 @@ class BackupChartTests(unittest.TestCase):
         self.assertIn("WARNING:", notes)
         self.assertIn("1800 seconds for local backup cleanup", notes)
 
+    def test_cleanup_timeouts_are_independent_and_only_enabled_budgets_count(self):
+        for local, remote in ((False, False), (False, True), (True, False), (True, True)):
+            with self.subTest(local=local, remote=remote):
+                docs = render("clickhouse.backup.localCleanup.enabled=" + str(local).lower(),
+                              "clickhouse.backup.cleanup.enabled=" + str(remote).lower(),
+                              "clickhouse.backup.localCleanup.timeoutSeconds=900",
+                              "clickhouse.backup.cleanup.timeoutSeconds=420")
+                job = one(docs, "CronJob")["spec"]["jobTemplate"]["spec"]
+                self.assertEqual(job["activeDeadlineSeconds"], 10800 + 60 + 900 * local + 420 * remote)
+                env = {item["name"]: item.get("value")
+                       for item in job["template"]["spec"]["containers"][0]["env"]}
+                self.assertEqual(env.get("BACKUP_LOCAL_CLEANUP_TIMEOUT_SECONDS"), "900" if local else None)
+                self.assertEqual(env.get("BACKUP_CLEANUP_TIMEOUT_SECONDS"), "420" if remote else None)
+                self.assertEqual(env.get("BACKUP_LOCAL_CLEANUP_ENABLED"), "true" if local else None)
+
     def test_backup_copy_count_must_be_a_positive_integer(self):
         for cleanup in (False, True):
             for count in ("0", "-1", "1.5", "true", "abc"):

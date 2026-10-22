@@ -258,8 +258,10 @@ These limits start from different events: scheduler
 startup and Job start, respectively. The stock tool requires its own ClickHouse
 timeout of four hours.
 Ending the Job does not cancel server-side work; check for a running operation
-before retrying. With `concurrencyPolicy: Forbid`, a Job that outlasts the cron interval causes scheduled
-runs to be skipped; leave time between the timeout and the next run.
+before retrying. With `concurrencyPolicy: Forbid`, an unfinished Job delays the
+next scheduled run. It can still start within the `startingDeadlineSeconds`
+window (900 seconds, or 15 minutes, by default); after that the missed run is
+skipped. Leave time between the timeout and the next run.
 At the default four-hour interval, `timeoutSeconds` of 14340 or more leaves no
 gap before the Job deadline reaches that interval even with cleanup disabled.
 Include every enabled cleanup timeout in the total too. Allow time for startup and

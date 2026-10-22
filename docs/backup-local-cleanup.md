@@ -11,7 +11,11 @@ changes the backup Job scripts and schedule settings, not the ClickHouse or
 Keeper installation. Review any other changes included in a chart upgrade
 separately.
 
-## Preview first
+## Start with a preview
+
+Preview is the default mode and the recommended first step. It is not an
+approval step enforced by the software: setting `dryRun: false` permits
+deletion on the next successful backup run, even without an earlier preview.
 
 With backups already enabled, add:
 
@@ -35,8 +39,9 @@ kubectl logs -n <namespace> job/<job-name> -c backup
 Lines starting `Backup local cleanup: ` contain a JSON summary. Lines starting
 `Backup local cleanup entry: ` list each kept or proposed record with its
 backup name and copy number (`0` is the first copy). `delete` is the proposed
-list; `deleted` lists confirmed removals. `delete` is informational and `deleted` is empty in preview mode. Save these logs if you need a longer history than the CronJob's
-three successful Jobs.
+list; `deleted` lists confirmed removals. `delete` is informational and
+`deleted` is empty in preview mode. Save these logs if you need a longer
+history than the CronJob's three successful Jobs.
 
 The default protects every full backup from the latest two distinct UTC dates
 with successful full backups, plus the incrementals that depend on them. Extra
@@ -50,6 +55,15 @@ S3 backup also stays. If any local record has broken metadata, no records are
 removed: its missing information could hide a dependency on another backup.
 Inspect `broken_local` and `local_only` entries before proceeding.
 
+The tool's built-in `backups_to_keep_local` stays at zero. It counts individual
+backups and deletes with force, bypassing the check for dependent local
+backups. This cleaner instead keeps successful UTC days and their dependency
+chains, checks every copy, and requires a matching completed S3 backup before
+each removal. These are different retention rules. See the upstream
+implementation:
+
+https://github.com/Altinity/clickhouse-backup/blob/v2.8.1/pkg/backup/delete.go#L199-L223
+
 ## Enable removal
 
 Test cleanup and recovery with disposable data first, then review the preview
@@ -61,9 +75,9 @@ Every configured database copy must be reachable and idle, and must agree on
 the completed S3 backups. Before and after each removal, cleanup checks the
 backup lists and their dependencies on every copy. It removes dependent
 incremental records before full-backup records and never uses force deletion.
-If a check fails, it stops sending deletion requests. Lines starting `Local backup cleanup: ` record `delete_requested` and
-`delete_verified` for each record, preserving the result even when a later
-removal fails.
+If a check fails, it stops sending deletion requests. Lines starting
+`Backup local cleanup: ` record `delete_requested` and `delete_verified` for
+each record, preserving the result even when a later removal fails.
 
 Do not run manual backup, restore, or remote-deletion commands while scheduled
 cleanup runs. The backup APIs do not provide one lock covering all copies.
@@ -78,19 +92,71 @@ retry or switch copies. Check the backup service and current lists before
 starting more work; the server may still be finishing the request. The chart
 does not add cleanup alerts.
 
+A large backlog may take several scheduled runs to clear. If the time limit
+is reached after a plan is available and without an uncertain request, the
+summary reports `completed: false`, `stop_reason: time_limit`, and the
+removals already verified in `deleted`. This is an expected pause; the next
+successful backup run checks the remaining records again. Reaching the limit
+before a plan is available, a request timeout, or an unverified deletion still
+reports an error. Do not retry an uncertain deletion to clear the backlog.
+
 `timeoutSeconds` must be an integer of at least 60. The Job deadline includes
 the backup timeout, each enabled cleanup timeout, and 60 seconds. With both
 cleanup options enabled at their defaults, that total is 14,460 seconds,
 slightly longer than the four-hour schedule. Choose shorter cleanup timeouts
-when combining them so a slow run does not skip the following backup.
+when combining them. An unfinished Job delays the next scheduled run because
+`concurrencyPolicy: Forbid` prevents overlap. That run can still start within
+the `startingDeadlineSeconds` window (900 seconds, or 15 minutes, by default).
+After that, the missed run is skipped. Leave room for Job startup as well as
+cleanup.
+
+## When cleanup stays stopped
+
+First pause the schedule with `clickhouse.backup.schedule.suspend: true` and
+wait for any backup, restore, download, or deletion to finish on every copy.
+Pausing the schedule does not cancel an existing Job or server operation.
+
+- **Failed or cancelled deletion in `/backup/actions`.** Inspect the exact
+  backup name in `/backup/list/local` on the affected copy and in
+  `/backup/list/remote` on every copy. Confirm that its completed S3 backup
+  still exists and that retained backups have their required bases. The local
+  record may still exist or may already be gone after a partial attempt; do
+  not resend the deletion until that state is understood. If the remote
+  backup is missing or unreadable, stop: deleting local records can also
+  remove native S3 data in that case. Both this cleanup and the S3 preview
+  remain stopped until the failed history entry clears. See
+  [failed deletion history](backup-cleanup.md#preview-stops-that-need-investigation)
+  for how entries age out or clear on a backup-container restart. A restart
+  clears history; it does not repair backup files.
+- **A `broken_local` record.** The report identifies its name and copy number.
+  Check that exact entry in the local and remote lists. For an interrupted
+  download with a healthy completed remote counterpart, follow the
+  [specific-entry removal checks](clickhouse-backups.md#interrupted-base-downloads).
+  If it also appears in `local_only`, that procedure does not apply: the files
+  may be the remaining record of S3 data. Keep them while investigating. Do
+  not remove directories by hand, use force deletion, or clear all broken
+  entries at once.
+
+After resolving the cause and any failed history, run with `dryRun: true`
+first and check its report before permitting more removals. A successful
+backup Job alone does not show that cleanup recovered.
 
 ## Recovery and checks
 
-Removing local records does not shorten S3 retention. Recovery downloads the
-records from S3 onto the recovery machine. For an incremental backup, download
-the required full backup's records first, then the incremental's records;
+Removing local records does not shorten S3 retention. To make the backup
+records available again, download them from S3 onto the recovery machine.
+For an incremental backup, download the required full backup's records first,
+then the incremental's records;
 downloading the incremental alone does not fetch its base. The scheduler also
 downloads a missing full backup's records before creating a new incremental.
+
+If downloading records or restoring onto the same installation, pause its
+schedule and wait for all backup and cleanup work to finish first. Keep it
+paused until recovery and its checks are complete, so scheduled cleanup cannot
+remove those records again. The download order above is preparation for
+recovery, not a complete or automatic restore procedure. A separate
+administrator configuration and a tested restore procedure are still needed;
+see [current restore limitations](clickhouse-backups.md#current-limitations).
 
 After enabling removal, check both the logs and database-disk usage on every
 copy (`df -h`, `df -i`, and the size of

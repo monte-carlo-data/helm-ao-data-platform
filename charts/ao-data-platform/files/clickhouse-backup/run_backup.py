@@ -501,16 +501,21 @@ class Scheduler:
         return name
 
 
-def report_cleanup(result):
+def report_cleanup_result(result, prefix, settings):
     """Keep each log line small without omitting any name or changing its order."""
     lists = ("kept", "delete", "deleted", "broken_local", "local_only")
-    summary = {key: result[key] for key in ("mode", "keep_last", "keep_days")}
+    summary = {key: result[key] for key in settings}
+    summary.update({key: result[key] for key in ("completed", "stop_reason") if key in result})
     summary.update({key + "_count": len(result[key]) for key in lists})
-    print("Backup cleanup: " + json.dumps(summary, sort_keys=True), flush=True)
+    print(prefix + ": " + json.dumps(summary, sort_keys=True), flush=True)
     for key in lists:
         for entry in result[key]:
             item = entry if isinstance(entry, dict) else {"name": entry}
-            print("Backup cleanup entry: " + json.dumps({"list": key, **item}, sort_keys=True), flush=True)
+            print(prefix + " entry: " + json.dumps({"list": key, **item}, sort_keys=True), flush=True)
+
+
+def report_cleanup(result):
+    report_cleanup_result(result, "Backup cleanup", ("mode", "keep_last", "keep_days"))
 
 
 def local_cleanup_options():
@@ -530,13 +535,7 @@ def local_cleanup_options():
 
 
 def report_local_cleanup(result):
-    lists = ("kept", "delete", "deleted", "broken_local", "local_only")
-    summary = {key: result[key] for key in ("mode", "keep_full_backup_days")}
-    summary.update({key + "_count": len(result[key]) for key in lists})
-    print("Backup local cleanup: " + json.dumps(summary, sort_keys=True), flush=True)
-    for key in lists:
-        for entry in result[key]:
-            print("Backup local cleanup entry: " + json.dumps({"list": key, **entry}, sort_keys=True), flush=True)
+    report_cleanup_result(result, "Backup local cleanup", ("mode", "keep_full_backup_days"))
 
 
 def main():
@@ -573,6 +572,11 @@ def main():
             print("Backup local cleanup stopped: check cleanup settings; the backup already completed.", file=sys.stderr)
         except BackupError as error:
             print(f"Backup local cleanup stopped: {error}", file=sys.stderr)
+        except Exception as error:
+            # Unexpected cleanup errors must not hide a verified backup or
+            # prevent the separate preview. Never log exception bodies.
+            print(f"Backup local cleanup stopped: unexpected {type(error).__name__}; "
+                  "the backup already completed.", file=sys.stderr)
 
     if cleanup_enabled:
         # This report runs after a verified upload. Its failure must not turn
@@ -592,6 +596,9 @@ def main():
                   file=sys.stderr)
         except BackupError as error:
             print(f"Backup cleanup preview stopped: {error}", file=sys.stderr)
+        except Exception as error:
+            print(f"Backup cleanup preview stopped: unexpected {type(error).__name__}; "
+                  "the backup already completed.", file=sys.stderr)
     return 0
 
 

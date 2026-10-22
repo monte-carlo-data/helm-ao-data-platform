@@ -114,6 +114,11 @@ class SelectionTests(unittest.TestCase):
             with self.subTest(local=local), self.assertRaises(cleanup.BackupError):
                 self.plan(local=[local])
 
+    def test_different_valid_local_and_remote_bases_stop_selection(self):
+        # Both bases are old enough and present; only their disagreement is unsafe.
+        with self.assertRaisesRegex(cleanup.BackupError, "dependencies disagree"):
+            self.plan(local=[{**GROUPS, CI: B}])
+
     def test_invalid_options_and_missing_latest_stop_selection(self):
         for kwargs in [dict(keep_full_backup_days=1), dict(keep_full_backup_days=True),
                        dict(keep_full_backup_days=2.5), dict(latest_backup="missing")]:
@@ -299,7 +304,7 @@ class OperationTests(unittest.TestCase):
         world.after_delete = fail_second
         with self.assertRaises(cleanup.BackupError):
             world.run(execute=True)
-        rows = [json.loads(line.removeprefix("Local backup cleanup: "))
+        rows = [json.loads(line.removeprefix("Backup local cleanup: "))
                 for line in world.output.getvalue().splitlines()]
         self.assertEqual(rows, [
             {"event": "delete_requested", "copy": 0, "name": AI},
@@ -388,6 +393,56 @@ class OperationTests(unittest.TestCase):
         with self.assertRaisesRegex(cleanup.BackupError, "time limit"):
             world.run(execute=True, timeout=30)
         self.assertEqual(world.writes(), [])
+
+    def test_time_limit_reports_verified_progress_and_next_run_finishes(self):
+        world = World()
+        clock = [0]
+        reads_after_delete = 0
+        def expire_after_verification(index, method, path):
+            nonlocal reads_after_delete
+            if method == "GET" and world.writes():
+                reads_after_delete += 1
+                if reads_after_delete == 8:
+                    clock[0] = 1000
+        world.before_request = expire_after_verification
+        result = world.run(execute=True, timeout=120, clock=lambda: clock[0])
+        self.assertFalse(result["completed"])
+        self.assertEqual(result["stop_reason"], "time_limit")
+        self.assertEqual(result["deleted"], [{"copy": 0, "name": AI}])
+        self.assertEqual(len(world.writes()), 1)
+        self.assertEqual(world.remote, GROUPS)
+        world.before_request = None
+        following = world.run(execute=True)
+        self.assertTrue(following["completed"])
+        self.assertEqual(len(following["deleted"]), 3)
+        self.assertEqual(len(world.writes()), 4)
+
+    def test_time_limit_during_post_delete_check_does_not_claim_verified_removal(self):
+        world = World()
+        clock = [0]
+        def expire(index, backup):
+            clock[0] = 1000
+        world.after_delete = expire
+        with self.assertRaisesRegex(cleanup.BackupError, "prevented its follow-up checks"):
+            world.run(execute=True, timeout=120, clock=lambda: clock[0])
+        self.assertEqual(len(world.writes()), 1)
+        self.assertNotIn("delete_verified", world.output.getvalue())
+
+    def test_authorized_delete_cannot_be_resent_even_after_an_uncertain_response(self):
+        for error in (None, cleanup.BackupError("uncertain transport result")):
+            world = World()
+            world.delete_error = error
+            cleaner = cleanup.LocalCleaner(world.apis)
+            cleaner.pending = (0, AI)
+            with self.subTest(error=error):
+                if error:
+                    with self.assertRaisesRegex(cleanup.BackupError, "not confirmed"):
+                        cleaner.request(0, "POST", cleanup.DELETE_PREFIX + AI)
+                else:
+                    cleaner.request(0, "POST", cleanup.DELETE_PREFIX + AI)
+                with self.assertRaisesRegex(cleanup.BackupError, "unexpected API request"):
+                    cleaner.request(0, "POST", cleanup.DELETE_PREFIX + AI)
+                self.assertEqual(len(world.writes()), 1)
 
     def test_delete_timeout_is_limited_by_remaining_budget(self):
         world = World(1)

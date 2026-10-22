@@ -20,11 +20,15 @@ import math
 import time
 
 from backup_common import BackupError, REQUEST_TIMEOUT_SECONDS, SCHEDULED_NAME
-from cleanup_backups import catalog, plan as validate_remote, scheduled_time
+from cleanup_backups import (READ_PATHS, catalog, local_record_warnings,
+                             plan as validate_remote, scheduled_time)
 
 
-READ_PATHS = frozenset(("/backup/actions", "/backup/list/remote", "/backup/list/local"))
 DELETE_PREFIX = "/backup/delete/local/"
+
+
+class LocalCleanupTimeLimit(BackupError):
+    """The time budget ended before sending another request."""
 
 
 def validated_rows(rows, location, remote=None):
@@ -68,10 +72,7 @@ def local_plan(remote, local, now, keep_full_backup_days=2, latest_backup=None):
     protected = {name for name in remote if chains[name] & protected_full}
     if latest_backup is not None:
         protected.update(chains[latest_backup])
-    broken = [{"copy": index, "name": name} for index, entries in enumerate(local)
-              for name, required in sorted(entries.items()) if required is None]
-    local_only = [{"copy": index, "name": name} for index, entries in enumerate(local)
-                  for name in sorted(entries) if name not in remote]
+    warnings = local_record_warnings(remote, local)
     kept, delete = [], []
     for index, entries in enumerate(local):
         for name, required in entries.items():
@@ -86,7 +87,7 @@ def local_plan(remote, local, now, keep_full_backup_days=2, latest_backup=None):
                         raise BackupError("Local cleanup stopped: a local scheduled backup has an unexpected base.")
             if required is not None and name in remote and required != remote[name]:
                 raise BackupError("Local cleanup stopped: local and remote dependencies disagree.")
-        if broken:
+        if warnings["broken_local"]:
             # An incomplete entry could conceal a dependency on any base.
             keep = set(entries)
         else:
@@ -106,7 +107,7 @@ def local_plan(remote, local, now, keep_full_backup_days=2, latest_backup=None):
             delete.extend({"copy": index, "name": name} for name in ready)
             remaining.difference_update(ready)
     return {"keep_full_backup_days": keep_full_backup_days, "kept": kept, "delete": delete,
-            "deleted": [], "broken_local": broken, "local_only": local_only}
+            "deleted": [], **warnings}
 
 
 class LocalCleaner:
@@ -127,7 +128,7 @@ class LocalCleaner:
     def request(self, index, method, path):
         remaining = self.deadline - self.clock()
         if remaining <= REQUEST_TIMEOUT_SECONDS:
-            raise BackupError("Local cleanup time limit reached; no further deletion was sent.")
+            raise LocalCleanupTimeLimit("Local cleanup time limit reached; no further deletion was sent.")
         if method == "GET" and path in READ_PATHS:
             return self.apis[index].request(method, path)
         name = path.removeprefix(DELETE_PREFIX)
@@ -180,16 +181,26 @@ class LocalCleaner:
         result = local_plan(remote[0], [entries for entries, _ in local], now,
                             self.keep_full_backup_days, latest_backup)
         result["mode"] = "delete" if execute else "dry-run"
-        self.unchanged(remote, local)
-        if not execute:
+        result["completed"] = False
+        try:
+            self.unchanged(remote, local)
+            if execute:
+                self.remove_planned(result, remote, local)
+        except LocalCleanupTimeLimit:
+            self.pending = None
+            result["stop_reason"] = "time_limit"
             return result
+        result["completed"] = True
+        return result
+
+    def remove_planned(self, result, remote, local):
         for entry in result["delete"]:
             index, name = entry["copy"], entry["name"]
             # Both copies must remain idle and every remote backup, every local
             # dependency and all exposed metadata must match the approved plan.
             self.unchanged(remote, local)
             self.pending = (index, name)
-            print("Local backup cleanup: " + json.dumps(
+            print("Backup local cleanup: " + json.dumps(
                 {"event": "delete_requested", "copy": index, "name": name}, sort_keys=True), flush=True)
             rows = self.request(index, "POST", DELETE_PREFIX + name)
             expected = {"status": "success", "operation": "delete", "backup_name": name, "location": "local"}
@@ -197,8 +208,11 @@ class LocalCleaner:
                 raise BackupError("Local deletion response was not confirmed; no retry or further deletion was sent.")
             del local[index][0][name]
             del local[index][1][name]
-            self.unchanged(remote, local)
+            try:
+                self.unchanged(remote, local)
+            except LocalCleanupTimeLimit:
+                raise BackupError("Local deletion returned success, but the time limit prevented its "
+                                  "follow-up checks; inspect the backup lists before more work.") from None
             result["deleted"].append(dict(entry))
-            print("Local backup cleanup: " + json.dumps(
+            print("Backup local cleanup: " + json.dumps(
                 {"event": "delete_verified", "copy": index, "name": name}, sort_keys=True), flush=True)
-        return result
