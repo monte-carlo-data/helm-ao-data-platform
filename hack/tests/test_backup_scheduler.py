@@ -936,6 +936,20 @@ class APITests(unittest.TestCase):
             backup.API(self.url, "backup", "private").request("GET", "/backup/list/remote")
         self.assertEqual(str(caught.exception), "Backup API returned HTTP 500.")
 
+    def test_api_timeout_is_bounded_and_defaults_to_thirty_seconds(self):
+        api = backup.API(self.url, "backup", "dummy")
+        with mock.patch.object(api.opener, "open") as request:
+            request.return_value.__enter__.return_value.read.return_value = b'{}\n'
+            api.request("GET", "/backup/list/remote")
+            self.assertEqual(request.call_args.kwargs["timeout"], 30)
+            api.request("POST", "/backup/delete/local/example", request_timeout=180)
+            self.assertEqual(request.call_args.kwargs["timeout"], 180)
+            request.reset_mock()
+            for timeout in (False, 0, -1, 301, float("nan"), float("inf"), "180"):
+                with self.subTest(timeout=timeout), self.assertRaises(backup.BackupError):
+                    api.request("POST", "/backup/delete/local/example", request_timeout=timeout)
+            request.assert_not_called()
+
     def test_backup_authentication_errors_name_rotation_without_printing_credentials(self):
         for status in (401, 403):
             with self.subTest(status=status):
@@ -1126,6 +1140,143 @@ class APITests(unittest.TestCase):
             clients.assert_not_called()
             run.assert_not_called()
             self.assertIn("preview only", errors.getvalue())
+
+    def test_invalid_local_cleanup_settings_stop_before_upload(self):
+        invalid = ({"BACKUP_LOCAL_CLEANUP_ENABLED": "yes"},
+                   {"BACKUP_LOCAL_CLEANUP_DRY_RUN": "yes"},
+                   {"BACKUP_LOCAL_KEEP_FULL_BACKUP_DAYS": "1"},
+                   {"BACKUP_LOCAL_KEEP_FULL_BACKUP_DAYS": "2.5"},
+                   {"BACKUP_LOCAL_CLEANUP_TIMEOUT_SECONDS": "59"})
+        for values in invalid:
+            settings = dict(self.settings, BACKUP_LOCAL_CLEANUP_ENABLED="true")
+            settings.update(values)
+            with self.subTest(values=values), mock.patch.dict(backup.os.environ, settings, clear=True), \
+                    mock.patch.object(backup, "configured_clients") as clients, \
+                    mock.patch.object(backup.Scheduler, "run") as run, redirect_stderr(io.StringIO()):
+                self.assertEqual(backup.main(), 1)
+            clients.assert_not_called()
+            run.assert_not_called()
+
+    def test_local_cleanup_after_verified_backup_is_independent_of_remote_preview(self):
+        for dry_run in ("true", "false"):
+            settings = dict(self.settings, BACKUP_LOCAL_CLEANUP_ENABLED="true",
+                            BACKUP_LOCAL_CLEANUP_DRY_RUN=dry_run)
+            local = mock.Mock()
+            local.LocalCleaner.return_value.run.return_value = {
+                "mode": "dry-run" if dry_run == "true" else "delete", "keep_full_backup_days": 2,
+                "kept": [{"copy": 0, "name": FULL}], "delete": [], "deleted": [],
+                "broken_local": [], "local_only": [],
+            }
+            remote = mock.Mock()
+            with self.subTest(dry_run=dry_run), mock.patch.dict(backup.os.environ, settings, clear=True), \
+                    mock.patch.dict("sys.modules", {"cleanup_local_backups": local, "cleanup_backups": remote}), \
+                    mock.patch.object(backup.Path, "read_text", return_value="test-password"), \
+                    mock.patch.object(backup, "PasswordRevisionGuard"), \
+                    mock.patch.object(backup.Scheduler, "run", return_value=FULL) as run, \
+                    redirect_stdout(io.StringIO()):
+                self.assertEqual(backup.main(), 0)
+            run.assert_called_once()
+            local.LocalCleaner.assert_called_once_with(mock.ANY, keep_full_backup_days=2, timeout=1800)
+            local.LocalCleaner.return_value.run.assert_called_once_with(latest_backup=FULL, execute=dry_run == "false")
+            remote.Cleaner.assert_not_called()
+
+    def test_local_settings_construct_the_real_cleaner(self):
+        with mock.patch.object(sys, "path", [str(SCRIPT.parent), *sys.path]):
+            from cleanup_local_backups import LocalCleaner
+        for dry_run in ("true", "false"):
+            settings = dict(self.settings, BACKUP_LOCAL_CLEANUP_ENABLED="true",
+                            BACKUP_LOCAL_CLEANUP_DRY_RUN=dry_run,
+                            BACKUP_LOCAL_KEEP_FULL_BACKUP_DAYS="3",
+                            BACKUP_LOCAL_CLEANUP_TIMEOUT_SECONDS="900")
+            with self.subTest(dry_run=dry_run), mock.patch.dict(backup.os.environ, settings, clear=True):
+                options = backup.local_cleanup_options()
+                self.assertEqual(options.pop("execute"), dry_run == "false")
+                cleaner = LocalCleaner([mock.Mock()], **options)
+                self.assertEqual(cleaner.keep_full_backup_days, 3)
+                self.assertEqual(cleaner.timeout, 900)
+
+    def test_unexpected_local_error_preserves_backup_and_runs_s3_preview(self):
+        settings = dict(self.settings, BACKUP_LOCAL_CLEANUP_ENABLED="true", BACKUP_CLEANUP_ENABLED="true")
+        for stage in ("constructor", "run"):
+            local, remote = mock.Mock(), mock.Mock()
+            target = local.LocalCleaner if stage == "constructor" else local.LocalCleaner.return_value.run
+            target.side_effect = TypeError("private response must not be logged")
+            remote.Cleaner.return_value.run.return_value = {
+                "mode": "dry-run", "keep_last": 2, "keep_days": 0,
+                "kept": [FULL], "delete": [], "deleted": [], "broken_local": [], "local_only": []}
+            errors = io.StringIO()
+            with self.subTest(stage=stage), mock.patch.dict(backup.os.environ, settings, clear=True), \
+                    mock.patch.dict("sys.modules", {"cleanup_local_backups": local, "cleanup_backups": remote}), \
+                    mock.patch.object(backup, "configured_clients", return_value=([mock.Mock()], [mock.Mock()])), \
+                    mock.patch.object(backup.Scheduler, "run", return_value=FULL) as run, \
+                    redirect_stdout(io.StringIO()), redirect_stderr(errors):
+                self.assertEqual(backup.main(), 0)
+            run.assert_called_once()
+            remote.Cleaner.return_value.run.assert_called_once_with(latest_backup=FULL, execute=False)
+            self.assertIn("Backup local cleanup stopped: unexpected TypeError", errors.getvalue())
+            self.assertNotIn("private response", errors.getvalue())
+
+    def test_unexpected_preview_error_preserves_backup_but_interruptions_propagate(self):
+        settings = dict(self.settings, BACKUP_CLEANUP_ENABLED="true")
+        for failure in (TypeError("private response"), KeyboardInterrupt()):
+            remote = mock.Mock()
+            remote.Cleaner.return_value.run.side_effect = failure
+            errors = io.StringIO()
+            with self.subTest(failure=type(failure).__name__), mock.patch.dict(backup.os.environ, settings, clear=True), \
+                    mock.patch.dict("sys.modules", {"cleanup_backups": remote}), \
+                    mock.patch.object(backup, "configured_clients", return_value=([mock.Mock()], [mock.Mock()])), \
+                    mock.patch.object(backup.Scheduler, "run", return_value=FULL) as run, redirect_stderr(errors):
+                if isinstance(failure, KeyboardInterrupt):
+                    with self.assertRaises(KeyboardInterrupt):
+                        backup.main()
+                else:
+                    self.assertEqual(backup.main(), 0)
+                    self.assertIn("Backup cleanup preview stopped: unexpected TypeError", errors.getvalue())
+                    self.assertNotIn("private response", errors.getvalue())
+            run.assert_called_once()
+
+    def test_local_time_limit_report_preserves_verified_removals(self):
+        result = {"mode": "delete", "keep_full_backup_days": 2, "completed": False,
+                  "stop_reason": "time_limit", "kept": [{"copy": 0, "name": FULL}],
+                  "delete": [{"copy": 1, "name": FULL}], "deleted": [],
+                  "broken_local": [], "local_only": []}
+        output = io.StringIO()
+        with redirect_stdout(output):
+            backup.report_local_cleanup(result)
+        lines = output.getvalue().splitlines()
+        summary = json.loads(lines[0].removeprefix("Backup local cleanup: "))
+        self.assertFalse(summary["completed"])
+        self.assertEqual(summary["stop_reason"], "time_limit")
+        self.assertEqual(summary["delete_count"], 1)
+        self.assertEqual(summary["deleted_count"], 0)
+
+    def test_failed_upload_never_calls_local_cleanup(self):
+        settings = dict(self.settings, BACKUP_LOCAL_CLEANUP_ENABLED="true", BACKUP_LOCAL_CLEANUP_DRY_RUN="false")
+        local = mock.Mock()
+        with mock.patch.dict(backup.os.environ, settings, clear=True), \
+                mock.patch.dict("sys.modules", {"cleanup_local_backups": local}), \
+                mock.patch.object(backup.Path, "read_text", return_value="test-password"), \
+                mock.patch.object(backup, "PasswordRevisionGuard"), \
+                mock.patch.object(backup.Scheduler, "run", side_effect=backup.BackupError("upload failed")), \
+                redirect_stderr(io.StringIO()):
+            self.assertEqual(backup.main(), 1)
+        local.LocalCleaner.assert_not_called()
+
+    def test_local_cleanup_failure_keeps_successful_backup_and_reports_failure(self):
+        settings = dict(self.settings, BACKUP_LOCAL_CLEANUP_ENABLED="true", BACKUP_LOCAL_CLEANUP_DRY_RUN="false")
+        local = mock.Mock()
+        local.LocalCleaner.return_value.run.side_effect = backup.BackupError("Local removal was not confirmed; no retry sent.")
+        errors = io.StringIO()
+        with mock.patch.dict(backup.os.environ, settings, clear=True), \
+                mock.patch.dict("sys.modules", {"cleanup_local_backups": local}), \
+                mock.patch.object(backup.Path, "read_text", return_value="test-password"), \
+                mock.patch.object(backup, "PasswordRevisionGuard"), \
+                mock.patch.object(backup.Scheduler, "run", return_value=FULL) as run, \
+                redirect_stderr(errors):
+            self.assertEqual(backup.main(), 0)
+        run.assert_called_once()
+        local.LocalCleaner.return_value.run.assert_called_once()
+        self.assertIn("Backup local cleanup stopped:", errors.getvalue())
 
     def test_cleanup_failure_does_not_fail_job_after_successful_upload(self):
         settings = dict(self.settings, BACKUP_CLEANUP_ENABLED="true")

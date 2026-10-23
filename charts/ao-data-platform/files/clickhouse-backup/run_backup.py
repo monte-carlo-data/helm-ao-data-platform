@@ -8,8 +8,8 @@ when moving between copies. All copies must share the same native S3 backup disk
 
 API contract: https://github.com/Altinity/clickhouse-backup/blob/v2.8.1/pkg/server/server.go
 Responses are newline-separated JSON objects, including asynchronous operation IDs.
-No operation is resubmitted after an uncertain response, and no local backup is
-deleted: deleting native S3 disk metadata can also remove the remote files.
+No operation is resubmitted after an uncertain response. Optional local cleanup
+runs only after a verified upload and requires matching completed S3 backups.
 """
 
 import base64
@@ -92,7 +92,11 @@ class API:
         self.guard = guard
         self.backup_api = backup_api
 
-    def request(self, method, path, query=None):
+    def request(self, method, path, query=None, *, request_timeout=None):
+        timeout = REQUEST_TIMEOUT_SECONDS if request_timeout is None else request_timeout
+        if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+                or not 0 < timeout <= 300):
+            raise BackupError("Backup API request timeout must be between zero and 300 seconds.")
         if self.guard:
             self.guard()
         url = self.endpoint + path
@@ -103,7 +107,7 @@ class API:
             headers={"Authorization": self.authorization, "Accept": "application/json"},
         )
         try:
-            with self.opener.open(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+            with self.opener.open(request, timeout=timeout) as response:
                 payload = response.read(32 * 1024 * 1024 + 1)
             if len(payload) > 32 * 1024 * 1024:
                 raise BackupError("Backup API response exceeded the size limit.")
@@ -497,16 +501,41 @@ class Scheduler:
         return name
 
 
-def report_cleanup(result):
+def report_cleanup_result(result, prefix, settings):
     """Keep each log line small without omitting any name or changing its order."""
     lists = ("kept", "delete", "deleted", "broken_local", "local_only")
-    summary = {key: result[key] for key in ("mode", "keep_last", "keep_days")}
+    summary = {key: result[key] for key in settings}
+    summary.update({key: result[key] for key in ("completed", "stop_reason") if key in result})
     summary.update({key + "_count": len(result[key]) for key in lists})
-    print("Backup cleanup: " + json.dumps(summary, sort_keys=True), flush=True)
+    print(prefix + ": " + json.dumps(summary, sort_keys=True), flush=True)
     for key in lists:
         for entry in result[key]:
             item = entry if isinstance(entry, dict) else {"name": entry}
-            print("Backup cleanup entry: " + json.dumps({"list": key, **item}, sort_keys=True), flush=True)
+            print(prefix + " entry: " + json.dumps({"list": key, **item}, sort_keys=True), flush=True)
+
+
+def report_cleanup(result):
+    report_cleanup_result(result, "Backup cleanup", ("mode", "keep_last", "keep_days"))
+
+
+def local_cleanup_options():
+    enabled = os.environ.get("BACKUP_LOCAL_CLEANUP_ENABLED", "false")
+    if enabled not in ("true", "false"):
+        raise BackupError("Local cleanup enabled must be true or false.")
+    if enabled == "false":
+        return None
+    dry_run = os.environ.get("BACKUP_LOCAL_CLEANUP_DRY_RUN", "true")
+    if dry_run not in ("true", "false"):
+        raise BackupError("Local cleanup dry-run must be true or false.")
+    keep_days = int(os.environ.get("BACKUP_LOCAL_KEEP_FULL_BACKUP_DAYS", "2"))
+    timeout = int(os.environ.get("BACKUP_LOCAL_CLEANUP_TIMEOUT_SECONDS", "1800"))
+    if keep_days < 2 or timeout < 60:
+        raise BackupError("Local cleanup needs at least two full-backup days and a timeout of at least 60 seconds.")
+    return {"keep_full_backup_days": keep_days, "timeout": timeout, "execute": dry_run == "false"}
+
+
+def report_local_cleanup(result):
+    report_cleanup_result(result, "Backup local cleanup", ("mode", "keep_full_backup_days"))
 
 
 def main():
@@ -519,6 +548,7 @@ def main():
         cleanup_enabled = os.environ.get("BACKUP_CLEANUP_ENABLED", "false") == "true"
         if cleanup_enabled and os.environ.get("BACKUP_CLEANUP_DRY_RUN", "true") != "true":
             raise BackupError(DELETION_UNAVAILABLE)
+        local_options = local_cleanup_options()
         apis, probes = configured_clients()
         name = Scheduler(apis, probes, timeout, poll_seconds, **options).run()
     except (KeyError, ValueError, OSError):
@@ -527,6 +557,26 @@ def main():
     except BackupError as error:
         print(f"Backup failed: {error}", file=sys.stderr)
         return 1
+
+    if local_options is not None:
+        # Cleanup must not turn a verified upload into a failed backup or
+        # cause it to be uploaded again. Its separate result remains visible.
+        try:
+            from cleanup_local_backups import LocalCleaner
+            execute = local_options.pop("execute")
+            result = LocalCleaner(apis, **local_options).run(latest_backup=name, execute=execute)
+            report_local_cleanup(result)
+            if result["broken_local"] or result["local_only"]:
+                print("Backup local cleanup kept records needing investigation; see the report.", file=sys.stderr)
+        except (KeyError, ValueError, OSError):
+            print("Backup local cleanup stopped: check cleanup settings; the backup already completed.", file=sys.stderr)
+        except BackupError as error:
+            print(f"Backup local cleanup stopped: {error}", file=sys.stderr)
+        except Exception as error:
+            # Unexpected cleanup errors must not hide a verified backup or
+            # prevent the separate preview. Never log exception bodies.
+            print(f"Backup local cleanup stopped: unexpected {type(error).__name__}; "
+                  "the backup already completed.", file=sys.stderr)
 
     if cleanup_enabled:
         # This report runs after a verified upload. Its failure must not turn
@@ -546,6 +596,9 @@ def main():
                   file=sys.stderr)
         except BackupError as error:
             print(f"Backup cleanup preview stopped: {error}", file=sys.stderr)
+        except Exception as error:
+            print(f"Backup cleanup preview stopped: unexpected {type(error).__name__}; "
+                  "the backup already completed.", file=sys.stderr)
     return 0
 
 

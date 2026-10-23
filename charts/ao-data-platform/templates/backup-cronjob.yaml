@@ -12,9 +12,13 @@ data:
     {{- .Files.Get "files/clickhouse-backup/backup_common.py" | nindent 4 }}
   run_backup.py: |
     {{- .Files.Get "files/clickhouse-backup/run_backup.py" | nindent 4 }}
-  {{- if $b.cleanup.enabled }}
+  {{- if or $b.cleanup.enabled $b.localCleanup.enabled }}
   cleanup_backups.py: |
     {{- .Files.Get "files/clickhouse-backup/cleanup_backups.py" | nindent 4 }}
+  {{- end }}
+  {{- if $b.localCleanup.enabled }}
+  cleanup_local_backups.py: |
+    {{- .Files.Get "files/clickhouse-backup/cleanup_local_backups.py" | nindent 4 }}
   {{- end }}
 ---
 apiVersion: batch/v1
@@ -35,7 +39,7 @@ spec:
     spec:
       # A lost API response may still have started a backup. Never blindly retry.
       backoffLimit: 0
-      activeDeadlineSeconds: {{ add (int $b.schedule.timeoutSeconds) (ternary (int $b.cleanup.timeoutSeconds) 0 $b.cleanup.enabled) 60 }}
+      activeDeadlineSeconds: {{ add (int $b.schedule.timeoutSeconds) (ternary (int $b.cleanup.timeoutSeconds) 0 $b.cleanup.enabled) (ternary (int $b.localCleanup.timeoutSeconds) 0 $b.localCleanup.enabled) 60 }}
       template:
         metadata:
           labels:
@@ -88,6 +92,16 @@ spec:
                   value: {{ $b.schedule.freshnessRetrySeconds | quote }}
                 - name: PYTHONDONTWRITEBYTECODE
                   value: "1"
+                {{- if $b.localCleanup.enabled }}
+                - name: BACKUP_LOCAL_CLEANUP_ENABLED
+                  value: "true"
+                - name: BACKUP_LOCAL_CLEANUP_DRY_RUN
+                  value: {{ $b.localCleanup.dryRun | quote }}
+                - name: BACKUP_LOCAL_KEEP_FULL_BACKUP_DAYS
+                  value: {{ $b.localCleanup.keepFullBackupDays | quote }}
+                - name: BACKUP_LOCAL_CLEANUP_TIMEOUT_SECONDS
+                  value: {{ $b.localCleanup.timeoutSeconds | quote }}
+                {{- end }}
                 {{- if $b.cleanup.enabled }}
                 - name: BACKUP_CLEANUP_ENABLED
                   value: "true"

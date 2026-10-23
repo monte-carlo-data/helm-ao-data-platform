@@ -138,7 +138,7 @@ To run the Docker checks locally:
 
 ```bash
 RUN_BACKUP_RUNTIME=1 python3 -m unittest discover \
-  -s hack/tests/runtime -p test_backup_runtime.py -v
+  -s hack/tests/runtime -p 'test*runtime.py' -v
 ```
 
 These checks use ClickHouse 26.4.3, the official pinned backup 2.8.1 image, and
