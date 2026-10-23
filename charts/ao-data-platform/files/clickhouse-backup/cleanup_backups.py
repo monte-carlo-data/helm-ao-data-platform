@@ -128,7 +128,7 @@ def local_record_warnings(remote, local):
 
 
 class Cleaner:
-    def __init__(self, apis, keep_last=2, keep_days=0, timeout=600, clock=time.monotonic,
+    def __init__(self, apis, keep_last=2, keep_days=0, timeout=1800, clock=time.monotonic,
                  retention_policy="count-and-age", daily_days=7, history_days=30):
         if not apis or timeout <= 0:
             raise BackupError("Cleanup requires at least one ClickHouse copy and a positive timeout.")

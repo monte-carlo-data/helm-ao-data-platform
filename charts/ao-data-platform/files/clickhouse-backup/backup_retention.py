@@ -12,7 +12,7 @@ import json
 import math
 import time
 
-from backup_common import BackupError, REQUEST_TIMEOUT_SECONDS, SCHEDULED_NAME
+from backup_common import BackupError, CleanupStopped, REQUEST_TIMEOUT_SECONDS, SCHEDULED_NAME
 from cleanup_backups import (READ_PATHS, catalog, local_record_warnings,
                              plan as validate_remote, scheduled_time)
 
@@ -108,7 +108,7 @@ def validated_rows(rows, location, remote=None):
 
 
 class RemoteCleaner:
-    def __init__(self, apis, daily_days=7, history_days=30, timeout=600, clock=time.monotonic):
+    def __init__(self, apis, daily_days=7, history_days=30, timeout=1800, clock=time.monotonic):
         if (not apis or type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0):
             raise BackupError("Cleanup requires copies and a positive time limit.")
         if (type(daily_days) is not int or daily_days < 1
@@ -121,13 +121,14 @@ class RemoteCleaner:
         self.daily_days, self.history_days = daily_days, history_days
         self.clock, self.deadline = clock, clock() + timeout
         self.pending = None
+        self.unverified = None
         self.execute = False
         self.allowed = set()
         self.attempted = set()
 
     def request(self, index, method, path):
         remaining = self.deadline - self.clock()
-        if remaining <= REQUEST_TIMEOUT_SECONDS:
+        if remaining <= REQUEST_TIMEOUT_SECONDS + getattr(self.apis[index], "guard_timeout_seconds", 0):
             raise RetentionTimeLimit("Cleanup time limit reached; no further deletion was sent.")
         if method == "GET" and path in READ_PATHS | {"/backup/version"}:
             return self.apis[index].request(method, path)
@@ -138,11 +139,21 @@ class RemoteCleaner:
                 or self.pending != (index, pieces[3], pieces[4])
                 or self.pending in self.attempted):
             raise BackupError("Cleanup refused an unexpected API request.")
+        # Reserve a full deletion request, all five follow-up reads per copy,
+        # and one spare read allowance before sending a mutation. Include the
+        # password revision lookups which each API performs before its request.
+        guard_seconds = (getattr(self.apis[index], "guard_timeout_seconds", 0)
+                         + 5 * sum(getattr(api, "guard_timeout_seconds", 0) for api in self.apis))
+        required = 300 + (5 * len(self.apis) + 1) * REQUEST_TIMEOUT_SECONDS + guard_seconds
+        if remaining <= required:
+            raise RetentionTimeLimit("Cleanup time limit reached; no further deletion was sent.")
         self.attempted.add(self.pending)
         self.pending = None
+        event = {"copy": index, "location": pieces[3], "name": pieces[4]}
+        print("Backup cleanup: " + json.dumps({"event": "delete_requested", **event}, sort_keys=True), flush=True)
+        self.unverified = {**event, "response_status": "unknown"}
         try:
-            return self.apis[index].request(method, path,
-                request_timeout=min(300, remaining - REQUEST_TIMEOUT_SECONDS))
+            return self.apis[index].request(method, path, request_timeout=300)
         except BackupError:
             raise BackupError("Deletion was not confirmed and may still be running; "
                               "no retry or further deletion was sent.") from None
@@ -179,20 +190,23 @@ class RemoteCleaner:
         if actual_remote != remote or actual_local != local:
             raise BackupError("Cleanup stopped: backup metadata changed; no further deletion was sent.")
 
-    def remove(self, index, location, name, remote, local):
+    def remove(self, index, location, name, remote, local, result):
         if location == "remote" and any(name in entries[0] for entries in local):
             raise BackupError("Cleanup refused S3 deletion while local records remain.")
         self.unchanged(remote, local)
         self.pending = (index, location, name)
         event = {"copy": index, "location": location, "name": name}
-        print("Backup cleanup: " + json.dumps({"event": "delete_requested", **event}, sort_keys=True), flush=True)
         rows = self.request(index, "POST", "/backup/delete/" + location + "/" + name)
         if rows != [{"status": "success", "operation": "delete", "backup_name": name, "location": location}]:
             raise BackupError("Deletion response was not confirmed; no retry or further deletion was sent.")
+        self.unverified["response_status"] = "success"
         target = local[index] if location == "local" else remote
         del target[0][name]
         del target[1][name]
         self.unchanged(remote, local)
+        if location == "remote":
+            result["deleted"].append(name)
+        self.unverified = None
         print("Backup cleanup: " + json.dumps({"event": "delete_verified", **event}, sort_keys=True), flush=True)
 
     def run(self, now=None, latest_backup=None, execute=False):
@@ -206,21 +220,31 @@ class RemoteCleaner:
         result = plan_sets(remote[0], [entries for entries, _ in local], now,
                            self.daily_days, self.history_days, latest_backup)
         self.allowed = set(result["delete"])
-        result.update(mode="delete" if execute else "dry-run", completed=False)
+        result.update(mode="delete" if execute else "dry-run", completed=False, unverified_deletions=[])
         try:
             self.unchanged(remote, local)
             if execute:
                 for name in result["delete"]:
                     for index, entries in enumerate(local):
                         if name in entries[0]:
-                            self.remove(index, "local", name, remote, local)
+                            self.remove(index, "local", name, remote, local, result)
                     # Both copies have no local record for this exact backup.
                     # Upstream can now remove native data before the S3 catalog.
-                    self.remove(0, "remote", name, remote, local)
-                    result["deleted"].append(name)
-        except RetentionTimeLimit:
+                    self.remove(0, "remote", name, remote, local, result)
+        except Exception as error:
             self.pending = None
-            result["stop_reason"] = "time_limit"
-            return result
+            if isinstance(error, RetentionTimeLimit) and self.unverified is None:
+                result["stop_reason"] = "time_limit"
+                return result
+            result["stop_reason"] = "error"
+            if self.unverified is not None:
+                result["unverified_deletions"].append(dict(self.unverified))
+            if isinstance(error, RetentionTimeLimit):
+                message = "Deletion returned success, but follow-up checks did not finish; no further deletion was sent."
+            elif isinstance(error, BackupError):
+                message = str(error)
+            else:
+                message = f"Unexpected {type(error).__name__}; no further deletion was sent."
+            raise CleanupStopped(message, result) from None
         result["completed"] = True
         return result

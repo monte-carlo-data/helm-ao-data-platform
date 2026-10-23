@@ -56,6 +56,13 @@ class SelectionTests(unittest.TestCase):
         self.assertTrue(set(group(29)) <= set(result["kept"]))
         self.assertTrue(set(group(30)) <= set(result["delete"]))
 
+    def test_thirtieth_prior_date_expires_without_a_newer_day_in_its_week(self):
+        for age, retained in ((29, True), (30, False)):
+            with self.subTest(age=age):
+                result = self.plan({**group(0), **group(age)}, local=[{}])
+                self.assertEqual(set(group(age)) <= set(result["kept"]), retained)
+                self.assertEqual(set(group(age)) <= set(result["delete"]), not retained)
+
     def test_multiple_fulls_on_a_selected_day_keep_every_family(self):
         retries = group(7, "aaaaaaaa")
         result = self.plan({**group(0), **group(7), **group(8), **retries})
@@ -77,6 +84,11 @@ class SelectionTests(unittest.TestCase):
         result = self.plan({**BASE, "manual-copy": OLD})
         self.assertEqual(result["delete"], [])
         self.assertIn("manual-copy", result["kept"])
+
+    def test_manual_remote_dependency_keeps_whole_set_without_local_records(self):
+        result = self.plan({**BASE, "manual-copy": OLD}, local=[{}])
+        self.assertEqual(result["delete"], [])
+        self.assertEqual(set(result["kept"]), set(BASE) | {"manual-copy"})
 
     def test_manual_and_local_only_records_preserve_remote_bases(self):
         for record in ("manual-copy", name("incremental", 39)):
@@ -117,12 +129,12 @@ class SelectionTests(unittest.TestCase):
 
 
 class World:
-    def __init__(self, local_copies=2):
+    def __init__(self, local_copies=2, copies=2):
         self.remote = dict(BASE)
-        self.local = [dict(BASE) if i < local_copies else {} for i in range(2)]
-        self.actions = [[], []]
-        self.versions = [[{"version": "2.8.2"}], [{"version": "2.8.2"}]]
-        self.calls, self.apis = [], [API(self, 0), API(self, 1)]
+        self.local = [dict(BASE) if i < local_copies else {} for i in range(copies)]
+        self.actions = [[] for _ in range(copies)]
+        self.versions = [[{"version": "2.8.2"}] for _ in range(copies)]
+        self.calls, self.apis = [], [API(self, i) for i in range(copies)]
         self.before_request = self.after_write = None
         self.failure = self.response = None
         self.remove_target = True
@@ -191,6 +203,91 @@ class ExecutionTests(unittest.TestCase):
         self.assertFalse(any(row[2] == "/backup/version" for row in world.calls))
         self.assertEqual(world.remote, BASE)
 
+    def test_short_timeout_still_allows_preview(self):
+        world = World()
+        result = world.run(execute=False, timeout=60, clock=lambda: 0)
+        self.assertTrue(result["completed"])
+        self.assertEqual(result["delete"], [OLD_I, OLD])
+        self.assertEqual(world.writes(), [])
+
+    def test_deletion_reserves_time_for_five_followup_reads_per_copy(self):
+        for copies, reserve in ((1, 480), (2, 630), (3, 780)):
+            for timeout in (60, reserve - 0.25, reserve):
+                with self.subTest(copies=copies, timeout=timeout):
+                    world = World(local_copies=copies, copies=copies)
+                    result = world.run(timeout=timeout, clock=lambda: 0)
+                    self.assertFalse(result["completed"])
+                    self.assertEqual(result["stop_reason"], "time_limit")
+                    self.assertEqual(result["deleted"], [])
+                    self.assertEqual(result.get("unverified_deletions", []), [])
+                    self.assertEqual(world.writes(), [])
+                    self.assertEqual(world.remote, BASE)
+                    self.assertEqual(world.local, [BASE] * copies)
+                    self.assertNotIn("delete_requested", world.output.getvalue())
+
+    def test_just_above_reserve_uses_fixed_delete_timeout_and_one_event_per_request(self):
+        for copies, timeout in ((1, 480.25), (2, 630.25), (3, 780.25)):
+            with self.subTest(copies=copies):
+                world = World(local_copies=copies, copies=copies)
+                result = world.run(timeout=timeout, clock=lambda: 0)
+                self.assertTrue(result["completed"])
+                self.assertEqual(result["deleted"], [OLD_I, OLD])
+                self.assertTrue(all(call[3] == {"request_timeout": 300} for call in world.writes()))
+                self.assertEqual(world.output.getvalue().count('"event": "delete_requested"'),
+                                 len(world.writes()))
+
+    def test_deletion_also_reserves_request_guard_time(self):
+        for timeout, completed in ((850, False), (851, True)):
+            with self.subTest(timeout=timeout):
+                world = World()
+                for api in world.apis:
+                    api.guard_timeout_seconds = 20
+                result = world.run(timeout=timeout, clock=lambda: 0)
+                self.assertEqual(result["completed"], completed)
+                if completed:
+                    self.assertEqual(result["deleted"], [OLD_I, OLD])
+                    self.assertTrue(all(call[3] == {"request_timeout": 300} for call in world.writes()))
+                    self.assertEqual(world.output.getvalue().count('"event": "delete_requested"'),
+                                     len(world.writes()))
+                else:
+                    self.assertEqual(result["stop_reason"], "time_limit")
+                    self.assertEqual(result["deleted"], [])
+                    self.assertEqual(result.get("unverified_deletions", []), [])
+                    self.assertEqual(world.writes(), [])
+                    self.assertEqual(world.remote, BASE)
+                    self.assertEqual(world.local, [BASE, BASE])
+                    self.assertNotIn("delete_requested", world.output.getvalue())
+
+    def test_time_limit_after_final_predelete_read_logs_no_request(self):
+        world, clock = World(), [0]
+        def expire(index, method, path):
+            if len(world.calls) == 30:
+                clock[0] = 1800
+        world.before_request = expire
+        result = world.run(timeout=1800, clock=lambda: clock[0])
+        self.assertFalse(result["completed"])
+        self.assertEqual(result["stop_reason"], "time_limit")
+        self.assertEqual(result["deleted"], [])
+        self.assertEqual(world.writes(), [])
+        self.assertNotIn("delete_requested", world.output.getvalue())
+        self.assertEqual(world.remote, BASE)
+        self.assertEqual(world.local, [BASE, BASE])
+
+    def test_reserved_time_covers_full_delete_and_followup_request_timeouts(self):
+        world, clock = World(0), [0]
+        world.after_write = lambda *args: clock.__setitem__(0, clock[0] + 300)
+        def read_time(index, method, path):
+            if world.writes() and method == "GET":
+                clock[0] += 30
+        world.before_request = read_time
+        result = world.run(timeout=630.25, clock=lambda: clock[0])
+        self.assertFalse(result["completed"])
+        self.assertEqual(result["stop_reason"], "time_limit")
+        self.assertEqual(result["deleted"], [OLD_I])
+        self.assertEqual(result.get("unverified_deletions", []), [])
+        self.assertEqual(len(world.writes()), 1)
+        self.assertEqual(world.output.getvalue().count('"event": "delete_verified"'), 1)
+
     def test_all_one_or_no_local_copies_are_handled_before_remote_deletion(self):
         for copies in (0, 1, 2):
             with self.subTest(copies=copies):
@@ -217,8 +314,13 @@ class ExecutionTests(unittest.TestCase):
     def test_version_change_after_one_action_stops_further_deletion(self):
         world = World()
         world.after_write = lambda *args: world.versions.__setitem__(1, [{"version": "2.8.1"}])
-        with self.assertRaisesRegex(retention.BackupError, "2.8.2 on every copy"):
+        with self.assertRaisesRegex(retention.BackupError, "2.8.2 on every copy") as caught:
             world.run()
+        self.assertIsInstance(caught.exception, retention.CleanupStopped)
+        self.assertEqual(caught.exception.result["deleted"], [])
+        self.assertEqual(caught.exception.result["stop_reason"], "error")
+        self.assertEqual(caught.exception.result["unverified_deletions"], [
+            {"copy": 0, "location": "local", "name": OLD_I, "response_status": "success"}])
         self.assertEqual(len(world.writes()), 1)
         self.assertEqual(world.remote, BASE)
 
@@ -270,8 +372,14 @@ class ExecutionTests(unittest.TestCase):
                         else:
                             del world.remote[OLD_I]
             world.before_request = change
-            with self.subTest(mutation=mutation), self.assertRaisesRegex(retention.BackupError, "metadata changed"):
+            with self.subTest(mutation=mutation), self.assertRaisesRegex(
+                    retention.BackupError, "metadata changed") as caught:
                 world.run()
+            self.assertIsInstance(caught.exception, retention.CleanupStopped)
+            self.assertFalse(caught.exception.result["completed"])
+            self.assertEqual(caught.exception.result["stop_reason"], "error")
+            self.assertEqual(caught.exception.result["deleted"], [])
+            self.assertEqual(caught.exception.result.get("unverified_deletions", []), [])
             self.assertEqual(world.writes(), [])
 
     def test_uncertain_or_unexpected_response_never_retries_or_continues(self):
@@ -284,6 +392,13 @@ class ExecutionTests(unittest.TestCase):
                         retention.BackupError, "not confirmed") as caught:
                     world.run()
                 self.assertNotIn("private", str(caught.exception))
+                self.assertIsInstance(caught.exception, retention.CleanupStopped)
+                self.assertFalse(caught.exception.result["completed"])
+                self.assertEqual(caught.exception.result["stop_reason"], "error")
+                self.assertEqual(caught.exception.result["deleted"], [])
+                self.assertEqual(caught.exception.result["unverified_deletions"], [
+                    {"copy": 0, "location": "local" if copies else "remote",
+                     "name": OLD_I, "response_status": "unknown"}])
                 self.assertEqual(len(world.writes()), 1)
                 self.assertNotIn("delete_verified", world.output.getvalue())
                 self.assertTrue(set(group(0)) <= set(world.remote))
@@ -291,19 +406,32 @@ class ExecutionTests(unittest.TestCase):
     def test_success_response_without_removal_stops(self):
         world = World()
         world.remove_target = False
-        with self.assertRaisesRegex(retention.BackupError, "metadata changed"):
+        with self.assertRaisesRegex(retention.BackupError, "metadata changed") as caught:
             world.run()
+        self.assertIsInstance(caught.exception, retention.CleanupStopped)
+        self.assertEqual(caught.exception.result["deleted"], [])
+        self.assertEqual(caught.exception.result["unverified_deletions"], [
+            {"copy": 0, "location": "local", "name": OLD_I, "response_status": "success"}])
         self.assertEqual(len(world.writes()), 1)
 
-    def test_time_limit_after_remote_removal_does_not_claim_verified_completion(self):
-        world, clock = World(0), [0]
-        world.after_write = lambda *args: clock.__setitem__(0, 1000)
-        result = world.run(timeout=120, clock=lambda: clock[0])
-        self.assertFalse(result["completed"])
-        self.assertEqual(result["stop_reason"], "time_limit")
-        self.assertEqual(result["deleted"], [])
-        self.assertEqual(len(world.writes()), 1)
-        self.assertNotIn("delete_verified", world.output.getvalue())
+    def test_time_limit_after_success_response_preserves_operation_without_claiming_verification(self):
+        for copies in (0, 2):
+            with self.subTest(local_copies=copies):
+                world, clock = World(copies), [0]
+                world.after_write = lambda *args: clock.__setitem__(0, 1800)
+                with self.assertRaises(retention.CleanupStopped) as caught:
+                    world.run(timeout=1800, clock=lambda: clock[0])
+                self.assertIsInstance(caught.exception, retention.BackupError)
+                result = caught.exception.result
+                self.assertFalse(result["completed"])
+                self.assertEqual(result["stop_reason"], "error")
+                self.assertEqual(result["deleted"], [])
+                self.assertEqual(result["unverified_deletions"], [
+                    {"copy": 0, "location": "local" if copies else "remote",
+                     "name": OLD_I, "response_status": "success"}])
+                self.assertEqual(len(world.writes()), 1)
+                self.assertNotIn("delete_verified", world.output.getvalue())
+                self.assertEqual(OLD_I in world.remote, bool(copies))
 
     def test_verified_partial_progress_is_reported_and_later_run_finishes(self):
         world, clock, reads = World(0), [0], [0]
@@ -311,11 +439,13 @@ class ExecutionTests(unittest.TestCase):
             if world.writes() and method == "GET":
                 reads[0] += 1
                 if reads[0] == 10:
-                    clock[0] = 1000
+                    clock[0] = 1800
         world.before_request = expire
-        result = world.run(timeout=120, clock=lambda: clock[0])
+        result = world.run(timeout=1800, clock=lambda: clock[0])
         self.assertFalse(result["completed"])
+        self.assertEqual(result["stop_reason"], "time_limit")
         self.assertEqual(result["deleted"], [OLD_I])
+        self.assertEqual(result.get("unverified_deletions", []), [])
         self.assertEqual(len(world.writes()), 1)
         world.before_request = None
         following = world.run()
@@ -323,16 +453,84 @@ class ExecutionTests(unittest.TestCase):
         self.assertTrue(following["completed"])
         self.assertEqual(len(world.writes()), 2)
 
-    def test_remote_recheck_failure_preserves_preceding_verified_event(self):
+    def test_remote_recheck_failure_preserves_verified_progress_and_current_operation(self):
         world = World(0)
         def change(index, location, backup):
             if backup == OLD:
                 world.remote["manual-copy"] = ""
         world.after_write = change
-        with self.assertRaisesRegex(retention.BackupError, "metadata changed"):
+        with self.assertRaisesRegex(retention.BackupError, "metadata changed") as caught:
             world.run()
+        self.assertIsInstance(caught.exception, retention.CleanupStopped)
+        self.assertFalse(caught.exception.result["completed"])
+        self.assertEqual(caught.exception.result["stop_reason"], "error")
+        self.assertEqual(caught.exception.result["deleted"], [OLD_I])
+        self.assertEqual(caught.exception.result["unverified_deletions"], [
+            {"copy": 0, "location": "remote", "name": OLD, "response_status": "success"}])
         self.assertEqual(world.output.getvalue().count('"event": "delete_verified"'), 1)
         self.assertEqual(len(world.writes()), 2)
+
+    def test_failed_later_predelete_check_preserves_progress_without_an_unverified_operation(self):
+        for failure in ("busy", "changed", "unreachable"):
+            with self.subTest(failure=failure):
+                world, reads = World(0), [0]
+                def fail(index, method, path):
+                    if world.writes() and method == "GET":
+                        reads[0] += 1
+                        if reads[0] == 11:
+                            if failure == "busy":
+                                world.actions[1] = [{"status": "in progress", "command": "restore other"}]
+                            elif failure == "changed":
+                                world.remote["manual-copy"] = ""
+                            else:
+                                raise retention.BackupError("unreachable")
+                world.before_request = fail
+                with self.assertRaises(retention.CleanupStopped) as caught:
+                    world.run()
+                self.assertIsInstance(caught.exception, retention.BackupError)
+                self.assertFalse(caught.exception.result["completed"])
+                self.assertEqual(caught.exception.result["stop_reason"], "error")
+                self.assertEqual(caught.exception.result["deleted"], [OLD_I])
+                self.assertEqual(caught.exception.result.get("unverified_deletions", []), [])
+                self.assertEqual(len(world.writes()), 1)
+
+    def test_uncertain_later_deletion_preserves_earlier_verified_progress(self):
+        world = World(0)
+        def fail(index, location, backup):
+            if backup == OLD:
+                world.failure = retention.BackupError("private transport detail")
+        world.after_write = fail
+        with self.assertRaisesRegex(retention.BackupError, "not confirmed") as caught:
+            world.run()
+        self.assertIsInstance(caught.exception, retention.CleanupStopped)
+        self.assertNotIn("private", str(caught.exception))
+        self.assertEqual(caught.exception.result["deleted"], [OLD_I])
+        self.assertEqual(caught.exception.result["unverified_deletions"], [
+            {"copy": 0, "location": "remote", "name": OLD, "response_status": "unknown"}])
+        self.assertEqual(len(world.writes()), 2)
+
+    def test_unexpected_error_preserves_progress_and_hides_private_details(self):
+        for phase, response_status in (("request", "unknown"), ("followup", "success")):
+            with self.subTest(phase=phase):
+                world = World(0)
+                def fail_write(index, location, backup):
+                    if phase == "request" and backup == OLD:
+                        raise TypeError("private failure details")
+                def fail_read(index, method, path):
+                    if phase == "followup" and method == "GET" and len(world.writes()) == 2:
+                        raise TypeError("private failure details")
+                world.after_write, world.before_request = fail_write, fail_read
+                with self.assertRaises(retention.CleanupStopped) as caught:
+                    world.run()
+                self.assertIsInstance(caught.exception, retention.BackupError)
+                self.assertIn("TypeError", str(caught.exception))
+                self.assertNotIn("private", str(caught.exception))
+                self.assertFalse(caught.exception.result["completed"])
+                self.assertEqual(caught.exception.result["stop_reason"], "error")
+                self.assertEqual(caught.exception.result["deleted"], [OLD_I])
+                self.assertEqual(caught.exception.result["unverified_deletions"], [
+                    {"copy": 0, "location": "remote", "name": OLD, "response_status": response_status}])
+                self.assertEqual(len(world.writes()), 2)
 
     def test_unapproved_paths_and_repeated_writes_are_rejected(self):
         world = World(0)
@@ -340,7 +538,8 @@ class ExecutionTests(unittest.TestCase):
         cleaner.execute = True
         cleaner.allowed = {OLD_I}
         cleaner.pending = (0, "remote", OLD_I)
-        cleaner.request(0, "POST", "/backup/delete/remote/" + OLD_I)
+        with redirect_stdout(io.StringIO()):
+            cleaner.request(0, "POST", "/backup/delete/remote/" + OLD_I)
         cleaner.pending = (0, "remote", OLD_I)
         with self.assertRaisesRegex(retention.BackupError, "unexpected API request"):
             cleaner.request(0, "POST", "/backup/delete/remote/" + OLD_I)

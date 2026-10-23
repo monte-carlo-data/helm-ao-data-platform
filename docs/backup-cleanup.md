@@ -72,8 +72,10 @@ and do not select sets under `daily-weekly`.
 - Keep the newly verified backup's whole set, even after a long gap. Keep manual
   backups and complete sets needed by any retained or local-only backup.
 - Additional full backups on a retained date stay too. With one full per day,
-  the 7/30 settings normally retain about 10-11 full sets. Older recovery points
-  are spaced farther apart than recent daily history.
+  same-day incrementals, and no extra protected older sets, the 7/30 settings
+  retain 11 full sets, or 12 when cleanup runs on Monday. Missed days and protected
+  dependencies can change that count. Older recovery points are spaced farther
+  apart than recent daily history.
 
 These rules do not change daily full backups or four-hour incrementals. Broken
 local records stop this policy because their missing metadata could hide a
@@ -139,13 +141,39 @@ For scripts or alerts, parse the text after `Backup cleanup: ` or
 `Backup cleanup entry: ` as JSON and read its fields. Do not match exact spacing
 or key order; those may change.
 
-`delete` entries list candidates in removal order; `deleted_count` is zero in preview mode.
-In deletion mode, `deleted` lists confirmed S3 removals; per-operation events
-record local and remote deletion attempts and confirmations. A time-limit report
-can contain partial progress, so inspect `completed` and `stop_reason` too.
+`delete` entries list the original candidates in removal order, and `delete_count`
+counts those candidates. In deletion mode, `deleted` and `deleted_count` record
+only S3 removals whose follow-up checks completed. `deleted_count` is zero in
+preview mode. Per-operation events record local and remote deletion attempts
+and verified removals. `delete_requested` is written only after the time check
+allows a request to be sent.
+
+If a later deletion or check fails, the report keeps every earlier verified S3
+removal and reports `completed: false` with `stop_reason: error`. The stop line
+includes the reason and the number of verified S3 removals. A clean pause before
+another deletion reports `stop_reason: time_limit` and also keeps that progress.
+Check these fields even when `deleted_count` is greater than zero.
+
+When an attempted deletion has not been verified, the report also includes
+`unverified_deletions` entries and `unverified_deletions_count`. Each entry has
+`copy`, `location`, `name`, and `response_status`:
+
+- `response_status: success` means the server returned the expected success
+  response, but the follow-up checks did not finish successfully.
+- `response_status: unknown` means the expected success response was not
+  received. The deletion may still be running.
+- `location: local` concerns the named copy's database-disk records. It does
+  not mean the S3 backup was removed. `location: remote` concerns an attempted
+  S3 removal.
+
+These entries need investigation and never increase `deleted_count`. Use
+`location` and `copy` to inspect the affected records and remote backup before
+more manual work. Cleanup sends no further deletion after an unverified result
+and never retries that request within the run.
+
 Every name is written separately, so the growing candidate list does not make
 one increasingly long JSON line. Keep the summary and all entry lines to retain
-the full report. Local entries also include `copy`: `0` is the first ClickHouse
+the full report. Where an entry includes `copy`, `0` is the first ClickHouse
 replica, `1` is the second, `2` is the third, and so on.
 
 Every configured copy must be reachable and report matching remote records. Missing
@@ -159,13 +187,31 @@ has already been verified, the Job still succeeds. Read that line and the
 report separately from backup Job status. Do not rerun a completed backup just
 because its preview failed. This chart does not send preview alerts.
 
+Before each local or S3 deletion under `daily-weekly`, cleanup reserves a fixed
+300-second delete timeout, five 30-second follow-up reads per copy, and another
+30 seconds for processing. These requests need
+`300 + (5 * copies + 1) * 30` seconds, plus time for the password revision checks
+that run before each request. With two copies, those checks add 220 seconds to
+the 630-second request allowance, so more than 850 seconds must remain before
+starting a deletion. Earlier checks also use the cleanup budget, so configure
+more time than this reserve; the default is 1800 seconds.
+
+If too little time remains to start another deletion, cleanup sends no further
+deletion and reports `completed: false` with `stop_reason: time_limit`. This is
+an expected pause, and a large backlog may take several scheduled runs. The
+60-second minimum for `cleanup.timeoutSeconds` remains available for previews;
+a deletion run with that budget pauses without starting a deletion. A request
+timeout or unfinished checks after a deletion still need investigation, as
+described above. If the initial reads fail before a removal plan exists, only
+the stop message is available; no deletion has been sent.
+
 The Job deadline is `schedule.timeoutSeconds + cleanup.timeoutSeconds + 60`,
 plus `localCleanup.timeoutSeconds` when database-disk cleanup is also enabled.
 Keep it below the scheduled interval, with time for startup and scheduling
 delays. Otherwise an unfinished Job delays the next scheduled run. It can
 still start within the configured start deadline (900 seconds, or 15 minutes,
 by default); after that the missed run is skipped. Defaults allow 10800 seconds
-for backup and 1800 for preview, with a 60-second allowance, on a four-hour
+for backup and 1800 for S3 cleanup, with a 60-second allowance, on a four-hour
 schedule.
 
 ## Local files in the report

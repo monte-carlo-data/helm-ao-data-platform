@@ -1046,6 +1046,8 @@ class APITests(unittest.TestCase):
             self.assertEqual(len(api.call_args_list), 2)
             self.assertEqual(api.call_args_list[0].args, (self.url, "backup", "backup-pw"))
             self.assertEqual(api.call_args_list[1].args, (self.url, "backup_probe", "probe-pw"))
+            self.assertEqual(api.call_args_list[0].kwargs["guard_timeout_seconds"], 10)
+            self.assertEqual(api.call_args_list[1].kwargs["guard_timeout_seconds"], 10)
             self.assertFalse(api.call_args_list[1].kwargs["backup_api"])
             self.assertEqual(read.call_args_list, [mock.call(Path(path)) for path in passwords])
             copy_guard = api.call_args_list[0].kwargs["guard"]
@@ -1348,6 +1350,37 @@ class APITests(unittest.TestCase):
             self.assertEqual(backup.main(), 0)
             run.assert_called_once()
             cleanup.Cleaner.return_value.run.assert_called_once_with(latest_backup=FULL, execute=False)
+
+    def test_stopped_cleanup_reports_verified_and_unverified_removals(self):
+        settings = dict(self.settings, BACKUP_CLEANUP_ENABLED="true", BACKUP_CLEANUP_DRY_RUN="false",
+                        BACKUP_RETENTION_POLICY="daily-weekly")
+        cleanup = mock.Mock()
+        result = {"mode": "delete", "retention_policy": "daily-weekly", "daily_days": 7,
+                  "history_days": 30, "completed": False, "stop_reason": "error",
+                  "kept": [FULL], "delete": ["old-confirmed", "old-unconfirmed"],
+                  "deleted": ["old-confirmed"], "broken_local": [], "local_only": [],
+                  "unverified_deletions": [{"copy": 0, "location": "remote", "name": "old-unconfirmed",
+                                             "response_status": "success"}]}
+        cleanup.Cleaner.return_value.run.side_effect = backup.CleanupStopped(
+            "Follow-up checks did not finish.", result)
+        output, errors = io.StringIO(), io.StringIO()
+        with mock.patch.dict(backup.os.environ, settings, clear=True), \
+                mock.patch.dict("sys.modules", {"cleanup_backups": cleanup}), \
+                mock.patch.object(backup, "configured_clients", return_value=([mock.Mock()], [mock.Mock()])), \
+                mock.patch.object(backup.Scheduler, "run", return_value=FULL), \
+                redirect_stdout(output), redirect_stderr(errors):
+            self.assertEqual(backup.main(), 0)
+        lines = output.getvalue().splitlines()
+        summary = json.loads(lines[0].split(": ", 1)[1])
+        self.assertEqual(summary["deleted_count"], 1)
+        self.assertEqual(summary["unverified_deletions_count"], 1)
+        self.assertFalse(summary["completed"])
+        entries = [json.loads(line.split(": ", 1)[1]) for line in lines[1:]]
+        self.assertEqual([row["name"] for row in entries if row["list"] == "deleted"], ["old-confirmed"])
+        self.assertEqual([row["name"] for row in entries if row["list"] == "unverified_deletions"],
+                         ["old-unconfirmed"])
+        self.assertIn("Backup cleanup stopped:", errors.getvalue())
+        self.assertIn("Verified S3 removals: 1; deletions needing confirmation: 1", errors.getvalue())
 
     def test_failed_upload_never_calls_cleanup(self):
         settings = dict(self.settings, BACKUP_CLEANUP_ENABLED="true")

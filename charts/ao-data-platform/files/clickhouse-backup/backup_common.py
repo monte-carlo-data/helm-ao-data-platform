@@ -14,6 +14,14 @@ class BackupError(Exception):
     """A safe-to-log failure message, without server bodies or credentials."""
 
 
+class CleanupStopped(BackupError):
+    """Preserve verified removals and any deletion still needing confirmation."""
+
+    def __init__(self, message, result):
+        super().__init__(message)
+        self.result = result
+
+
 def scheduled_name(kind, now):
     """Use the same name format for creation, full-base selection, and cleanup."""
     if kind not in ("full", "incremental"):

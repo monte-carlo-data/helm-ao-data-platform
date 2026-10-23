@@ -176,7 +176,7 @@ print('downloaded')
 from cleanup_backups import Cleaner
 apis = [backup.API('http://127.0.0.1:' + str(port), 'backup', 'dummy-api-password') for port in (7171, 7172)]
 try:
-    result = Cleaner(apis, retention_policy='daily-weekly', daily_days=7, history_days=30, timeout=180).run(
+    result = Cleaner(apis, retention_policy='daily-weekly', daily_days=7, history_days=30, timeout=1800).run(
         now=datetime.fromisoformat(os.environ['CLEANUP_TIME']), latest_backup=os.environ['LATEST_BACKUP'],
         execute=os.environ['EXECUTE'] == '1')
 except backup.BackupError as error:

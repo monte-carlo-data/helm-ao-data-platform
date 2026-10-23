@@ -27,7 +27,7 @@ import urllib.parse
 import urllib.request
 
 
-from backup_common import (BackupError, DELETION_UNAVAILABLE, REQUEST_TIMEOUT_SECONDS,
+from backup_common import (BackupError, CleanupStopped, DELETION_UNAVAILABLE, REQUEST_TIMEOUT_SECONDS,
                            SCHEDULED_NAME, broken_local_entry, scheduled_name)
 
 
@@ -74,7 +74,8 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class API:
-    def __init__(self, endpoint, username, password, guard=None, ca_file=None, backup_api=True):
+    def __init__(self, endpoint, username, password, guard=None, ca_file=None, backup_api=True,
+                 guard_timeout_seconds=0):
         parsed = urllib.parse.urlsplit(endpoint)
         if (parsed.scheme not in ("http", "https") or not parsed.hostname
                 or parsed.username or parsed.password or parsed.query
@@ -90,6 +91,7 @@ class API:
             handlers.append(urllib.request.HTTPSHandler(context=ssl.create_default_context(cafile=ca_file)))
         self.opener = urllib.request.build_opener(*handlers)
         self.guard = guard
+        self.guard_timeout_seconds = guard_timeout_seconds
         self.backup_api = backup_api
 
     def request(self, method, path, query=None, *, request_timeout=None):
@@ -138,6 +140,9 @@ class API:
             raise BackupError("Backup API returned invalid JSON.") from None
 
 
+PASSWORD_REVISION_READ_TIMEOUT_SECONDS = 10
+
+
 class PasswordRevisionGuard:
     """Check projected credentials and every existing copy before sending them."""
 
@@ -168,7 +173,7 @@ class PasswordRevisionGuard:
                     "https://kubernetes.default.svc" + prefix + urllib.parse.quote(name, safe=""),
                     headers={"Authorization": "Bearer " + token})
                 try:
-                    with opener.open(request, timeout=10) as response:
+                    with opener.open(request, timeout=PASSWORD_REVISION_READ_TIMEOUT_SECONDS) as response:
                         payload = response.read(4 * 1024 * 1024 + 1)
                 except urllib.error.HTTPError as error:
                     code = error.code
@@ -268,10 +273,13 @@ def configured_clients():
     if not probe_password:
         raise BackupError("The mounted backup probe password is empty.")
     guards = [lambda index=index: guard(index) for index in range(len(endpoints))]
-    apis = [API(endpoint, os.environ.get("BACKUP_API_USERNAME", "backup"), password, guard=guards[index])
+    guard_timeout = len(pod_names) * PASSWORD_REVISION_READ_TIMEOUT_SECONDS
+    apis = [API(endpoint, os.environ.get("BACKUP_API_USERNAME", "backup"), password, guard=guards[index],
+                guard_timeout_seconds=guard_timeout)
             for index, endpoint in enumerate(endpoints)]
     probes = [API(endpoint, os.environ.get("BACKUP_PROBE_USERNAME", "backup_probe"), probe_password, guard=guards[index],
-                  ca_file=os.environ.get("BACKUP_DATABASE_CA_FILE"), backup_api=False)
+                  ca_file=os.environ.get("BACKUP_DATABASE_CA_FILE"), backup_api=False,
+                  guard_timeout_seconds=guard_timeout)
               for index, endpoint in enumerate(database_endpoints)]
     return apis, probes
 
@@ -504,6 +512,8 @@ class Scheduler:
 def report_cleanup_result(result, prefix, settings):
     """Keep each log line small without omitting any name or changing its order."""
     lists = ("kept", "delete", "deleted", "broken_local", "local_only")
+    if "unverified_deletions" in result:
+        lists += ("unverified_deletions",)
     summary = {key: result[key] for key in settings}
     summary.update({key: result[key] for key in ("completed", "stop_reason") if key in result})
     summary.update({key + "_count": len(result[key]) for key in lists})
@@ -635,6 +645,12 @@ def main():
                 print(label + " found local files needing attention; "
                       "see broken_local and local_only in the report." +
                       (" No files were deleted." if not execute else ""), file=sys.stderr)
+        except CleanupStopped as error:
+            report_cleanup(error.result)
+            print(f"{label} stopped: {error} "
+                  f"Verified S3 removals: {len(error.result['deleted'])}; "
+                  f"deletions needing confirmation: {len(error.result['unverified_deletions'])}. "
+                  "See the report for names. The backup already completed.", file=sys.stderr)
         except (KeyError, ValueError, OSError):
             print(label + " stopped: check cleanup settings; the backup already completed.",
                   file=sys.stderr)
