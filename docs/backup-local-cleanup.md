@@ -102,8 +102,18 @@ successful backup run checks the remaining records again. Reaching the limit
 before a plan is available, a request timeout, or an unverified deletion still
 reports an error. Do not retry an uncertain deletion to clear the backlog.
 
-`timeoutSeconds` must be an integer of at least 60. The Job deadline includes
-the backup timeout, each enabled cleanup timeout, and 60 seconds. With both
+Before starting each removal, cleanup reserves five minutes for the deletion,
+four 30-second reads per copy to verify the result, and another 30 seconds for
+processing. With two copies, more than 570 seconds must remain. If less time
+is available, it returns the partial summary without sending or logging a new
+deletion request. It does not shorten a deletion's timeout just to fit another
+removal in. This leaves time unused when the next removal cannot safely fit;
+unexpected delays or request failures still stop cleanup with an error.
+
+`timeoutSeconds` must be an integer of at least 60. A short timeout can be used
+for previews, but removal needs the time above plus the initial checks; keep
+the default 1800 seconds unless a different limit has been tested. The Job
+deadline includes the backup timeout, each enabled cleanup timeout, and 60 seconds. With both
 cleanup options enabled at their defaults, that total is 14,460 seconds,
 slightly longer than the four-hour schedule. Choose shorter cleanup timeouts
 when combining them. An unfinished Job delays the next scheduled run because

@@ -25,6 +25,7 @@ from cleanup_backups import (READ_PATHS, catalog, local_record_warnings,
 
 
 DELETE_PREFIX = "/backup/delete/local/"
+DELETE_TIMEOUT_SECONDS = 300
 
 
 class LocalCleanupTimeLimit(BackupError):
@@ -135,12 +136,21 @@ class LocalCleaner:
         if (method != "POST" or not path.startswith(DELETE_PREFIX)
                 or not SCHEDULED_NAME.fullmatch(name) or self.pending != (index, name)):
             raise BackupError("Local cleanup refused an unexpected API request.")
+        # After deletion, snapshot() reads actions twice and both lists on
+        # every copy. Reserve each request's full timeout and one extra read
+        # timeout for processing before starting an irreversible operation.
+        required = DELETE_TIMEOUT_SECONDS + (4 * len(self.apis) + 1) * REQUEST_TIMEOUT_SECONDS
+        if remaining <= required:
+            raise LocalCleanupTimeLimit("Not enough cleanup time remains for a deletion and its checks; "
+                                        "no further deletion was sent.")
         # Consume authorization before the request. Even an uncertain response
         # cannot cause the same operation to be sent again through this object.
         self.pending = None
+        print("Backup local cleanup: " + json.dumps(
+            {"event": "delete_requested", "copy": index, "name": name}, sort_keys=True), flush=True)
         try:
             return self.apis[index].request(method, path,
-                request_timeout=min(300, remaining - REQUEST_TIMEOUT_SECONDS))
+                request_timeout=DELETE_TIMEOUT_SECONDS)
         except BackupError:
             raise BackupError("Local deletion was not confirmed and may still be running; "
                               "no retry or further deletion was sent.") from None
@@ -200,8 +210,6 @@ class LocalCleaner:
             # dependency and all exposed metadata must match the approved plan.
             self.unchanged(remote, local)
             self.pending = (index, name)
-            print("Backup local cleanup: " + json.dumps(
-                {"event": "delete_requested", "copy": index, "name": name}, sort_keys=True), flush=True)
             rows = self.request(index, "POST", DELETE_PREFIX + name)
             expected = {"status": "success", "operation": "delete", "backup_name": name, "location": "local"}
             if rows != [expected]:

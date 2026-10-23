@@ -206,7 +206,7 @@ print(json.dumps(result, sort_keys=True))
         for copy, keep_days in ((0, 3), (1, 4)):
             output = self.client(storage, """
 from cleanup_local_backups import LocalCleaner
-result = LocalCleaner([api], keep_full_backup_days=int(os.environ['KEEP_DAYS']), timeout=180).run(
+result = LocalCleaner([api], keep_full_backup_days=int(os.environ['KEEP_DAYS'])).run(
     latest_backup=os.environ['LATEST_BACKUP'], execute=True)
 print(json.dumps(result))
 """, copy=copy, KEEP_DAYS=str(keep_days), LATEST_BACKUP=groups[-1][-1])
