@@ -157,7 +157,7 @@ print(json.dumps(objects, sort_keys=True))
         output = self.client(storage, """
 from cleanup_local_backups import LocalCleaner
 apis = [backup.API('http://127.0.0.1:' + str(port), 'backup', 'dummy-api-password') for port in (7171, 7172)]
-result = LocalCleaner(apis, keep_full_backup_days=2, timeout=180).run(
+result = LocalCleaner(apis, keep_full_backup_days=2).run(
     latest_backup=os.environ['LATEST_BACKUP'], execute=os.environ['EXECUTE'] == '1')
 print(json.dumps(result, sort_keys=True))
 """, LATEST_BACKUP=latest_backup, EXECUTE="1" if execute else "0")

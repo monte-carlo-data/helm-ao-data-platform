@@ -405,7 +405,7 @@ class OperationTests(unittest.TestCase):
                 if reads_after_delete == 8:
                     clock[0] = 1000
         world.before_request = expire_after_verification
-        result = world.run(execute=True, timeout=120, clock=lambda: clock[0])
+        result = world.run(execute=True, timeout=900, clock=lambda: clock[0])
         self.assertFalse(result["completed"])
         self.assertEqual(result["stop_reason"], "time_limit")
         self.assertEqual(result["deleted"], [{"copy": 0, "name": AI}])
@@ -424,7 +424,7 @@ class OperationTests(unittest.TestCase):
             clock[0] = 1000
         world.after_delete = expire
         with self.assertRaisesRegex(cleanup.BackupError, "prevented its follow-up checks"):
-            world.run(execute=True, timeout=120, clock=lambda: clock[0])
+            world.run(execute=True, timeout=900, clock=lambda: clock[0])
         self.assertEqual(len(world.writes()), 1)
         self.assertNotIn("delete_verified", world.output.getvalue())
 
@@ -444,11 +444,73 @@ class OperationTests(unittest.TestCase):
                     cleaner.request(0, "POST", cleanup.DELETE_PREFIX + AI)
                 self.assertEqual(len(world.writes()), 1)
 
-    def test_delete_timeout_is_limited_by_remaining_budget(self):
-        world = World(1)
-        result = world.run(execute=True, timeout=120, clock=lambda: 0)
-        self.assertEqual(len(result["deleted"]), 2)
-        self.assertTrue(all(call[3] == {"request_timeout": 90} for call in world.writes()))
+    def test_delete_requires_its_full_timeout_and_verification_time_on_every_copy(self):
+        for copies, required in ((1, 450), (2, 570), (3, 690)):
+            for timeout in (required - 1, required, required + 1):
+                with self.subTest(copies=copies, timeout=timeout):
+                    world = World(copies)
+                    result = world.run(execute=True, timeout=timeout, clock=lambda: 0)
+                    if timeout <= required:
+                        self.assertFalse(result["completed"])
+                        self.assertEqual(result["stop_reason"], "time_limit")
+                        self.assertEqual(result["deleted"], [])
+                        self.assertEqual(world.writes(), [])
+                        self.assertNotIn("delete_requested", world.output.getvalue())
+                    else:
+                        self.assertTrue(result["completed"])
+                        self.assertEqual(len(result["deleted"]), copies * 2)
+                        self.assertTrue(all(call[3] == {"request_timeout": 300}
+                                            for call in world.writes()))
+
+    def test_limit_reached_immediately_before_delete_has_no_request_log(self):
+        world = World()
+        # Three snapshots (four reads per copy) have finished. Expire at the
+        # next clock check, immediately before the first delete would be sent.
+        result = world.run(execute=True, timeout=900,
+                           clock=lambda: 900 if len(world.calls) == 24 else 0)
+        self.assertFalse(result["completed"])
+        self.assertEqual(result["stop_reason"], "time_limit")
+        self.assertEqual(world.writes(), [])
+        self.assertNotIn("delete_requested", world.output.getvalue())
+
+    def test_near_limit_runs_pause_or_finish_without_unverified_deletions(self):
+        outcomes = set()
+        for timeout in (*range(60, 200), *range(600, 751)):
+            with self.subTest(timeout=timeout):
+                world = World()
+                clock = [0]
+                def advance(index, method, path):
+                    clock[0] += 1
+                world.before_request = advance
+                result = world.run(execute=True, timeout=timeout, clock=lambda: clock[0])
+                outcomes.add((result["completed"], bool(result["deleted"])))
+                self.assertEqual(len(result["deleted"]), len(world.writes()))
+                events = [json.loads(line.removeprefix("Backup local cleanup: "))
+                          for line in world.output.getvalue().splitlines()]
+                self.assertEqual(sum(row["event"] == "delete_requested" for row in events),
+                                 len(world.writes()))
+                self.assertEqual(sum(row["event"] == "delete_verified" for row in events),
+                                 len(world.writes()))
+                self.assertEqual(world.remote, GROUPS)
+        self.assertEqual(outcomes, {(False, False), (False, True), (True, True)})
+
+    def test_slow_delete_and_follow_up_reads_fit_the_reserved_time(self):
+        world = World()
+        clock = [0]
+        def advance(index, method, path):
+            if method == "POST":
+                clock[0] += 299
+            elif world.writes():
+                clock[0] += 29
+            else:
+                clock[0] += 1
+        world.before_request = advance
+        result = world.run(execute=True, timeout=600, clock=lambda: clock[0])
+        self.assertFalse(result["completed"])
+        self.assertEqual(result["stop_reason"], "time_limit")
+        self.assertEqual(result["deleted"], [{"copy": 0, "name": AI}])
+        self.assertEqual(len(world.writes()), 1)
+        self.assertEqual(world.remote, GROUPS)
 
     def test_direct_writes_and_invalid_options_are_rejected(self):
         world = World()
