@@ -5,11 +5,11 @@ where their data lives in S3. These files grow as backups are created or
 downloaded. `clickhouse.backup.localCleanup` can remove older records after a
 successful backup, while keeping the completed backups in S3.
 
-This option is off by default. It uses the chart's existing stock Altinity
-2.8.1 image and requires no new AWS permissions. Changing this option alone
+This option is off by default. It supports the stock Altinity
+2.8.1 and 2.8.2 images and requires no new AWS permissions. Changing this option alone
 changes the backup Job scripts and schedule settings, not the ClickHouse or
-Keeper installation. Review any other changes included in a chart upgrade
-separately.
+Keeper installation. Review other changes in a chart upgrade separately: chart 5.8.0 changes the
+default backup image to 2.8.2, which rolls ClickHouse pods when backups are enabled.
 
 ## Start with a preview
 
@@ -69,7 +69,9 @@ https://github.com/Altinity/clickhouse-backup/blob/v2.8.1/pkg/backup/delete.go#L
 Test cleanup and recovery with disposable data first, then review the preview
 for your installation. Set `localCleanup.dryRun: false` to permit removal on
 later successful backup runs. This does not enable S3 deletion; the separate
-`cleanup` option remains a preview only.
+`cleanup` option has its own preview and deletion controls. When S3 deletion
+is explicitly enabled, it also removes remaining local records for the sets
+it retires. See [S3 backup cleanup](backup-cleanup.md).
 
 Every configured database copy must be reachable and idle, and must agree on
 the completed S3 backups. Before and after each removal, cleanup checks the
@@ -133,7 +135,7 @@ Pausing the schedule does not cancel an existing Job or server operation.
   record may still exist or may already be gone after a partial attempt; do
   not resend the deletion until that state is understood. If the remote
   backup is missing or unreadable, stop: deleting local records can also
-  remove native S3 data in that case. Both this cleanup and the S3 preview
+  remove native S3 data in that case. Both this cleanup and S3 cleanup
   remain stopped until the failed history entry clears. See
   [failed deletion history](backup-cleanup.md#preview-stops-that-need-investigation)
   for how entries age out or clear on a backup-container restart. A restart

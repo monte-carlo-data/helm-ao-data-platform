@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
-"""Preview retention after a verified backup without deleting any backup files.
+"""Preview legacy retention or select complete daily/weekly backup sets.
 
 Call inside the same non-overlapping CronJob. Every copy and every dependency
 must be readable. Only this scheduler's names are eligible; unrelated backups
 and required bases are preserved.
 
-Stock clickhouse-backup 2.8.1 skips native serialization.json objects during
-S3 deletion. This module therefore rejects execution before making any API
-request and contains no deletion operation. See docs/backup-cleanup.md for
-operator instructions and deletion limitations.
-Source: https://github.com/Altinity/clickhouse-backup/blob/v2.8.1/pkg/backup/delete.go
+The original count-and-age policy remains preview-only. The daily-weekly
+policy delegates to backup_retention, which requires stock 2.8.2 for deletion.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -131,7 +128,8 @@ def local_record_warnings(remote, local):
 
 
 class Cleaner:
-    def __init__(self, apis, keep_last=2, keep_days=0, timeout=600, clock=time.monotonic):
+    def __init__(self, apis, keep_last=2, keep_days=0, timeout=1800, clock=time.monotonic,
+                 retention_policy="count-and-age", daily_days=7, history_days=30):
         if not apis or timeout <= 0:
             raise BackupError("Cleanup requires at least one ClickHouse copy and a positive timeout.")
         endpoints = [api.endpoint for api in apis if getattr(api, "endpoint", None)]
@@ -140,6 +138,10 @@ class Cleaner:
         self.apis = tuple(apis)
         self.keep_last = keep_last
         self.keep_days = keep_days
+        if retention_policy not in ("count-and-age", "daily-weekly"):
+            raise BackupError("Cleanup retention policy must be count-and-age or daily-weekly.")
+        self.retention_policy = retention_policy
+        self.daily_days, self.history_days, self.timeout = daily_days, history_days, timeout
         self.clock = clock
         self.deadline = clock() + timeout
 
@@ -192,6 +194,10 @@ class Cleaner:
     def run(self, now=None, latest_backup=None, execute=False):
         if type(execute) is not bool:
             raise BackupError("Cleanup execute must be an explicit boolean.")
+        if self.retention_policy == "daily-weekly":
+            from backup_retention import RemoteCleaner
+            return RemoteCleaner(self.apis, self.daily_days, self.history_days, self.timeout, self.clock).run(
+                now, latest_backup, execute)
         if execute:
             raise BackupError(DELETION_UNAVAILABLE)
         now = now or datetime.now(timezone.utc)

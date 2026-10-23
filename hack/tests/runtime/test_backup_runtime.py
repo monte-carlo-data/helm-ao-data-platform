@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from test_backup_chart import CHART, one, pod, render, render_secret_template
 
 CH_IMAGE = os.environ.get("CLICKHOUSE_TEST_IMAGE", "clickhouse/clickhouse-server:26.4.3")
-BACKUP_IMAGE = os.environ.get("BACKUP_TEST_IMAGE", "altinity/clickhouse-backup:2.8.1@sha256:08016b048f7e6035c048501315c2a788e5a782f15f168e042c7bd48d5a388cc4")
+BACKUP_IMAGE = os.environ.get("BACKUP_TEST_IMAGE", "altinity/clickhouse-backup:2.8.2@sha256:bc32794f2bd95d780bf6a0fea093d0ee463ec8e7dc486ccb845ce47b3406fad5")
 PYTHON_IMAGE = os.environ.get("BACKUP_PYTHON_IMAGE", "python:3.12-slim-bookworm@sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e")
 S3_IMAGE = os.environ.get("BACKUP_S3_IMAGE", "chainguard/minio@sha256:0f95aa412a12351a95bb43c3b54b66440eb0aa022bb3f3458942678a489e915b")
 WRAPPER = CHART / "files/clickhouse-backup/start-backup.sh"
@@ -287,6 +287,12 @@ class BackupRuntimeHelpers:
                "--env", "BACKUP_PASSWORD_REVISION=" + revision,
                "--mount", f"type=bind,source={root / 'scripts'},target=/scripts,readonly",
                "--entrypoint", "/bin/sh"]
+        if database.s3_credentials:
+            # Native S3 deletion follows the disk's environment-credential
+            # setting, separately from the catalog credentials in config.yml.
+            args += ["--env", "AWS_EC2_METADATA_DISABLED=true",
+                     "--env", "AWS_ACCESS_KEY_ID=" + database.s3_credentials["access_key"],
+                     "--env", "AWS_SECRET_ACCESS_KEY=" + database.s3_credentials["secret_key"]]
         for kind, directory, target in (("config", config, "/etc/clickhouse-backup"),
                                          ("api", api, "/etc/clickhouse-backup-api")):
             source = f"type=volume,source={volumes[kind]}" if volumes else f"type=bind,source={directory}"

@@ -30,7 +30,8 @@ delays that run (concurrencyPolicy: Forbid). It can start up to
 {{ $b.schedule.startingDeadlineSeconds }} seconds late; after that, the missed
 run is skipped (startingDeadlineSeconds: {{ $b.schedule.startingDeadlineSeconds }}).
 {{- if $b.cleanup.enabled }}
-The Job deadline includes {{ $b.cleanup.timeoutSeconds }} seconds for the cleanup preview.
+The Job deadline includes {{ $b.cleanup.timeoutSeconds }} seconds for {{ if $b.cleanup.dryRun }}the cleanup preview{{ else }}S3 backup cleanup{{ end }}.
+S3 cleanup {{ if $b.cleanup.dryRun }}only previews removals{{ else }}removes expired complete backup sets and their remaining local records{{ end }}.
 {{- end }}
 {{- if $b.localCleanup.enabled }}
 The Job deadline includes {{ $b.localCleanup.timeoutSeconds }} seconds for local backup cleanup.
