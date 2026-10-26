@@ -236,6 +236,19 @@ print(json.dumps(result))
             self.assertLess(cleaned["deleted"].index(incremental), cleaned["deleted"].index(full))
         for copy in (0, 1):
             self.assertEqual(self.local_names(storage, copy), set(names) - expired)
+            rows = json.loads(self.client(
+                storage, "print(json.dumps(api.request('GET', '/backup/actions')))", copy=copy))
+            deleted = [row for row in rows if row["command"].startswith("delete ")]
+            self.assertTrue(deleted)
+            self.assertTrue(all(row["status"] == "success" and not row.get("operation_id")
+                                for row in deleted))
+            if copy == 0:
+                self.assertEqual({row["command"] for row in deleted if row["command"].startswith("delete remote ")},
+                                 {"delete remote " + name for name in expired})
+            accepted = self.failover_actions(rows)
+            self.assertEqual({row[1] for row in accepted if row[1].startswith("delete ")},
+                             {row["command"] for row in deleted},
+                             "The copy-switch check must retain completed local and remote deletions")
         after = self.snapshot(storage, credentials)
         self.assertEqual(after, {key: value for key, value in before.items() if key not in removed_objects},
                          "Every expired native/catalog object must be gone; retained objects must be unchanged")
@@ -294,6 +307,9 @@ print('bucket versioning access denied')
             if copy == 0:
                 expected.append("delete remote " + deleted_name)
             self.assertEqual([row["command"] for row in rows if row["command"].startswith("delete ")], expected)
+            accepted = self.failover_actions(rows)
+            self.assertEqual([row[1] for row in accepted if row[1].startswith("delete ")], expected,
+                             "The copy-switch check must also accept completed deletions after cleanup stops")
         self.s3(storage, admin, """
 target = '/runtime-backups?' + urllib.parse.urlencode({'list-type': '2', 'prefix': 'test/catalog/', 'delimiter': '/'})
 root = ET.fromstring(signed_s3_request('GET', target, key, secret))
