@@ -229,6 +229,11 @@ verify_clickhouse_user_model() {
   expect_privilege "monte_carlo writes conversation turns"     monte_carlo "$MC_PW" "INSERT ON otel_traces.conversations_normalized"
   expect_privilege "monte_carlo publishes the rollup cursor"   monte_carlo "$MC_PW" "INSERT ON otel_traces.conversation_rollup_watermarks"
   expect_privilege "monte_carlo writes the trajectory trigger ledger" monte_carlo "$MC_PW" "INSERT ON otel_traces.trajectory_trigger_ledger"
+  expect_privilege "monte_carlo writes agent feedback" monte_carlo "$MC_PW" "INSERT ON otel_traces.agent_feedback"
+  expect_privilege "monte_carlo writes agent turn links" monte_carlo "$MC_PW" "INSERT ON otel_traces.agent_turn_links"
+  expect_match "feedback carries its source" monte_carlo "$MC_PW" "DESCRIBE TABLE otel_traces.agent_feedback" $'source\tLowCardinality(String)'
+  expect_match "feedback preserves its span timestamp" monte_carlo "$MC_PW" "DESCRIBE TABLE otel_traces.agent_feedback" $'feedback_span_time\tDateTime64(9)'
+  expect_ok "monte_carlo reads code run links" monte_carlo "$MC_PW" "SELECT run_id, trace_id FROM otel_traces.code_agent_run_links LIMIT 0"
   # ADD COLUMN IF NOT EXISTS matches by name only, so the table loop's existence check cannot
   # see a wrong-shaped column: a cluster where a draft 0022/0024 was hand-applied during
   # development keeps it forever and the schema job exits 0. Assert the shape the writer relies
@@ -303,7 +308,7 @@ verify_clickhouse_user_model() {
 
   # Materialized views must run under schema_owner as their DEFINER.
   local mv
-  for mv in otel_traces_trace_id_ts_mv spans_normalized_mv conversations_normalized_mv; do
+  for mv in otel_traces_trace_id_ts_mv spans_normalized_mv conversations_normalized_mv code_agent_feedback_mv code_agent_run_links_mv; do
     if ch_as schema_owner "$SO_PW" "SHOW CREATE TABLE otel_traces.$mv" | grep -qiE "DEFINER *= *\`?schema_owner\`?"; then
       pass "MV $mv runs as schema_owner (DEFINER)"
     else

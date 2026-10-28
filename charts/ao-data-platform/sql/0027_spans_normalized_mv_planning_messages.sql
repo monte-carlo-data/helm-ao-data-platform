@@ -544,4 +544,6 @@ SELECT
         _completion_indices
     ) AS completions
 
-FROM otel_traces.otel_traces;
+FROM otel_traces.otel_traces
+WHERE SpanName != 'user_feedback'
+  AND JSONExtractString(toString(SpanAttributes), 'gen_ai', 'evaluation', 'name') != 'user_feedback';
