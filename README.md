@@ -22,7 +22,7 @@ The ClickHouse instance ships with production hardening: a capped memory ceiling
 
 > **Chart-version bumps no longer recreate ClickHouse:** the ClickHouse operator propagates only a fixed allowlist of stable labels onto the resources it generates. A chart-version bump changes the volatile `helm.sh/chart` label, but that label is no longer stamped onto the StatefulSet's immutable `volumeClaimTemplates`, so the bump no longer forces a delete/recreate of the ClickHouse StatefulSet.
 
-> **Upgrading to 5.7.0:** adds code-agent feedback ingestion, the `agent_feedback` and `agent_turn_links` tables, and the compact `code_agent_run_links` table. Install this version before sending feedback spans. Feedback is retained separately and excluded from normalized traces, conversations, and trace time bounds. The schema job extends existing feedback tables without changing existing writers. Retention follows `clickhouse.ttlDays`. Before rolling back below 5.7.0, stop sending feedback: an older chart can restore normalization that treats feedback as ordinary spans. A rollback retains the new tables and views.
+> **Upgrading to 5.7.0:** adds code-agent feedback ingestion, the `agent_feedback` and `agent_turn_links` tables, and the compact `code_agent_run_links` table. Install this version before sending feedback spans. Feedback is retained separately and excluded from normalized traces, conversations, and trace time bounds. The schema job extends existing feedback tables without changing existing writers. Retention follows `clickhouse.ttlDays`. Before rolling back below 5.7.0, stop sending feedback: an older chart can restore normalization that treats feedback as ordinary spans. A rollback retains the new tables, views, and rows. It restores older `spans_normalized_mv` behavior, while the trace-time view continues excluding feedback and the feedback views keep writing. Rolling back to a version without the feedback grants, such as 5.5.0, also revokes `monte_carlo` INSERT on `agent_feedback` and `agent_turn_links`; the 5.6.0 prerequisite retains those grants.
 
 > **Upgrading to 5.5.0:** adds the `trajectory_trigger_ledger` table and grants the `monte_carlo` user INSERT on it. Conversation-scoped trajectory monitors record the trigger spans that alerted there, so overlapping monitor runs alert on each trigger once. The Monte Carlo-side monitor requires this version or later: its query reads the table, so on an older chart the query fails on the missing table. Its retention follows `clickhouse.ttlDays`. The upgrade does not restart ClickHouse or Keeper pods. A `helm rollback` below 5.5.0 keeps the table but revokes the INSERT grant, so the ledger INSERT fails with ACCESS_DENIED until the chart is upgraded again. The verify scripts' grant assertions catch this.
 
@@ -1128,11 +1128,15 @@ opentelemetry-collector:
 A span with `gen_ai.evaluation.name = user_feedback` carries the current rating,
 categories, and comment for a trace. Name the span `user_feedback`. Supply either
 `montecarlo.feedback.trace_id` (a nonzero 32-character hexadecimal trace ID) or
-`montecarlo.feedback.run_id`. A child feedback span can omit both and use its own
+`montecarlo.feedback.run_id` (at most 256 UTF-8 bytes). A child feedback span can omit both and use its own
 trace ID. The optional `gen_ai.evaluation.score.label` accepts `positive`,
 `negative`, or `none`; `none` clears the whole feedback state. An omitted label
-leaves the rating unset. `gen_ai.evaluation.explanation` carries an optional
-comment, and `montecarlo.feedback.categories` is an array of strings.
+leaves the rating unset. Labels are case-sensitive; other values leave the event
+raw without extracting feedback. `gen_ai.evaluation.explanation` carries an optional
+comment, and `montecarlo.feedback.categories` is an array of strings. The extractor
+also accepts the JSON-array string produced by the collector; invalid categories
+become an empty list. Client span timestamps determine ordering and retention, so
+emitting clocks must be accurate.
 
 `agent_feedback` stores rating metadata and the exact raw-span location. Comment
 text, user identity, and optional numeric scores stay in the raw span. Feedback
@@ -1158,8 +1162,10 @@ The feedback views run as `schema_owner`. The collector still inserts only into
 the raw table. Malformed feedback stays raw and never becomes a normalized
 trace. No historical span rewrite runs during upgrade.
 
-Local SQL checks run against a separate temporary database in a running
-ClickHouse container:
+Local SQL checks start and remove a disposable ClickHouse container with Keeper,
+using the chart-default image and no host ports. They run replicated tables,
+distributed schema changes, retention updates, and projection checks. Docker is
+required; set `CLICKHOUSE_TEST_IMAGE` to test another supported image:
 
 ```sh
 RUN_FEEDBACK_RUNTIME=1 python3 -m unittest discover -s hack/tests/runtime -p test_code_agent_feedback_runtime.py -v

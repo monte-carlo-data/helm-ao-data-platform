@@ -17,11 +17,11 @@
 --     let '' win, which is a latent bug on that side.
 --
 -- All added expressions are total, so the MV never raises. Output columns
--- are unchanged.
+-- are unchanged. Feedback spans are excluded by their name or evaluation marker
+-- so they do not become normal traces or contribute to derived trace metrics.
 --
--- DEPLOYMENT: this is the authoritative copy of this view definition,
--- mirrored in monolith 0020_spans_normalized_mv_planning_messages.sql
--- (test fixture). Supersedes 0026_spans_normalized_mv_planning_tool_calls.sql,
+-- DEPLOYMENT: this is the authoritative copy of this view definition.
+-- Supersedes 0026_spans_normalized_mv_planning_tool_calls.sql,
 -- whose ALTER ... MODIFY QUERY is emptied by this change (schema-job.yaml
 -- re-applies every /sql/*.sql with no ledger, so a superseded ALTER left in
 -- place would regress the view on every upgrade).

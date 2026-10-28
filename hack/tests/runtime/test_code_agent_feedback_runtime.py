@@ -1,20 +1,44 @@
-"""SQL checks on an existing local ClickHouse container, in an isolated database.
+"""Opt-in SQL checks in a disposable ClickHouse container with local Keeper.
 
 RUN_FEEDBACK_RUNTIME=1 python3 -m unittest discover -s hack/tests/runtime \
     -p test_code_agent_feedback_runtime.py -v
-Set CLICKHOUSE_TEST_CONTAINER when the container is not named clickhouse.
+Requires Docker. CLICKHOUSE_TEST_IMAGE can override the chart-default image.
+No host ports are published; only the container created here is removed.
 """
 
 import json
 import os
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
+import re
 import subprocess
+import tempfile
+import time
 import unittest
 import uuid
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
-
-SQL_DIR = Path(__file__).resolve().parents[3] / "charts/ao-data-platform/sql"
+CHART = Path(__file__).resolve().parents[3] / "charts/ao-data-platform"
+SQL_DIR = CHART / "sql"
+CH_IMAGE = os.getenv("CLICKHOUSE_TEST_IMAGE", "clickhouse/clickhouse-server:26.4.3")
+RUNTIME_CONFIG = """<clickhouse>
+<logger><level>error</level><console>1</console></logger>
+<max_thread_pool_size>256</max_thread_pool_size>
+<background_schedule_pool_size>16</background_schedule_pool_size>
+<background_buffer_flush_schedule_pool_size>4</background_buffer_flush_schedule_pool_size>
+<background_message_broker_schedule_pool_size>4</background_message_broker_schedule_pool_size>
+<background_distributed_schedule_pool_size>4</background_distributed_schedule_pool_size>
+<keeper_server><tcp_port>9181</tcp_port><server_id>1</server_id>
+<log_storage_path>/var/lib/clickhouse/keeper/log</log_storage_path>
+<snapshot_storage_path>/var/lib/clickhouse/keeper/snapshots</snapshot_storage_path>
+<raft_configuration><server><id>1</id><hostname>127.0.0.1</hostname><port>9234</port>
+</server></raft_configuration></keeper_server>
+<zookeeper><node><host>127.0.0.1</host><port>9181</port></node></zookeeper>
+<remote_servers><feedback_test><shard><replica><host>127.0.0.1</host><port>9000</port>
+</replica></shard></feedback_test></remote_servers>
+<macros><shard>01</shard><replica>01</replica></macros>
+<default_replica_path>/clickhouse/tables/{uuid}/{shard}</default_replica_path>
+<default_replica_name>{replica}</default_replica_name>
+</clickhouse>"""
 
 
 @unittest.skipUnless(os.getenv("RUN_FEEDBACK_RUNTIME") == "1", "opt-in ClickHouse test")
@@ -26,7 +50,7 @@ class FeedbackStorageTests(unittest.TestCase):
                 "docker",
                 "exec",
                 "-i",
-                os.getenv("CLICKHOUSE_TEST_CONTAINER", "clickhouse"),
+                cls.container,
                 "clickhouse-client",
                 "--multiquery",
                 "--format",
@@ -36,6 +60,7 @@ class FeedbackStorageTests(unittest.TestCase):
             text=True,
             capture_output=True,
             timeout=45,
+            check=False,
         )
         if result.returncode:
             raise AssertionError(result.stderr)
@@ -43,11 +68,9 @@ class FeedbackStorageTests(unittest.TestCase):
 
     @classmethod
     def apply(cls, paths):
-        # Only the deployment mechanics differ from the single-node test server.
-        # The table columns, sort keys, TTLs, and view queries run unchanged.
+        # Use the production replicated engines and distributed DDL on one replica.
         for path in paths:
-            sql = path.read_text().replace(" ON CLUSTER '{cluster}'", "")
-            sql = sql.replace("Replicated", "").replace("schema_owner", "default")
+            sql = path.read_text().replace("'{cluster}'", "'feedback_test'")
             sql = sql.replace(
                 "CREATE DATABASE IF NOT EXISTS otel_traces",
                 "CREATE DATABASE IF NOT EXISTS " + cls.database,
@@ -56,7 +79,68 @@ class FeedbackStorageTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        directory = tempfile.TemporaryDirectory(prefix="feedback-runtime-")
+        cls.addClassCleanup(directory.cleanup)
+        config = Path(directory.name) / "runtime.xml"
+        config.write_text(RUNTIME_CONFIG)
+        cls.container = "feedback-runtime-" + uuid.uuid4().hex
+        cls.addClassCleanup(
+            subprocess.run,
+            ["docker", "rm", "--force", cls.container],
+            check=False,
+            capture_output=True,
+            timeout=30,
+        )
+        subprocess.run(
+            [
+                "docker",
+                "run",
+                "--detach",
+                "--rm",
+                "--name",
+                cls.container,
+                "--network",
+                "none",
+                "--hostname",
+                "localhost",
+                "--memory",
+                "2g",
+                "--cpus",
+                "2",
+                "--env",
+                "CLICKHOUSE_SKIP_USER_SETUP=1",
+                "--mount",
+                f"type=bind,source={config},target=/etc/clickhouse-server/config.d/feedback-runtime.xml,readonly",
+                CH_IMAGE,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+        for attempt in range(30):
+            ready = subprocess.run(
+                [
+                    "docker",
+                    "exec",
+                    cls.container,
+                    "clickhouse-client",
+                    "--query",
+                    "SELECT 1",
+                ],
+                check=False,
+                capture_output=True,
+                timeout=3,
+            )
+            if ready.returncode == 0:
+                break
+            time.sleep(1)
+        else:
+            raise AssertionError("Disposable ClickHouse server did not become ready.")
         cls.database = "feedback_test_" + uuid.uuid4().hex
+        cls.execute(
+            "CREATE USER schema_owner; GRANT ALL ON otel_traces.* TO schema_owner"
+        )
         cls.addClassCleanup(
             cls.execute, "DROP DATABASE IF EXISTS " + cls.database + " SYNC"
         )
@@ -70,7 +154,7 @@ class FeedbackStorageTests(unittest.TestCase):
     def setUp(self):
         self.service = "test_" + uuid.uuid4().hex
         self.target = uuid.uuid4().hex
-        self.day = datetime.now(timezone.utc).date()
+        self.day = datetime.now(UTC).date()
 
     def insert(self, rows):
         self.execute(
@@ -131,6 +215,7 @@ class FeedbackStorageTests(unittest.TestCase):
         self.assertEqual(result["feedback_span_id"], row["SpanId"])
         self.assertEqual(result["feedback_service_name"], self.service)
         self.assertEqual(result["feedback_span_time"], row["Timestamp"])
+
         self.assertEqual(result["source"], "code")
         self.assertNotIn("comment", result)
         self.insert(
@@ -151,6 +236,45 @@ class FeedbackStorageTests(unittest.TestCase):
             (None, False, []),
         )
 
+    def test_categories_accept_native_and_collector_string_arrays(self):
+        for encoded, expected in [
+            (
+                ["incorrect", "missing_information"],
+                ["incorrect", "missing_information"],
+            ),
+            (
+                '["incorrect","missing_information"]',
+                ["incorrect", "missing_information"],
+            ),
+            ("not JSON", []),
+            ('{"unexpected":true}', []),
+            (123, []),
+            (None, []),
+        ]:
+            with self.subTest(encoded=encoded):
+                event = self.feedback(
+                    **{
+                        "montecarlo.feedback.trace_id": self.target,
+                        "montecarlo.feedback.categories": encoded,
+                    }
+                )
+                normal = self.span()
+                self.insert([event, normal])
+                result = self.select(
+                    "agent_feedback",
+                    "categories",
+                    f"AND feedback_span_id = '{event['SpanId']}'",
+                )
+                self.assertEqual(result, [{"categories": expected}])
+                self.assertEqual(
+                    self.select(
+                        "spans_normalized",
+                        "span_id",
+                        f"AND span_id = '{normal['SpanId']}'",
+                    ),
+                    [{"span_id": normal["SpanId"]}],
+                )
+
     def test_comment_only_and_child_target(self):
         child = self.feedback(**{"gen_ai.evaluation.explanation": "Comment only"})
         child.update(TraceId=self.target, ParentSpanId="1234567890abcdef")
@@ -168,6 +292,8 @@ class FeedbackStorageTests(unittest.TestCase):
             {"montecarlo.feedback.trace_id": "0" * 32},
             {"montecarlo.feedback.trace_id": {"nested": "bad"}},
             {"montecarlo.feedback.run_id": 123},
+            {"montecarlo.feedback.run_id": "x" * 257},
+            {"montecarlo.feedback.run_id": "é" * 129},
             {
                 "montecarlo.feedback.trace_id": self.target,
                 "montecarlo.feedback.run_id": "run",
@@ -179,6 +305,10 @@ class FeedbackStorageTests(unittest.TestCase):
             {
                 "montecarlo.feedback.trace_id": self.target,
                 "gen_ai.evaluation.score.label": False,
+            },
+            {
+                "montecarlo.feedback.trace_id": self.target,
+                "gen_ai.evaluation.score.label": "Positive",
             },
         ]
         normal = self.span({"gen_ai.evaluation.name": "correctness"})
@@ -280,13 +410,35 @@ class FeedbackStorageTests(unittest.TestCase):
         result = self.select("agent_feedback")[0]
         self.assertEqual(result["feedback_service_name"], "feedback-service")
         self.assertEqual(result["target_kind"], "run")
+        normal = self.span(
+            {
+                "montecarlo.agent_name": self.service,
+                "montecarlo.association_properties.run_id": "run-1",
+            },
+            ServiceName="trace-service",
+        )
+        self.insert([normal])
+        self.assertEqual(
+            self.select("code_agent_run_links", "run_id, trace_id"),
+            [{"run_id": "run-1", "trace_id": self.target}],
+        )
 
     def test_upgrade_is_repeatable_and_preserves_existing_writer(self):
         migrated = self.execute(
-            "SELECT source, cleared, positive FROM otel_traces.agent_feedback WHERE service_name = 'upgrade-seed'"
+            "SELECT source, cleared, positive, target_id, target_kind, toUnixTimestamp64Nano(feedback_span_time) AS feedback_time FROM otel_traces.agent_feedback WHERE service_name = 'upgrade-seed'"
         )
         self.assertEqual(
-            migrated, [{"source": "cortex", "cleared": False, "positive": True}]
+            migrated,
+            [
+                {
+                    "source": "cortex",
+                    "cleared": False,
+                    "positive": True,
+                    "target_id": "request",
+                    "target_kind": "run",
+                    "feedback_time": 0,
+                }
+            ],
         )
         self.execute(
             f"INSERT INTO otel_traces.agent_feedback (service_name, agent_mcon, request_id, positive, has_comment, submitted_at, collected_at) VALUES ('{self.service}', 'existing-agent', 'request', true, false, now64(6), now64(6))"
@@ -300,6 +452,66 @@ class FeedbackStorageTests(unittest.TestCase):
         self.insert([self.feedback(**{"montecarlo.feedback.trace_id": self.target})])
         self.assertEqual(len(self.select("agent_feedback")), 2)
         self.assertEqual(self.select("spans_normalized"), [])
+
+    def test_existing_feedback_view_gets_collector_fix_on_upgrade(self):
+        # Simulate an already-installed view. CREATE IF NOT EXISTS alone cannot fix it.
+        initial = (SQL_DIR / "0032_code_agent_feedback_mv.sql").read_text()
+        self.execute(
+            "ALTER TABLE otel_traces.code_agent_feedback_mv MODIFY QUERY WITH"
+            + initial.split("AS WITH", 1)[1]
+        )
+        try:
+            before = self.feedback(
+                **{
+                    "montecarlo.feedback.trace_id": self.target,
+                    "montecarlo.feedback.categories": '["incorrect"]',
+                }
+            )
+            self.insert([before])
+            self.assertEqual(
+                self.select("agent_feedback", "categories"), [{"categories": []}]
+            )
+            self.apply([SQL_DIR / "0036_code_agent_feedback_collector_categories.sql"])
+            after = self.feedback(
+                **{
+                    "montecarlo.feedback.trace_id": self.target,
+                    "montecarlo.feedback.categories": '["incorrect"]',
+                }
+            )
+            self.insert([after])
+            self.assertEqual(
+                self.select(
+                    "agent_feedback",
+                    "categories",
+                    f"AND feedback_span_id = '{after['SpanId']}'",
+                ),
+                [{"categories": ["incorrect"]}],
+            )
+        finally:
+            self.apply([SQL_DIR / "0036_code_agent_feedback_collector_categories.sql"])
+
+    def test_configured_feedback_retention_runs_on_replicated_tables(self):
+        scope = {"agent_feedback", "agent_turn_links", "code_agent_run_links"}
+        statements = dict(
+            re.findall(
+                r'modify_ttl otel_traces\.(\w+) "([^"]+)"',
+                (CHART / "templates/schema-job.yaml").read_text(),
+            )
+        )
+        self.assertTrue(scope <= statements.keys())
+        for days in (45, 20):
+            for table in sorted(scope):
+                expression = statements[table].replace(
+                    "{{ .Values.clickhouse.ttlDays }}", str(days)
+                )
+                self.execute(
+                    f"ALTER TABLE otel_traces.{table} ON CLUSTER 'feedback_test' MODIFY TTL {expression} SETTINGS materialize_ttl_after_modify = 0"
+                )
+                definition = self.execute(f"SHOW CREATE TABLE otel_traces.{table}")[0][
+                    "statement"
+                ]
+                self.assertIn("Replicated", definition)
+                self.assertIn(f"toIntervalDay({days})", definition)
 
     def test_trace_lookup_uses_projection_and_reads_a_bounded_granule(self):
         self.execute(

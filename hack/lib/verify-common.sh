@@ -234,6 +234,8 @@ verify_clickhouse_user_model() {
   expect_match "feedback carries its source" monte_carlo "$MC_PW" "DESCRIBE TABLE otel_traces.agent_feedback" $'source\tLowCardinality(String)'
   expect_match "feedback preserves its span timestamp" monte_carlo "$MC_PW" "DESCRIBE TABLE otel_traces.agent_feedback" $'feedback_span_time\tDateTime64(9)'
   expect_ok "monte_carlo reads code run links" monte_carlo "$MC_PW" "SELECT run_id, trace_id FROM otel_traces.code_agent_run_links LIMIT 0"
+  expect_match "code run links support trace lookups" monte_carlo "$MC_PW" "SHOW CREATE TABLE otel_traces.code_agent_run_links" 'PROJECTION by_trace'
+  expect_match "code run links rebuild the projection during merges" monte_carlo "$MC_PW" "SHOW CREATE TABLE otel_traces.code_agent_run_links" "deduplicate_merge_projection_mode = 'rebuild'"
   # ADD COLUMN IF NOT EXISTS matches by name only, so the table loop's existence check cannot
   # see a wrong-shaped column: a cluster where a draft 0022/0024 was hand-applied during
   # development keeps it forever and the schema job exits 0. Assert the shape the writer relies
