@@ -1028,9 +1028,10 @@ jobs:
             /tmp/backup-runtime-tests/bin/pip install PyYAML==6.0.3
             helm dependency build charts/ao-data-platform
             docker pull clickhouse/clickhouse-server:26.4.3
-            docker pull altinity/clickhouse-backup:2.8.1@sha256:08016b048f7e6035c048501315c2a788e5a782f15f168e042c7bd48d5a388cc4
+            docker pull altinity/clickhouse-backup:2.8.2@sha256:bc32794f2bd95d780bf6a0fea093d0ee463ec8e7dc486ccb845ce47b3406fad5
             docker pull python:3.12-slim-bookworm@sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e
             docker pull chainguard/minio@sha256:0f95aa412a12351a95bb43c3b54b66440eb0aa022bb3f3458942678a489e915b
+            docker pull cgr.dev/chainguard/minio-client@sha256:72f9978d415ea8294d78051fb3aee2fd258d449237633f77f100b5367bb5225d
       - run:
           name: Test replicated feedback storage and upgrade queries
           no_output_timeout: 5m
@@ -1038,11 +1039,11 @@ jobs:
             RUN_FEEDBACK_RUNTIME=1 PYTHONDONTWRITEBYTECODE=1 /tmp/backup-runtime-tests/bin/python \
               -m unittest discover -s hack/tests/runtime -p test_code_agent_feedback_runtime.py -v
       - run:
-          name: Test stock backup startup and scheduled full/incremental backups
+          name: Test stock backups, local and S3 cleanup, and recovery
           no_output_timeout: 15m
           command: |
             RUN_BACKUP_RUNTIME=1 PYTHONDONTWRITEBYTECODE=1 /tmp/backup-runtime-tests/bin/python \
-              -m unittest discover -s hack/tests/runtime -p test_backup_runtime.py -v
+              -m unittest discover -s hack/tests/runtime -p 'test*runtime.py' -v
 
   publish-dev:
     docker:

@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Run one scheduled backup through the pinned clickhouse-backup v2.8.1 API.
+"""Run one scheduled backup through the verified stock clickhouse-backup API.
 
 The default CronJob schedule runs every four hours.
 The first successful run of each UTC day creates a full backup; later runs use
 that day's latest full backup as their base. This avoids a chain of incrementals
 when moving between copies. All copies must share the same native S3 backup disk.
 
-API contract: https://github.com/Altinity/clickhouse-backup/blob/v2.8.1/pkg/server/server.go
+API contract: https://github.com/Altinity/clickhouse-backup/blob/v2.8.2/pkg/server/server.go
 Responses are newline-separated JSON objects, including asynchronous operation IDs.
-No operation is resubmitted after an uncertain response, and no local backup is
-deleted: deleting native S3 disk metadata can also remove the remote files.
+No operation is resubmitted after an uncertain response. Optional local cleanup
+runs only after a verified upload and requires matching completed S3 backups.
 """
 
 import base64
@@ -27,7 +27,8 @@ import urllib.parse
 import urllib.request
 
 
-from backup_common import (BackupError, DELETION_UNAVAILABLE, REQUEST_TIMEOUT_SECONDS,
+from backup_common import (BackupError, CleanupStopped, DELETION_UNAVAILABLE, REQUEST_TIMEOUT_SECONDS,
+                           RequestNotSent, RevisionError, RevisionCheckUnavailable,
                            SCHEDULED_NAME, broken_local_entry, scheduled_name)
 
 
@@ -44,20 +45,8 @@ SETTINGS output_format_json_quote_64bit_integers = 0
 FORMAT JSONEachRow"""
 
 
-class RevisionError(BackupError):
-    """A password rotation must stop the whole Job, rather than trigger failover."""
-
-
-class RevisionCheckUnavailable(BackupError):
-    """Credentials must not be sent until the revision can be checked again."""
-
-
 class AuthenticationError(BackupError):
     """The backup server rejected a credential; do not send it again."""
-
-
-class RequestNotSent(BackupError):
-    """The request was refused locally or could not establish a connection."""
 
 
 class ReadUnavailable(BackupError):
@@ -74,7 +63,8 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class API:
-    def __init__(self, endpoint, username, password, guard=None, ca_file=None, backup_api=True):
+    def __init__(self, endpoint, username, password, guard=None, ca_file=None, backup_api=True,
+                 guard_timeout_seconds=0):
         parsed = urllib.parse.urlsplit(endpoint)
         if (parsed.scheme not in ("http", "https") or not parsed.hostname
                 or parsed.username or parsed.password or parsed.query
@@ -90,9 +80,14 @@ class API:
             handlers.append(urllib.request.HTTPSHandler(context=ssl.create_default_context(cafile=ca_file)))
         self.opener = urllib.request.build_opener(*handlers)
         self.guard = guard
+        self.guard_timeout_seconds = guard_timeout_seconds
         self.backup_api = backup_api
 
-    def request(self, method, path, query=None):
+    def request(self, method, path, query=None, *, request_timeout=None):
+        timeout = REQUEST_TIMEOUT_SECONDS if request_timeout is None else request_timeout
+        if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+                or not 0 < timeout <= 300):
+            raise BackupError("Backup API request timeout must be between zero and 300 seconds.")
         if self.guard:
             self.guard()
         url = self.endpoint + path
@@ -103,7 +98,7 @@ class API:
             headers={"Authorization": self.authorization, "Accept": "application/json"},
         )
         try:
-            with self.opener.open(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+            with self.opener.open(request, timeout=timeout) as response:
                 payload = response.read(32 * 1024 * 1024 + 1)
             if len(payload) > 32 * 1024 * 1024:
                 raise BackupError("Backup API response exceeded the size limit.")
@@ -132,6 +127,9 @@ class API:
             raise ReadUnavailable("Backup API response could not be read; the request may have reached the server.") from None
         except ValueError:
             raise BackupError("Backup API returned invalid JSON.") from None
+
+
+PASSWORD_REVISION_READ_TIMEOUT_SECONDS = 10
 
 
 class PasswordRevisionGuard:
@@ -164,7 +162,7 @@ class PasswordRevisionGuard:
                     "https://kubernetes.default.svc" + prefix + urllib.parse.quote(name, safe=""),
                     headers={"Authorization": "Bearer " + token})
                 try:
-                    with opener.open(request, timeout=10) as response:
+                    with opener.open(request, timeout=PASSWORD_REVISION_READ_TIMEOUT_SECONDS) as response:
                         payload = response.read(4 * 1024 * 1024 + 1)
                 except urllib.error.HTTPError as error:
                     code = error.code
@@ -264,10 +262,13 @@ def configured_clients():
     if not probe_password:
         raise BackupError("The mounted backup probe password is empty.")
     guards = [lambda index=index: guard(index) for index in range(len(endpoints))]
-    apis = [API(endpoint, os.environ.get("BACKUP_API_USERNAME", "backup"), password, guard=guards[index])
+    guard_timeout = len(pod_names) * PASSWORD_REVISION_READ_TIMEOUT_SECONDS
+    apis = [API(endpoint, os.environ.get("BACKUP_API_USERNAME", "backup"), password, guard=guards[index],
+                guard_timeout_seconds=guard_timeout)
             for index, endpoint in enumerate(endpoints)]
     probes = [API(endpoint, os.environ.get("BACKUP_PROBE_USERNAME", "backup_probe"), probe_password, guard=guards[index],
-                  ca_file=os.environ.get("BACKUP_DATABASE_CA_FILE"), backup_api=False)
+                  ca_file=os.environ.get("BACKUP_DATABASE_CA_FILE"), backup_api=False,
+                  guard_timeout_seconds=guard_timeout)
               for index, endpoint in enumerate(database_endpoints)]
     return apis, probes
 
@@ -497,16 +498,79 @@ class Scheduler:
         return name
 
 
-def report_cleanup(result):
+def report_cleanup_result(result, prefix, settings):
     """Keep each log line small without omitting any name or changing its order."""
     lists = ("kept", "delete", "deleted", "broken_local", "local_only")
-    summary = {key: result[key] for key in ("mode", "keep_last", "keep_days")}
+    if "unverified_deletions" in result:
+        lists += ("unverified_deletions",)
+    summary = {key: result[key] for key in settings}
+    summary.update({key: result[key] for key in ("completed", "stop_reason") if key in result})
     summary.update({key + "_count": len(result[key]) for key in lists})
-    print("Backup cleanup: " + json.dumps(summary, sort_keys=True), flush=True)
+    print(prefix + ": " + json.dumps(summary, sort_keys=True), flush=True)
     for key in lists:
         for entry in result[key]:
             item = entry if isinstance(entry, dict) else {"name": entry}
-            print("Backup cleanup entry: " + json.dumps({"list": key, **item}, sort_keys=True), flush=True)
+            print(prefix + " entry: " + json.dumps({"list": key, **item}, sort_keys=True), flush=True)
+
+
+def report_cleanup(result):
+    settings = ("mode", "retention_policy", "daily_days", "history_days") if (
+        result.get("retention_policy") == "daily-weekly"
+    ) else ("mode", "keep_last", "keep_days")
+    report_cleanup_result(result, "Backup cleanup", settings)
+
+
+def remote_cleanup_options(validate_numbers=True):
+    enabled = os.environ.get("BACKUP_CLEANUP_ENABLED", "false")
+    if enabled not in ("true", "false"):
+        raise BackupError("S3 cleanup enabled must be true or false.")
+    if enabled == "false":
+        return None
+    dry_run = os.environ.get("BACKUP_CLEANUP_DRY_RUN", "true")
+    policy = os.environ.get("BACKUP_RETENTION_POLICY", "daily-weekly")
+    if dry_run not in ("true", "false"):
+        raise BackupError("S3 cleanup dry-run must be true or false.")
+    if policy not in ("count-and-age", "daily-weekly"):
+        raise BackupError("S3 retention policy must be count-and-age or daily-weekly.")
+    if dry_run == "false" and policy != "daily-weekly":
+        raise BackupError(DELETION_UNAVAILABLE)
+    if dry_run == "true" and not validate_numbers:
+        # Preserve the existing preview behavior: malformed retention numbers
+        # stop its report after backup, without blocking the backup itself.
+        return {"execute": False}
+    options = {"keep_last": int(os.environ.get("BACKUP_KEEP_LAST", "2")),
+               "keep_days": int(os.environ.get("BACKUP_KEEP_DAYS", "0")),
+               "timeout": int(os.environ.get("BACKUP_CLEANUP_TIMEOUT_SECONDS", "1800")),
+               "execute": dry_run == "false"}
+    if policy == "daily-weekly":
+        if options["timeout"] < 60:
+            raise BackupError("S3 cleanup needs a timeout of at least 60 seconds.")
+        options.update(retention_policy=policy,
+                       daily_days=int(os.environ.get("BACKUP_DAILY_DAYS", "7")),
+                       history_days=int(os.environ.get("BACKUP_HISTORY_DAYS", "30")))
+        if options["daily_days"] < 1 or options["history_days"] < options["daily_days"]:
+            raise BackupError("S3 history days must cover at least the positive daily-days window.")
+    return options
+
+
+def local_cleanup_options():
+    enabled = os.environ.get("BACKUP_LOCAL_CLEANUP_ENABLED", "false")
+    if enabled not in ("true", "false"):
+        raise BackupError("Local cleanup enabled must be true or false.")
+    if enabled == "false":
+        return None
+    dry_run = os.environ.get("BACKUP_LOCAL_CLEANUP_DRY_RUN", "true")
+    if dry_run not in ("true", "false"):
+        raise BackupError("Local cleanup dry-run must be true or false.")
+    keep_days = int(os.environ.get("BACKUP_LOCAL_KEEP_FULL_BACKUP_DAYS", "2"))
+    timeout = int(os.environ.get("BACKUP_LOCAL_CLEANUP_TIMEOUT_SECONDS", "1800"))
+    if keep_days < 2 or timeout < 60:
+        raise BackupError("Local cleanup needs at least two full-backup days and a timeout of at least 60 seconds.")
+    return {"keep_full_backup_days": keep_days, "timeout": timeout, "execute": dry_run == "false"}
+
+
+def report_local_cleanup(result):
+    report_cleanup_result(result, "Backup local cleanup", ("mode", "keep_full_backup_days"))
 
 
 def main():
@@ -516,9 +580,8 @@ def main():
         if timeout <= 0 or poll_seconds <= 0:
             raise BackupError("Backup timeout and polling interval must be positive seconds.")
         options = configured_options()
-        cleanup_enabled = os.environ.get("BACKUP_CLEANUP_ENABLED", "false") == "true"
-        if cleanup_enabled and os.environ.get("BACKUP_CLEANUP_DRY_RUN", "true") != "true":
-            raise BackupError(DELETION_UNAVAILABLE)
+        remote_options = remote_cleanup_options(validate_numbers=False)
+        local_options = local_cleanup_options()
         apis, probes = configured_clients()
         name = Scheduler(apis, probes, timeout, poll_seconds, **options).run()
     except (KeyError, ValueError, OSError):
@@ -528,24 +591,63 @@ def main():
         print(f"Backup failed: {error}", file=sys.stderr)
         return 1
 
-    if cleanup_enabled:
+    local_complete = local_options is None
+    if local_options is not None:
+        # Cleanup must not turn a verified upload into a failed backup or
+        # cause it to be uploaded again. Its separate result remains visible.
+        try:
+            from cleanup_local_backups import LocalCleaner
+            execute = local_options.pop("execute")
+            result = LocalCleaner(apis, **local_options).run(latest_backup=name, execute=execute)
+            report_local_cleanup(result)
+            local_complete = result.get("completed") is True
+            if result["broken_local"] or result["local_only"]:
+                print("Backup local cleanup kept records needing investigation; see the report.", file=sys.stderr)
+        except (KeyError, ValueError, OSError):
+            print("Backup local cleanup stopped: check cleanup settings; the backup already completed.", file=sys.stderr)
+        except BackupError as error:
+            print(f"Backup local cleanup stopped: {error}", file=sys.stderr)
+        except Exception as error:
+            # Unexpected cleanup errors must not hide a verified backup or
+            # prevent the separate preview. Never log exception bodies.
+            print(f"Backup local cleanup stopped: unexpected {type(error).__name__}; "
+                  "the backup already completed.", file=sys.stderr)
+
+    if remote_options is not None:
         # This report runs after a verified upload. Its failure must not turn
         # that successful backup into a failed Job or invite another upload.
+        execute = remote_options.pop("execute")
+        if execute and not local_complete:
+            print("Backup cleanup stopped: local cleanup did not finish; no S3 deletion was sent. "
+                  "The backup already completed.", file=sys.stderr)
+            return 0
+        label = "Backup cleanup" if execute else "Backup cleanup preview"
         try:
             from cleanup_backups import Cleaner
-            cleaner = Cleaner(apis, keep_last=int(os.environ.get("BACKUP_KEEP_LAST", "2")),
-                              keep_days=int(os.environ.get("BACKUP_KEEP_DAYS", "0")),
-                              timeout=int(os.environ.get("BACKUP_CLEANUP_TIMEOUT_SECONDS", "1800")))
-            result = cleaner.run(latest_backup=name, execute=False)
+            if not execute:
+                remote_options = remote_cleanup_options()
+                remote_options.pop("execute")
+            cleaner = Cleaner(apis, **remote_options)
+            result = cleaner.run(latest_backup=name, execute=execute)
             report_cleanup(result)
             if result["broken_local"] or result["local_only"]:
-                print("Backup cleanup preview found local files needing attention; "
-                      "see broken_local and local_only in the report. No files were deleted.", file=sys.stderr)
+                print(label + " found local files needing attention; "
+                      "see broken_local and local_only in the report." +
+                      (" No files were deleted." if not execute else ""), file=sys.stderr)
+        except CleanupStopped as error:
+            report_cleanup(error.result)
+            print(f"{label} stopped: {error} "
+                  f"Verified S3 removals: {len(error.result['deleted'])}; "
+                  f"deletions needing confirmation: {len(error.result['unverified_deletions'])}. "
+                  "See the report for names. The backup already completed.", file=sys.stderr)
         except (KeyError, ValueError, OSError):
-            print("Backup cleanup preview stopped: check cleanup settings; the backup already completed.",
+            print(label + " stopped: check cleanup settings; the backup already completed.",
                   file=sys.stderr)
         except BackupError as error:
-            print(f"Backup cleanup preview stopped: {error}", file=sys.stderr)
+            print(f"{label} stopped: {error}", file=sys.stderr)
+        except Exception as error:
+            print(f"{label} stopped: unexpected {type(error).__name__}; "
+                  "the backup already completed.", file=sys.stderr)
     return 0
 
 
