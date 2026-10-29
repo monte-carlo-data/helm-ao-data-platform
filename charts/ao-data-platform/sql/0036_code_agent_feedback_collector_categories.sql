@@ -16,7 +16,16 @@ WITH
     JSONHas(attrs, 'montecarlo', 'feedback', 'run_id') AS has_run_target,
     if(has_trace_target, rated_trace_id, TraceId) AS target_trace_id,
     (has_trace_target OR (NOT has_run_target AND ParentSpanId != '')) AS rates_trace,
-    coalesce(nullIf(JSONExtractString(attrs, 'montecarlo', 'agent_name'), ''), ServiceName) AS agent_name
+    coalesce(nullIf(JSONExtractString(attrs, 'montecarlo', 'agent_name'), ''), ServiceName) AS agent_name,
+    multiIf(
+        JSONType(attrs, 'montecarlo', 'feedback', 'categories') = 'Array',
+            JSONExtractArrayRaw(attrs, 'montecarlo', 'feedback', 'categories'),
+        JSONType(attrs, 'montecarlo', 'feedback', 'categories') = 'String',
+            JSONExtractArrayRaw(JSONExtractString(attrs, 'montecarlo', 'feedback', 'categories')),
+        []
+    ) AS category_values,
+    arrayMap(category -> JSONExtractString(category),
+        arrayFilter(category -> JSONType(category) = 'String', category_values)) AS string_categories
 SELECT
     agent_name AS service_name,
     '' AS agent_mcon,
@@ -25,13 +34,11 @@ SELECT
     label != 'none'
         AND JSONType(attrs, 'gen_ai', 'evaluation', 'explanation') = 'String'
         AND JSONExtractString(attrs, 'gen_ai', 'evaluation', 'explanation') != '' AS has_comment,
-    if(label = 'none', [], arraySlice(arrayFilter(category -> length(category) <= 128, multiIf(
-        JSONType(attrs, 'montecarlo', 'feedback', 'categories') = 'Array',
-            JSONExtract(attrs, 'montecarlo', 'feedback', 'categories', 'Array(String)'),
-        JSONType(attrs, 'montecarlo', 'feedback', 'categories') = 'String',
-            JSONExtract(JSONExtractString(attrs, 'montecarlo', 'feedback', 'categories'), 'Array(String)'),
-        []
-    )), 1, 20)) AS categories,
+    -- Match the SDK nonblank rule, including Unicode separators and control whitespace.
+    -- Keep the original text of accepted categories.
+    if(label = 'none', [], arraySlice(arrayFilter(category ->
+        length(category) <= 128 AND match(category, '[^\\s\\p{Z}\\x{000B}\\x{0085}\\x{001C}-\\x{001F}]'),
+        string_categories), 1, 20)) AS categories,
     toDateTime64(Timestamp, 6) AS submitted_at,
     now64(6) AS collected_at,
     'code' AS source,

@@ -22,7 +22,7 @@ The ClickHouse instance ships with production hardening: a capped memory ceiling
 
 > **Chart-version bumps no longer recreate ClickHouse:** the ClickHouse operator propagates only a fixed allowlist of stable labels onto the resources it generates. A chart-version bump changes the volatile `helm.sh/chart` label, but that label is no longer stamped onto the StatefulSet's immutable `volumeClaimTemplates`, so the bump no longer forces a delete/recreate of the ClickHouse StatefulSet.
 
-> **Upgrading to 5.10.0:** adds code-agent feedback ingestion and the compact `code_agent_run_links` table. Install this version before sending feedback spans. Run links are created from spans ingested after this upgrade; use trace IDs for earlier runs that have no new spans. Feedback is retained separately and excluded from normalized traces, conversations, and trace time bounds. The schema job extends existing feedback tables without changing existing writers. Retention follows `clickhouse.ttlDays`. Before rolling back below 5.10.0, stop sending feedback: an older chart can restore normalization that treats feedback as ordinary spans. A rollback retains the new tables, views, and rows. It restores older `spans_normalized_mv` behavior, while the trace-time view continues excluding feedback and the feedback views keep writing. Rolling back to a version without the feedback grants, such as 5.8.0, also revokes `monte_carlo` INSERT on `agent_feedback` and `agent_turn_links`; the 5.9.0 prerequisite retains those grants.
+> **Upgrading to 5.10.0:** adds code-agent feedback ingestion and the compact `code_agent_run_links` table. Install this version before sending feedback spans. Run links are created from spans ingested after this upgrade; use trace IDs for earlier runs that have no new spans. Feedback is retained separately and excluded from normalized traces, conversations, and trace time bounds. The schema job extends existing feedback tables without changing existing writers. Retention follows `clickhouse.ttlDays`. Feedback extraction runs during raw trace inserts, so a backlog of unmerged data in the shared `agent_feedback` table can also reject ordinary spans, including batches with no feedback. This dependency starts on install and remains after rollback because the feedback view is kept. Before rolling back below 5.10.0, stop sending feedback: an older chart can restore normalization that treats feedback as ordinary spans. A rollback retains the new tables, views, and rows. It restores older `spans_normalized_mv` behavior, while the trace-time view continues excluding feedback and the feedback views keep writing. Rolling back to a version without the feedback grants, such as 5.8.0, also revokes `monte_carlo` INSERT on `agent_feedback` and `agent_turn_links`; the 5.9.0 prerequisite retains those grants.
 
 > **Upgrading to 5.9.0:** adds the `agent_feedback` and `agent_turn_links` tables, which hold end-user feedback on agent responses and map each rated turn to its trace, and grants the `monte_carlo` user INSERT on both. Both follow `clickhouse.ttlDays`. The upgrade does not restart ClickHouse or Keeper pods. A `helm rollback` below 5.9.0 revokes the INSERT grants while the tables and their rows remain. Monte Carlo checks the grants hourly, so within an hour it stops writing and reading feedback here, and the rows expire with `clickhouse.ttlDays`.
 
@@ -1145,6 +1145,11 @@ categories, and comment for a trace. Name the span `user_feedback`. Supply eithe
 omit both and use its own trace ID. A span with both targets, or a root span with
 neither target, stays raw without extracting feedback.
 
+Identify the rated agent with a nonempty string in `montecarlo.agent_name`.
+If that attribute is absent or empty, the sending span's service name is used.
+When feedback comes from a separate service, set `montecarlo.agent_name` to the
+rated agent's name so readers can find it.
+
 Each feedback span replaces the target's earlier state. The optional
 `gen_ai.evaluation.score.label` accepts `positive`, `negative`, or `none`; `none`
 clears the whole feedback state. An omitted label records no rating, even if an
@@ -1152,9 +1157,10 @@ earlier event had one. Labels are case-sensitive; other values leave the event
 raw without extracting feedback. `gen_ai.evaluation.explanation` carries an
 optional comment, and `montecarlo.feedback.categories` is an array of strings.
 The extractor also accepts the JSON-array string produced by the collector.
-Non-array values and malformed JSON become an empty list. It keeps at most 20
-categories and skips any entry longer than 128 UTF-8 bytes, without cutting a
-character in half.
+Non-array values and malformed JSON become an empty list. The extractor drops
+non-string and whitespace-only entries, skips whole entries longer than 128
+UTF-8 bytes, and keeps the first 20 remaining entries. It preserves the text of
+accepted entries.
 Client span timestamps determine ordering and retention, so emitting clocks must
 be accurate.
 
@@ -1170,24 +1176,42 @@ newest event before applying rating filters. Direct trace targets do not need a
 run link. Resolve the account's own store and match the exact agent service name
 on every read; these tables are not a boundary between untrusted tenants.
 
+Use `source` to distinguish the feedback writers. For `source = 'code'`,
+`target_kind` specifies a trace or run ID. Cortex rows have `source = 'cortex'`;
+their `request_id` identifies a turn and resolves through `agent_turn_links`.
+Do not interpret a Cortex row's default `target_kind` as a code-agent run.
+`target_id` currently equals `request_id` for both writers. Code readers use
+`target_id`; `request_id` remains the existing column used to order the table.
+
 `code_agent_run_links` combines ordinary spans carrying
 `montecarlo.association_properties.run_id`. A run can map to several traces.
 Links are created only from spans ingested after this upgrade; no historical run
 links are built. Use trace IDs for earlier runs that have no new spans.
 Readers group by `(service_name, run_id, trace_id)` and read `min(first_seen)` and
 `max(last_seen)` so results remain correct before background merges. Feedback
-spans never extend these times. The agent name matches normalized spans:
-`montecarlo.agent_name` takes precedence over the emitting service name.
+spans never extend these times. For string agent names, the name matches
+normalized spans: `montecarlo.agent_name` takes precedence over the emitting
+service name.
 The `by_trace` projection also stores this compact mapping in trace order, so
 page reads can find run IDs without scanning the agent's entire run history.
 It adds a second copy of mapping data and rebuilds during aggregation merges.
-Trace lookups should use `GROUP BY run_id, trace_id`: on ClickHouse 26.2,
-`SELECT DISTINCT` does not select this projection. The runtime test checks the
+Trace lookups should use `GROUP BY run_id, trace_id`: on ClickHouse 26.2 and
+26.4.3, `SELECT DISTINCT` does not select this projection. The runtime test checks the
 query plan and row-read limit against 100,000 mapping rows.
 
 The feedback views run as `schema_owner`. The collector still inserts only into
 the raw table. Malformed feedback stays raw and never becomes a normalized
 trace. No historical span rewrite runs during upgrade.
+
+The feedback table also accepts writes from the Cortex sync. Installing the chart
+adds this dependency before any code feedback is sent. Rolling the chart back
+keeps the feedback view, so that dependency remains. If ClickHouse rejects writes
+to `agent_feedback`, that failure can reject ordinary raw trace inserts too,
+including batches with no feedback. This happens, for example, when
+unmerged data parts reach the table's insert limit. The collector retries failed
+writes within its configured queue and retry limits; a prolonged failure can
+exhaust those limits. The runtime test checks this failure and a successful retry
+after the table accepts writes again.
 
 Local SQL checks start and remove a disposable ClickHouse container with Keeper,
 using the chart-default image and no host ports. They run replicated tables,

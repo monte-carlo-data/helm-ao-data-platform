@@ -98,8 +98,8 @@ spec:
               # Scope covers spans telemetry plus its derived annotations — the
               # conversations source (conversations_normalized), the conversation
               # and span eval scores, the cluster assignments, and the trajectory
-              # trigger ledger, feedback, and feedback-to-trace mappings — all designed
-              # to age out in lockstep with the telemetry they annotate.
+              # trigger ledger, feedback, and mappings from turns and runs to traces —
+              # all designed to age out in lockstep with the telemetry they annotate.
               # Excluded: the llm_* tables are LLM-worker queue state, not telemetry,
               # and keep their own fixed TTL (sql/0008–0010). llm_worker_info and
               # conversation_rollup_watermarks are current-state control metadata

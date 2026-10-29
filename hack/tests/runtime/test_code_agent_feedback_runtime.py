@@ -322,6 +322,118 @@ class FeedbackStorageTests(unittest.TestCase):
                     [{"categories": expected}],
                 )
 
+    def test_categories_drop_blank_and_nonstring_entries(self):
+        categories = [
+            None,
+            "",
+            1,
+            True,
+            {"a": 1},
+            ["nested"],
+            " ",
+            "\t\n\v\f\r\u0085\x1c\x1d\x1e\x1f",
+            "\u00a0\u2003",
+            "ok",
+            " padded ",
+            "2026-10-29",
+        ]
+        for encoded in (categories, json.dumps(categories)):
+            with self.subTest(encoding=type(encoded).__name__):
+                event = self.feedback(
+                    **{
+                        "montecarlo.feedback.trace_id": self.target,
+                        "montecarlo.feedback.categories": encoded,
+                    }
+                )
+                normal = self.span()
+                self.insert([event, normal])
+                self.assertEqual(
+                    self.select(
+                        "agent_feedback",
+                        "categories",
+                        f"AND feedback_span_id = '{event['SpanId']}'",
+                    ),
+                    [{"categories": ["ok", " padded ", "2026-10-29"]}],
+                )
+                self.assertEqual(
+                    self.select(
+                        "spans_normalized",
+                        "span_id",
+                        f"AND span_id = '{normal['SpanId']}'",
+                    ),
+                    [{"span_id": normal["SpanId"]}],
+                )
+
+    def test_date_shaped_run_ids_link_to_the_same_feedback_target(self):
+        values = [
+            "2026-10-29",
+            "2026-10-29 12:00:00",
+            "2026-10-29 12:00:00.123456",
+            "2026-10-29T12:00:00Z",
+            "2026-10-29T14:00:00+02:00",
+            "123",
+            "true",
+            "run-abc",
+            str(uuid.uuid4()),
+        ]
+        for value in values:
+            with self.subTest(run_id=value):
+                trace_id = uuid.uuid4().hex
+                normal = self.span(
+                    {"montecarlo.association_properties.run_id": value},
+                    TraceId=trace_id,
+                )
+                feedback = self.feedback(
+                    **{
+                        "montecarlo.feedback.run_id": value,
+                        "gen_ai.evaluation.score.label": "positive",
+                    }
+                )
+                self.insert([normal, feedback])
+                result = self.select(
+                    "agent_feedback",
+                    "target_kind, target_id",
+                    f"AND feedback_span_id = '{feedback['SpanId']}'",
+                )
+                self.assertEqual(len(result), 1)
+                self.assertEqual(result[0]["target_kind"], "run")
+                self.assertTrue(result[0]["target_id"])
+                if value in ("2026-10-29", "2026-10-29 12:00:00"):
+                    self.assertEqual(result[0]["target_id"], value)
+                    stored_type = self.execute(
+                        "SELECT dynamicType(SpanAttributes.montecarlo.association_properties.run_id) AS stored_type FROM otel_traces.otel_traces "
+                        + f"WHERE SpanId = '{normal['SpanId']}'"
+                    )[0]["stored_type"]
+                    self.assertTrue(stored_type.startswith("Date"), stored_type)
+                self.assertEqual(
+                    self.select(
+                        "code_agent_run_links",
+                        "run_id, trace_id",
+                        f"AND trace_id = '{trace_id}'",
+                    ),
+                    [{"run_id": result[0]["target_id"], "trace_id": trace_id}],
+                )
+
+    def test_child_feedback_with_run_target_does_not_rate_its_own_trace(self):
+        event = self.feedback(
+            **{
+                "montecarlo.feedback.run_id": "explicit-run",
+                "gen_ai.evaluation.score.label": "positive",
+            }
+        )
+        event["ParentSpanId"] = "1234567890abcdef"
+        self.insert([event])
+        self.assertEqual(
+            self.select("agent_feedback", "target_kind, target_id, request_id"),
+            [
+                {
+                    "target_kind": "run",
+                    "target_id": "explicit-run",
+                    "request_id": "explicit-run",
+                }
+            ],
+        )
+
     def test_positive_run_feedback_keeps_target_and_boolean(self):
         event = self.feedback(
             **{
@@ -342,6 +454,7 @@ class FeedbackStorageTests(unittest.TestCase):
             ("run", "run-case-sensitive", "run-case-sensitive", "", True),
         )
         self.assertIs(result["positive"], True)
+        self.assertIs(result["has_comment"], False)
 
     def test_marker_only_child_and_reserved_name_never_become_normal_spans(self):
         normal = self.span({"montecarlo.association_properties.run_id": "normal-run"})
@@ -433,6 +546,7 @@ class FeedbackStorageTests(unittest.TestCase):
             {"montecarlo.feedback.trace_id": "0" * 32},
             {"montecarlo.feedback.trace_id": {"nested": "bad"}},
             {"montecarlo.feedback.run_id": 123},
+            {"montecarlo.feedback.run_id": ""},
             {"montecarlo.feedback.run_id": "x" * 257},
             {"montecarlo.feedback.run_id": "é" * 129},
             {
@@ -667,7 +781,7 @@ class FeedbackStorageTests(unittest.TestCase):
             after = self.feedback(
                 **{
                     "montecarlo.feedback.trace_id": self.target,
-                    "montecarlo.feedback.categories": '["incorrect"]',
+                    "montecarlo.feedback.categories": '[null,"",1,"incorrect"]',
                 }
             )
             self.insert([after])
@@ -682,24 +796,30 @@ class FeedbackStorageTests(unittest.TestCase):
         finally:
             self.apply([SQL_DIR / "0036_code_agent_feedback_collector_categories.sql"])
 
-    def test_existing_run_mapping_gets_native_filters_on_upgrade(self):
-        # This is the query used before native JSON filters were added.
+    def test_existing_run_mapping_gets_date_shaped_ids_on_upgrade(self):
+        # Earlier installations read only the String variant of a run ID.
         self.execute("""
 ALTER TABLE otel_traces.code_agent_run_links_mv MODIFY QUERY
 WITH
-    toString(SpanAttributes) AS attrs,
-    JSONExtractString(attrs, 'montecarlo', 'association_properties', 'run_id') AS associated_run_id,
-    coalesce(nullIf(JSONExtractString(attrs, 'montecarlo', 'agent_name'), ''), ServiceName) AS agent_name
-SELECT agent_name AS service_name, associated_run_id AS run_id,
-    lower(TraceId) AS trace_id, min(Timestamp) AS first_seen, max(Timestamp) AS last_seen
+    ifNull(dynamicElement(SpanAttributes.montecarlo.association_properties.run_id, 'String'), '') AS associated_run_id,
+    (SpanName != 'user_feedback'
+        AND ifNull(dynamicElement(SpanAttributes.gen_ai.evaluation.name, 'String'), '') != 'user_feedback'
+        AND associated_run_id != '' AND length(associated_run_id) <= 256) AS is_run_span,
+    -- Read only Monte Carlo attributes to preserve existing agent-name conversion.
+    toString(if(is_run_span, SpanAttributes.^montecarlo, CAST('{}' AS JSON))) AS agent_attrs,
+    coalesce(nullIf(JSONExtractString(agent_attrs, 'agent_name'), ''), ServiceName) AS agent_name
+SELECT
+    agent_name AS service_name,
+    associated_run_id AS run_id,
+    lower(TraceId) AS trace_id,
+    min(Timestamp) AS first_seen,
+    max(Timestamp) AS last_seen
 FROM otel_traces.otel_traces
-WHERE SpanName != 'user_feedback'
-  AND JSONExtractString(attrs, 'gen_ai', 'evaluation', 'name') != 'user_feedback'
-  AND agent_name != '' AND associated_run_id != ''
-  AND JSONType(attrs, 'montecarlo', 'association_properties', 'run_id') = 'String'
-  AND length(associated_run_id) <= 256
-  AND match(TraceId, '^[0-9a-fA-F]{32}$') AND lower(TraceId) != repeat('0', 32)
-GROUP BY service_name, run_id, trace_id
+WHERE is_run_span
+  AND agent_name != ''
+  AND match(TraceId, '^[0-9a-fA-F]{32}$')
+  AND lower(TraceId) != repeat('0', 32)
+GROUP BY service_name, run_id, trace_id;
 """)
         try:
             self.insert(
@@ -708,27 +828,67 @@ GROUP BY service_name, run_id, trace_id
                     self.span({"montecarlo.association_properties.run_id": "before"}),
                 ]
             )
-            before = self.execute(
-                "SHOW CREATE TABLE otel_traces.code_agent_run_links_mv"
-            )[0]["statement"]
-            self.assertNotIn("dynamicElement", before)
+            # Insert date strings in their own block so JSON infers Date rather than
+            # combining them with unrelated string IDs into the String variant.
+            self.insert(
+                [
+                    self.span(
+                        {"montecarlo.association_properties.run_id": "2026-10-29"}
+                    ),
+                    self.feedback(**{"montecarlo.feedback.run_id": "2026-10-29"}),
+                ]
+            )
+            self.assertEqual(
+                self.select("code_agent_run_links", "run_id"), [{"run_id": "before"}]
+            )
+            self.assertEqual(
+                self.select("agent_feedback", "target_id"),
+                [{"target_id": "2026-10-29"}],
+            )
             self.apply([SQL_DIR / "0037_code_agent_run_links_native_filters.sql"])
-            after = self.execute(
-                "SHOW CREATE TABLE otel_traces.code_agent_run_links_mv"
-            )[0]["statement"]
-            self.assertIn("dynamicElement", after)
             self.insert(
                 [
                     self.span({"montecarlo.association_properties.run_id": 456}),
                     self.span({"montecarlo.association_properties.run_id": "after"}),
                 ]
             )
+            self.insert(
+                [self.span({"montecarlo.association_properties.run_id": "2026-10-29"})]
+            )
             self.assertEqual(
                 self.select("code_agent_run_links", "run_id", "ORDER BY run_id"),
-                [{"run_id": "after"}, {"run_id": "before"}],
+                [{"run_id": "2026-10-29"}, {"run_id": "after"}, {"run_id": "before"}],
             )
         finally:
             self.apply([SQL_DIR / "0037_code_agent_run_links_native_filters.sql"])
+
+    def test_feedback_table_backlog_rejects_insert_and_recovers(self):
+        self.execute("SYSTEM STOP MERGES otel_traces.agent_feedback")
+        try:
+            self.execute(
+                f"INSERT INTO otel_traces.agent_feedback (service_name, agent_mcon, request_id, positive, has_comment, submitted_at, collected_at) VALUES ('{self.service}', 'existing-agent', 'backlog-seed', true, false, now64(6), now64(6))"
+            )
+            self.execute(
+                "ALTER TABLE otel_traces.agent_feedback MODIFY SETTING parts_to_throw_insert = 1, parts_to_delay_insert = 1"
+            )
+            with self.assertRaises(AssertionError) as failure:
+                self.insert([self.span()])
+            self.assertIn("TOO_MANY_PARTS", str(failure.exception))
+            self.assertIn("code_agent_feedback_mv", str(failure.exception))
+        finally:
+            self.execute(
+                "ALTER TABLE otel_traces.agent_feedback RESET SETTING parts_to_throw_insert, parts_to_delay_insert"
+            )
+            self.execute("SYSTEM START MERGES otel_traces.agent_feedback")
+        # A failed multi-view insert is not an atomic transaction; use a fresh ID.
+        retry = self.span()
+        self.insert([retry])
+        self.assertEqual(
+            self.select(
+                "spans_normalized", "span_id", f"AND span_id = '{retry['SpanId']}'"
+            ),
+            [{"span_id": retry["SpanId"]}],
+        )
 
     def test_configured_feedback_retention_runs_on_replicated_tables(self):
         scope = {"agent_feedback", "agent_turn_links", "code_agent_run_links"}
