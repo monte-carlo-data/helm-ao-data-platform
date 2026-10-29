@@ -104,7 +104,9 @@ reports an error. Do not retry an uncertain deletion to clear the backlog.
 
 Before starting each removal, cleanup reserves five minutes for the deletion,
 four 30-second reads per copy to verify the result, and another 30 seconds for
-processing. With two copies, more than 570 seconds must remain. If less time
+processing, plus the password revision checks before every request. Each check
+allows 10 seconds per ClickHouse Pod. With two copies, the nine requests add
+180 seconds for these checks, so more than 750 seconds must remain. If less time
 is available, it returns the partial summary without sending or logging a new
 deletion request. It does not shorten a deletion's timeout just to fit another
 removal in. This leaves time unused when the next removal cannot safely fit;

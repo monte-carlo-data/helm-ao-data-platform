@@ -1049,6 +1049,8 @@ class APITests(unittest.TestCase):
             self.assertEqual(api.call_args_list[0].kwargs["guard_timeout_seconds"], 10)
             self.assertEqual(api.call_args_list[1].kwargs["guard_timeout_seconds"], 10)
             self.assertFalse(api.call_args_list[1].kwargs["backup_api"])
+            self.assertEqual(api.call_args_list[0].kwargs["guard_timeout_seconds"], 10)
+            self.assertEqual(api.call_args_list[1].kwargs["guard_timeout_seconds"], 10)
             self.assertEqual(read.call_args_list, [mock.call(Path(path)) for path in passwords])
             copy_guard = api.call_args_list[0].kwargs["guard"]
             self.assertIs(copy_guard, api.call_args_list[1].kwargs["guard"])
