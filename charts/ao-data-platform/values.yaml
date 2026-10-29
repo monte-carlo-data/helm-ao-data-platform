@@ -90,12 +90,21 @@ clickhouse:
       # Preview checks every configured ClickHouse copy; all must be reachable.
       enabled: false
       # Preview only: stock clickhouse-backup 2.8.1 cannot safely remove native files.
-      # When cleanup is enabled, any value but true is rejected; this chart never deletes backups.
+      # When cleanup is enabled, any value but true is rejected; S3 deletion stays off.
       dryRun: true
       keepLast: 2
       # Also keep every backup from the last N days, plus their bases.
       # 0 disables the age window so only keepLast applies. Use 30 for real data.
       keepDays: 0
+      timeoutSeconds: 1800
+    localCleanup:
+      # Remove older local records only when their completed S3 backups exist.
+      # Runs after a verified backup; every configured copy must be reachable.
+      enabled: false
+      dryRun: true
+      # Keep all full/incremental records from this many latest successful UTC days.
+      # At least two are required; unrelated backups and their needed bases stay.
+      keepFullBackupDays: 2
       timeoutSeconds: 1800
   storageClass: ""
   storageSize: 100Gi

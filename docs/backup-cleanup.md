@@ -5,6 +5,10 @@ They do not change the backup schedule or delete files. The chart does not add
 an alerting system. Cleanup checks every configured ClickHouse copy and supports
 one or more copies.
 
+This page covers `clickhouse.backup.cleanup`, the S3 retention preview. The
+separate [database-disk record cleanup](backup-local-cleanup.md) option can
+remove older local records while preserving their completed S3 backups.
+
 ```yaml
 clickhouse:
   backup:
@@ -84,11 +88,14 @@ has already been verified, the Job still succeeds. Read that line and the
 report separately from backup Job status. Do not rerun a completed backup just
 because its preview failed. This chart does not send preview alerts.
 
-The Job deadline is `schedule.timeoutSeconds + cleanup.timeoutSeconds + 60`.
+The Job deadline is `schedule.timeoutSeconds + cleanup.timeoutSeconds + 60`,
+plus `localCleanup.timeoutSeconds` when database-disk cleanup is also enabled.
 Keep it below the scheduled interval, with time for startup and scheduling
-delays. Otherwise an unfinished Job can cause the next scheduled run to be
-skipped. Defaults allow 10800 seconds for backup and 1800 for preview, with a
-60-second allowance, on a four-hour schedule.
+delays. Otherwise an unfinished Job delays the next scheduled run. It can
+still start within the configured start deadline (900 seconds, or 15 minutes,
+by default); after that the missed run is skipped. Defaults allow 10800 seconds
+for backup and 1800 for preview, with a 60-second allowance, on a four-hour
+schedule.
 
 ## Local files in the report
 
@@ -153,7 +160,7 @@ does not show that the preview recovered.
 
 ## Why deletion is unavailable
 
-This chart does not delete backups. It rejects enabled cleanup with
+This S3 cleanup option does not delete backups. It rejects enabled cleanup with
 `dryRun: false`, and the preview program refuses execution before contacting
 any backup API. Keep the tool's automatic retention disabled and S3
 lifecycle expiration disabled for both backup prefixes. The chart cannot
@@ -180,7 +187,7 @@ https://github.com/Altinity/clickhouse-backup/blob/v2.8.1/pkg/backup/delete.go
 
 https://github.com/Altinity/clickhouse-backup/pull/1590
 
-Deletion remains unavailable until this chart adopts a tested upstream release
+S3 deletion remains unavailable until this chart adopts a tested upstream release
 with the fix and implements cleanup. Merging the upstream change alone does
 not update this chart's pinned image or remove its deletion guards.
 
@@ -202,10 +209,12 @@ https://github.com/Altinity/clickhouse-backup/blob/v2.8.1/pkg/backup/upload.go
 ClickHouse keeps small files describing S3 object locations on its own data
 volume, under `/var/lib/clickhouse/disks/backups_s3/`. These pointers accumulate
 on every copy that creates or downloads backup metadata. This preview does not
-limit their growth. Check free space and available file entries on every copy
+limit their growth. The separate [database-disk record cleanup](backup-local-cleanup.md)
+option can remove older records while keeping their completed S3 backups.
+Check free space and available file entries on every copy
 using the commands in [the current limitations](clickhouse-backups.md#current-limitations).
 
-Future automatic deletion must execute this preview's ordered `delete` list
+Future automatic S3 deletion must execute this preview's ordered `delete` list
 through per-backup delete calls, preserving the same age window, manual backups,
 and required bases. Turning on the tool's count-based retention would choose a
 different set. Remove dependent backups before their bases.

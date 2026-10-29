@@ -61,7 +61,12 @@ def catalog(rows, location, remote=None):
 
 
 def plan(remote, now, keep_last=2, keep_days=0, latest_backup=None):
-    """Keep newest individual backups, the age window, and all required bases."""
+    """Keep newest individual backups, the age window, and all required bases.
+
+    Local deletion also calls this function to validate the remote catalog.
+    Keep the name, timestamp and complete dependency checks independent of the
+    remote retention selection: local deletion safety depends on them.
+    """
     if (type(keep_last) is not int or keep_last < 1
             or type(keep_days) is not int or keep_days < 0):
         raise BackupError("Cleanup needs a positive keep_last and nonnegative keep_days.")
@@ -112,6 +117,17 @@ def plan(remote, now, keep_last=2, keep_days=0, latest_backup=None):
         remaining.difference_update(ready)
     return {"keep_last": keep_last, "keep_days": keep_days,
             "kept": sorted(owned & kept), "delete": ordered}
+
+
+def local_record_warnings(remote, local):
+    """Describe incomplete and unmatched records without trusting their contents."""
+    return {"broken_local": [
+        {"copy": index, "name": name}
+        for index, entries in enumerate(local)
+        for name, required in sorted(entries.items()) if required is None], "local_only": [
+        {"copy": index, "name": name}
+        for index, entries in enumerate(local)
+        for name in sorted(entries) if name not in remote]}
 
 
 class Cleaner:
@@ -181,12 +197,6 @@ class Cleaner:
         now = now or datetime.now(timezone.utc)
         remote, local = self.snapshot()
         result = plan(remote, now, self.keep_last, self.keep_days, latest_backup)
-        result.update(mode="dry-run", deleted=[], broken_local=[
-            {"copy": index, "name": name}
-            for index, entries in enumerate(local)
-            for name, required in sorted(entries.items()) if required is None], local_only=[
-            {"copy": index, "name": name}
-            for index, entries in enumerate(local)
-            for name in sorted(entries) if name not in remote])
+        result.update(mode="dry-run", deleted=[], **local_record_warnings(remote, local))
         self.unchanged(remote, local)
         return result

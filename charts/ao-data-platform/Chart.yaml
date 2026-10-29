@@ -1,8 +1,8 @@
 apiVersion: v2
 name: ao-data-platform
 description: Monte Carlo data platform — ClickHouse, OTel collector, and schema management
-# 5.5.0 adds the trajectory_trigger_ledger table. See README "Upgrading to 5.5.0".
-version: 5.5.0
+# 5.7.0 adds optional cleanup of local backup records while retaining S3 backups.
+version: 5.7.0
 type: application
 # minDomains on the ClickHouse/Keeper zone topologySpreadConstraints is GA in
 # Kubernetes 1.30. Declare the floor so a render/install against an older API
