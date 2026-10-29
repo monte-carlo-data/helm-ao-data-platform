@@ -139,7 +139,7 @@ class BackupChartTests(unittest.TestCase):
         spec = pod(self.chi)
         self.assertEqual(spec["serviceAccountName"], account["metadata"]["name"])
         sidecar = next(c for c in spec["containers"] if c["name"] == "clickhouse-backup")
-        self.assertEqual(sidecar["image"], "altinity/clickhouse-backup:2.8.1@sha256:08016b048f7e6035c048501315c2a788e5a782f15f168e042c7bd48d5a388cc4")
+        self.assertEqual(sidecar["image"], "altinity/clickhouse-backup:2.8.2@sha256:bc32794f2bd95d780bf6a0fea093d0ee463ec8e7dc486ccb845ce47b3406fad5")
         self.assertEqual(sidecar["command"], ["/bin/sh", "/scripts/start-backup.sh"])
         data_volume = self.chi["spec"]["defaults"]["templates"]["dataVolumeClaimTemplate"]
         mounts = {mount["mountPath"]: mount for mount in sidecar["volumeMounts"]}
@@ -438,6 +438,98 @@ class BackupChartTests(unittest.TestCase):
                     scripts = one(docs, "ConfigMap", name + "-backup-job")["data"]
                     self.assertIn("cleanup_backups.py", scripts)
 
+    def test_local_cleanup_is_opt_in_and_does_not_change_database_pods(self):
+        baseline = render()
+        baseline_chi = one(baseline, "ClickHouseInstallation")
+        baseline_scripts = one(baseline, "ConfigMap", "otel-backup-job")["data"]
+        self.assertNotIn("cleanup_local_backups.py", baseline_scripts)
+        for execute in (False, True):
+            docs = render("clickhouse.backup.localCleanup.enabled=true",
+                          "clickhouse.backup.localCleanup.dryRun=" + str(not execute).lower())
+            self.assertEqual(one(docs, "ClickHouseInstallation"), baseline_chi)
+            self.assertEqual(one(docs, "ClickHouseKeeperInstallation"), one(baseline, "ClickHouseKeeperInstallation"))
+            job = one(docs, "CronJob")["spec"]["jobTemplate"]["spec"]
+            self.assertEqual(job["activeDeadlineSeconds"], 10800 + 1800 + 60)
+            env = {x["name"]: x.get("value") for x in job["template"]["spec"]["containers"][0]["env"]}
+            self.assertEqual(env["BACKUP_LOCAL_CLEANUP_ENABLED"], "true")
+            self.assertEqual(env["BACKUP_LOCAL_CLEANUP_DRY_RUN"], str(not execute).lower())
+            self.assertEqual(env["BACKUP_LOCAL_KEEP_FULL_BACKUP_DAYS"], "2")
+            self.assertNotIn("BACKUP_CLEANUP_ENABLED", env)
+            scripts = one(docs, "ConfigMap", "otel-backup-job")["data"]
+            self.assertIn("cleanup_local_backups.py", scripts)
+            self.assertIn("cleanup_backups.py", scripts)
+            self.assertNotEqual(scripts["cleanup_local_backups.py"].strip(), "")
+
+    def test_local_cleanup_rejects_invalid_settings_and_still_blocks_s3_deletion(self):
+        for setting in ("keepFullBackupDays=1", "keepFullBackupDays=-2", "keepFullBackupDays=2.5",
+                        "timeoutSeconds=59", "timeoutSeconds=60.5", "dryRun=invalid"):
+            with self.subTest(setting=setting), self.assertRaisesRegex(AssertionError, "localCleanup"):
+                render("clickhouse.backup.localCleanup.enabled=true", "clickhouse.backup.localCleanup." + setting)
+        with self.assertRaisesRegex(AssertionError, "requires clickhouse.backup.enabled"):
+            render("clickhouse.backup.localCleanup.enabled=true", backup=False)
+        with self.assertRaisesRegex(AssertionError, "count-and-age supports preview only"):
+            render("clickhouse.backup.localCleanup.enabled=true", "clickhouse.backup.localCleanup.dryRun=false",
+                   "clickhouse.backup.cleanup.enabled=true", "clickhouse.backup.cleanup.dryRun=false",
+                   "clickhouse.backup.cleanup.retentionPolicy=count-and-age")
+
+    def test_both_cleanup_timeouts_are_included_in_job_and_notes(self):
+        docs = render("clickhouse.backup.localCleanup.enabled=true", "clickhouse.backup.cleanup.enabled=true")
+        self.assertEqual(one(docs, "CronJob")["spec"]["jobTemplate"]["spec"]["activeDeadlineSeconds"], 14460)
+        values = yaml.safe_load((CHART / "values.yaml").read_text())
+        values["clickhouse"]["backup"]["enabled"] = True
+        values["clickhouse"]["backup"]["cleanup"]["enabled"] = True
+        values["clickhouse"]["backup"]["localCleanup"]["enabled"] = True
+        notes = render_secret_template((CHART / "templates/NOTES.txt").read_text(), {
+            "Values": values, "Release": {"Namespace": "render-test"},
+        })
+        self.assertIn("WARNING:", notes)
+        self.assertIn("1800 seconds for local backup cleanup", notes)
+
+    def test_daily_weekly_cleanup_is_default_and_wires_complete_settings(self):
+        for dry_run in (True, False):
+            docs = render("clickhouse.backup.cleanup.enabled=true",
+                          "clickhouse.backup.cleanup.dailyDays=8",
+                          "clickhouse.backup.cleanup.historyDays=35",
+                          "clickhouse.backup.cleanup.dryRun=" + str(dry_run).lower())
+            job = one(docs, "CronJob")["spec"]["jobTemplate"]["spec"]["template"]["spec"]
+            settings = {item["name"]: item.get("value") for item in job["containers"][0]["env"]}
+            self.assertEqual(settings["BACKUP_RETENTION_POLICY"], "daily-weekly")
+            self.assertEqual(settings["BACKUP_DAILY_DAYS"], "8")
+            self.assertEqual(settings["BACKUP_HISTORY_DAYS"], "35")
+            self.assertEqual(settings["BACKUP_CLEANUP_DRY_RUN"], str(dry_run).lower())
+            scripts = one(docs, "ConfigMap", "otel-backup-job")["data"]
+            self.assertIn("class", scripts["backup_retention.py"])
+
+    def test_daily_weekly_validation_and_old_image_deletion_guard(self):
+        settings = ("clickhouse.backup.cleanup.enabled=true",
+                    "clickhouse.backup.cleanup.retentionPolicy=daily-weekly")
+        for invalid in ("dailyDays=0", "dailyDays=1.5", "historyDays=0", "historyDays=1.5",
+                        "historyDays=6", "retentionPolicy=unknown", "dryRun=invalid"):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(AssertionError, "cleanup"):
+                render(*settings, "clickhouse.backup.cleanup." + invalid)
+        old_image = "altinity/clickhouse-backup:2.8.1@sha256:08016b048f7e6035c048501315c2a788e5a782f15f168e042c7bd48d5a388cc4"
+        render(*settings, "clickhouse.backup.sidecar.image=" + old_image)
+        render("clickhouse.backup.sidecar.image=" + old_image,
+               "clickhouse.backup.localCleanup.enabled=true", "clickhouse.backup.localCleanup.dryRun=false")
+        with self.assertRaisesRegex(AssertionError, "2.8.2 image digest"):
+            render(*settings, "clickhouse.backup.sidecar.image=" + old_image,
+                   "clickhouse.backup.cleanup.dryRun=false")
+
+    def test_cleanup_timeouts_are_independent_and_only_enabled_budgets_count(self):
+        for local, remote in ((False, False), (False, True), (True, False), (True, True)):
+            with self.subTest(local=local, remote=remote):
+                docs = render("clickhouse.backup.localCleanup.enabled=" + str(local).lower(),
+                              "clickhouse.backup.cleanup.enabled=" + str(remote).lower(),
+                              "clickhouse.backup.localCleanup.timeoutSeconds=900",
+                              "clickhouse.backup.cleanup.timeoutSeconds=420")
+                job = one(docs, "CronJob")["spec"]["jobTemplate"]["spec"]
+                self.assertEqual(job["activeDeadlineSeconds"], 10800 + 60 + 900 * local + 420 * remote)
+                env = {item["name"]: item.get("value")
+                       for item in job["template"]["spec"]["containers"][0]["env"]}
+                self.assertEqual(env.get("BACKUP_LOCAL_CLEANUP_TIMEOUT_SECONDS"), "900" if local else None)
+                self.assertEqual(env.get("BACKUP_CLEANUP_TIMEOUT_SECONDS"), "420" if remote else None)
+                self.assertEqual(env.get("BACKUP_LOCAL_CLEANUP_ENABLED"), "true" if local else None)
+
     def test_backup_copy_count_must_be_a_positive_integer(self):
         for cleanup in (False, True):
             for count in ("0", "-1", "1.5", "true", "abc"):
@@ -544,9 +636,9 @@ class BackupChartTests(unittest.TestCase):
             "clickhouse.backup.serviceAccount.name=default": "dedicated account",
             "clickhouse.backup.api.existingSecret=": "exactly one",
             "clickhouse.backup.api.passwordRevision=": "passwordRevision",
-            "clickhouse.backup.sidecar.image=": "verified Altinity 2.8.1 digest",
-            "clickhouse.backup.sidecar.image=altinity/clickhouse-backup:2.8.1": "verified Altinity 2.8.1 digest",
-            "clickhouse.backup.sidecar.image=mirror.example.org/backup@sha256:" + "0" * 64: "verified Altinity 2.8.1 digest",
+            "clickhouse.backup.sidecar.image=": "verified Altinity 2.8.1 or 2.8.2 digest",
+            "clickhouse.backup.sidecar.image=altinity/clickhouse-backup:2.8.1": "verified Altinity 2.8.1 or 2.8.2 digest",
+            "clickhouse.backup.sidecar.image=mirror.example.org/backup@sha256:" + "0" * 64: "verified Altinity 2.8.1 or 2.8.2 digest",
             "clickhouse.backup.probe.secret=ao-clickhouse-backup-credentials": "separate Secrets",
             "clickhouse.backup.user.secret=ao-clickhouse-auth-methods": "shared auth bundle",
             "clickhouse.backup.probe.secret=ao-clickhouse-otel-credentials": "another ClickHouse user",

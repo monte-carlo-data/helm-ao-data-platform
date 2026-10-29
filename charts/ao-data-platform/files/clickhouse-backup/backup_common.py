@@ -7,11 +7,31 @@ import uuid
 REQUEST_TIMEOUT_SECONDS = 30
 NAME_PREFIX = "ao-otel-"
 SCHEDULED_NAME = re.compile(re.escape(NAME_PREFIX) + r"(full|incremental)-(\d{8}T\d{6}Z)-[0-9a-f]{8}\Z")
-DELETION_UNAVAILABLE = "Backup deletion is unavailable with stock clickhouse-backup 2.8.1; cleanup supports preview only."
+DELETION_UNAVAILABLE = "S3 deletion requires daily-weekly retention; count-and-age supports preview only."
 
 
 class BackupError(Exception):
     """A safe-to-log failure message, without server bodies or credentials."""
+
+
+class RequestNotSent(BackupError):
+    """The request was refused locally or could not establish a connection."""
+
+
+class RevisionError(BackupError):
+    """A password rotation stops the Job before sending another request."""
+
+
+class RevisionCheckUnavailable(BackupError):
+    """Credentials must not be sent before the revision can be checked."""
+
+
+class CleanupStopped(BackupError):
+    """Preserve verified removals and any deletion still needing confirmation."""
+
+    def __init__(self, message, result):
+        super().__init__(message)
+        self.result = result
 
 
 def scheduled_name(kind, now):
