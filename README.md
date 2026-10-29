@@ -22,7 +22,7 @@ The ClickHouse instance ships with production hardening: a capped memory ceiling
 
 > **Chart-version bumps no longer recreate ClickHouse:** the ClickHouse operator propagates only a fixed allowlist of stable labels onto the resources it generates. A chart-version bump changes the volatile `helm.sh/chart` label, but that label is no longer stamped onto the StatefulSet's immutable `volumeClaimTemplates`, so the bump no longer forces a delete/recreate of the ClickHouse StatefulSet.
 
-> **Upgrading to 5.10.0:** adds code-agent feedback ingestion and the compact `code_agent_run_links` table. Install this version before sending feedback spans. Feedback is retained separately and excluded from normalized traces, conversations, and trace time bounds. The schema job extends existing feedback tables without changing existing writers. Retention follows `clickhouse.ttlDays`. Before rolling back below 5.10.0, stop sending feedback: an older chart can restore normalization that treats feedback as ordinary spans. A rollback retains the new tables, views, and rows. It restores older `spans_normalized_mv` behavior, while the trace-time view continues excluding feedback and the feedback views keep writing. Rolling back to a version without the feedback grants, such as 5.8.0, also revokes `monte_carlo` INSERT on `agent_feedback` and `agent_turn_links`; the 5.9.0 prerequisite retains those grants.
+> **Upgrading to 5.10.0:** adds code-agent feedback ingestion and the compact `code_agent_run_links` table. Install this version before sending feedback spans. Run links are created from spans ingested after this upgrade; use trace IDs for earlier runs that have no new spans. Feedback is retained separately and excluded from normalized traces, conversations, and trace time bounds. The schema job extends existing feedback tables without changing existing writers. Retention follows `clickhouse.ttlDays`. Before rolling back below 5.10.0, stop sending feedback: an older chart can restore normalization that treats feedback as ordinary spans. A rollback retains the new tables, views, and rows. It restores older `spans_normalized_mv` behavior, while the trace-time view continues excluding feedback and the feedback views keep writing. Rolling back to a version without the feedback grants, such as 5.8.0, also revokes `monte_carlo` INSERT on `agent_feedback` and `agent_turn_links`; the 5.9.0 prerequisite retains those grants.
 
 > **Upgrading to 5.9.0:** adds the `agent_feedback` and `agent_turn_links` tables, which hold end-user feedback on agent responses and map each rated turn to its trace, and grants the `monte_carlo` user INSERT on both. Both follow `clickhouse.ttlDays`. The upgrade does not restart ClickHouse or Keeper pods. A `helm rollback` below 5.9.0 revokes the INSERT grants while the tables and their rows remain. Monte Carlo checks the grants hourly, so within an hour it stops writing and reading feedback here, and the rows expire with `clickhouse.ttlDays`.
 
@@ -1141,15 +1141,27 @@ opentelemetry-collector:
 A span with `gen_ai.evaluation.name = user_feedback` carries the current rating,
 categories, and comment for a trace. Name the span `user_feedback`. Supply either
 `montecarlo.feedback.trace_id` (a nonzero 32-character hexadecimal trace ID) or
-`montecarlo.feedback.run_id` (at most 256 UTF-8 bytes). A child feedback span can omit both and use its own
-trace ID. The optional `gen_ai.evaluation.score.label` accepts `positive`,
-`negative`, or `none`; `none` clears the whole feedback state. An omitted label
-leaves the rating unset. Labels are case-sensitive; other values leave the event
-raw without extracting feedback. `gen_ai.evaluation.explanation` carries an optional
-comment, and `montecarlo.feedback.categories` is an array of strings. The extractor
-also accepts the JSON-array string produced by the collector; invalid categories
-become an empty list. Client span timestamps determine ordering and retention, so
-emitting clocks must be accurate.
+`montecarlo.feedback.run_id` (at most 256 UTF-8 bytes). A child feedback span can
+omit both and use its own trace ID. A span with both targets, or a root span with
+neither target, stays raw without extracting feedback.
+
+Each feedback span replaces the target's earlier state. The optional
+`gen_ai.evaluation.score.label` accepts `positive`, `negative`, or `none`; `none`
+clears the whole feedback state. An omitted label records no rating, even if an
+earlier event had one. Labels are case-sensitive; other values leave the event
+raw without extracting feedback. `gen_ai.evaluation.explanation` carries an
+optional comment, and `montecarlo.feedback.categories` is an array of strings.
+The extractor also accepts the JSON-array string produced by the collector.
+Non-array values and malformed JSON become an empty list. It keeps at most 20
+categories and skips any entry longer than 128 UTF-8 bytes, without cutting a
+character in half.
+Client span timestamps determine ordering and retention, so emitting clocks must
+be accurate.
+
+The span name `user_feedback` is reserved. A span with that name, or with
+`gen_ai.evaluation.name = user_feedback`, is excluded from normal traces,
+conversations, trace time bounds, and run links, even when its feedback attributes
+are missing or invalid. Choose another name for an ordinary application span.
 
 `agent_feedback` stores rating metadata and the exact raw-span location. Comment
 text, user identity, and optional numeric scores stay in the raw span. Feedback
@@ -1160,6 +1172,8 @@ on every read; these tables are not a boundary between untrusted tenants.
 
 `code_agent_run_links` combines ordinary spans carrying
 `montecarlo.association_properties.run_id`. A run can map to several traces.
+Links are created only from spans ingested after this upgrade; no historical run
+links are built. Use trace IDs for earlier runs that have no new spans.
 Readers group by `(service_name, run_id, trace_id)` and read `min(first_seen)` and
 `max(last_seen)` so results remain correct before background merges. Feedback
 spans never extend these times. The agent name matches normalized spans:

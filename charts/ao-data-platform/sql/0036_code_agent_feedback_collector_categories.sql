@@ -1,11 +1,13 @@
 -- The collector stringifies array attributes. Accept both its JSON-array string
 -- and native arrays without raising for malformed input. Replaces the installed
 -- view query on upgrade; the initial CREATE does not change an existing view.
+-- Keep this query identical to 0032_code_agent_feedback_mv.sql.
 ALTER TABLE otel_traces.code_agent_feedback_mv ON CLUSTER '{cluster}'
 MODIFY QUERY
 WITH
-    toString(SpanAttributes) AS attrs,
-    JSONExtractString(attrs, 'gen_ai', 'evaluation', 'name') AS evaluation_name,
+    ifNull(dynamicElement(SpanAttributes.gen_ai.evaluation.name, 'String'), '') AS evaluation_name,
+    -- Guard the value before serialization; WHERE evaluation order is not a gate.
+    toString(if(evaluation_name = 'user_feedback', SpanAttributes, CAST('{}' AS JSON))) AS attrs,
     JSONExtractString(attrs, 'gen_ai', 'evaluation', 'score', 'label') AS label,
     JSONHas(attrs, 'gen_ai', 'evaluation', 'score', 'label') AS has_label,
     JSONExtractString(attrs, 'montecarlo', 'feedback', 'trace_id') AS rated_trace_id,
@@ -23,13 +25,13 @@ SELECT
     label != 'none'
         AND JSONType(attrs, 'gen_ai', 'evaluation', 'explanation') = 'String'
         AND JSONExtractString(attrs, 'gen_ai', 'evaluation', 'explanation') != '' AS has_comment,
-    if(label = 'none', [], multiIf(
+    if(label = 'none', [], arraySlice(arrayFilter(category -> length(category) <= 128, multiIf(
         JSONType(attrs, 'montecarlo', 'feedback', 'categories') = 'Array',
             JSONExtract(attrs, 'montecarlo', 'feedback', 'categories', 'Array(String)'),
         JSONType(attrs, 'montecarlo', 'feedback', 'categories') = 'String',
             JSONExtract(JSONExtractString(attrs, 'montecarlo', 'feedback', 'categories'), 'Array(String)'),
         []
-    )) AS categories,
+    )), 1, 20)) AS categories,
     toDateTime64(Timestamp, 6) AS submitted_at,
     now64(6) AS collected_at,
     'code' AS source,

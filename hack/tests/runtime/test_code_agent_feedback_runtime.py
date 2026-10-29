@@ -41,6 +41,31 @@ RUNTIME_CONFIG = """<clickhouse>
 </clickhouse>"""
 
 
+class FeedbackDefinitionTests(unittest.TestCase):
+    def test_fresh_and_upgrade_view_queries_match(self):
+        for create_name, upgrade_name in (
+            (
+                "0032_code_agent_feedback_mv.sql",
+                "0036_code_agent_feedback_collector_categories.sql",
+            ),
+            (
+                "0033_code_agent_run_links_mv.sql",
+                "0037_code_agent_run_links_native_filters.sql",
+            ),
+        ):
+            with self.subTest(create=create_name):
+                create = (
+                    (SQL_DIR / create_name).read_text().split("AS WITH", 1)[1].strip()
+                )
+                upgrade = (
+                    (SQL_DIR / upgrade_name)
+                    .read_text()
+                    .split("MODIFY QUERY\nWITH", 1)[1]
+                    .strip()
+                )
+                self.assertEqual(create, upgrade)
+
+
 @unittest.skipUnless(os.getenv("RUN_FEEDBACK_RUNTIME") == "1", "opt-in ClickHouse test")
 class FeedbackStorageTests(unittest.TestCase):
     @classmethod
@@ -275,6 +300,122 @@ class FeedbackStorageTests(unittest.TestCase):
                     [{"span_id": normal["SpanId"]}],
                 )
 
+    def test_categories_bound_count_and_utf8_bytes(self):
+        categories = ["x" * 129, "é" * 65, "x" * 128, "é" * 64]
+        categories += [f"category-{index}" for index in range(25)]
+        expected = categories[2:22]
+        for encoded in (categories, json.dumps(categories)):
+            with self.subTest(encoding=type(encoded).__name__):
+                event = self.feedback(
+                    **{
+                        "montecarlo.feedback.trace_id": self.target,
+                        "montecarlo.feedback.categories": encoded,
+                    }
+                )
+                self.insert([event])
+                self.assertEqual(
+                    self.select(
+                        "agent_feedback",
+                        "categories",
+                        f"AND feedback_span_id = '{event['SpanId']}'",
+                    ),
+                    [{"categories": expected}],
+                )
+
+    def test_positive_run_feedback_keeps_target_and_boolean(self):
+        event = self.feedback(
+            **{
+                "montecarlo.feedback.run_id": "run-case-sensitive",
+                "gen_ai.evaluation.score.label": "positive",
+            }
+        )
+        self.insert([event])
+        result = self.select("agent_feedback")[0]
+        self.assertEqual(
+            (
+                result["target_kind"],
+                result["target_id"],
+                result["request_id"],
+                result["agent_mcon"],
+                result["positive"],
+            ),
+            ("run", "run-case-sensitive", "run-case-sensitive", "", True),
+        )
+        self.assertIs(result["positive"], True)
+
+    def test_marker_only_child_and_reserved_name_never_become_normal_spans(self):
+        normal = self.span({"montecarlo.association_properties.run_id": "normal-run"})
+        child = self.feedback(
+            **{"montecarlo.association_properties.run_id": "feedback-run"}
+        )
+        child.update(
+            SpanName="evaluation",
+            TraceId=self.target,
+            ParentSpanId=normal["SpanId"],
+            Timestamp=str(self.day + timedelta(days=1)) + " 12:00:00.123456789",
+        )
+        reserved = self.span(
+            {"montecarlo.association_properties.run_id": "reserved-run"},
+            SpanName="user_feedback",
+            TraceId=uuid.uuid4().hex,
+        )
+        self.insert([normal, child, reserved])
+        self.assertEqual(
+            self.select("spans_normalized", "span_id"), [{"span_id": normal["SpanId"]}]
+        )
+        self.assertEqual(
+            self.select("code_agent_run_links", "run_id"), [{"run_id": "normal-run"}]
+        )
+        self.assertEqual(
+            self.select("agent_feedback", "target_kind, target_id"),
+            [{"target_kind": "trace", "target_id": self.target}],
+        )
+        self.assertEqual(
+            self.execute(
+                "SELECT TraceId, max(End) AS end FROM otel_traces.otel_traces_trace_id_ts "
+                f"WHERE TraceId IN ('{self.target}', '{reserved['TraceId']}') GROUP BY TraceId"
+            ),
+            [{"TraceId": self.target, "end": normal["Timestamp"].split(".")[0]}],
+        )
+
+    def test_run_mapping_rejects_bad_types_lengths_and_trace_ids(self):
+        invalid_runs = [123, True, ["run"], {"nested": "run"}, "", "x" * 257, "é" * 129]
+        rows = [
+            self.span({"montecarlo.association_properties.run_id": run})
+            for run in invalid_runs
+        ]
+        rows.extend(
+            self.span(
+                {"montecarlo.association_properties.run_id": "valid-run"}, TraceId=trace
+            )
+            for trace in ("g" * 32, "0" * 32, "abc", "a" * 33)
+        )
+        normal = self.span({"montecarlo.association_properties.run_id": "é" * 128})
+        rows.append(normal)
+        self.insert(rows)
+        self.assertEqual(
+            self.select("code_agent_run_links", "run_id, trace_id"),
+            [{"run_id": "é" * 128, "trace_id": self.target}],
+        )
+        self.assertEqual(len(self.select("spans_normalized")), len(rows))
+
+    def test_nonstring_feedback_markers_remain_ordinary_spans(self):
+        values = [123, True, ["user_feedback"], {"name": "user_feedback"}, None]
+        rows = [
+            self.span(
+                {
+                    "gen_ai.evaluation.name": value,
+                    "montecarlo.association_properties.run_id": f"run-{index}",
+                },
+                ParentSpanId="1234567890abcdef",
+            )
+            for index, value in enumerate(values)
+        ]
+        self.insert(rows)
+        self.assertEqual(len(self.select("spans_normalized")), len(rows))
+        self.assertEqual(len(self.select("code_agent_run_links")), len(rows))
+        self.assertEqual(self.select("agent_feedback"), [])
+
     def test_comment_only_and_child_target(self):
         child = self.feedback(**{"gen_ai.evaluation.explanation": "Comment only"})
         child.update(TraceId=self.target, ParentSpanId="1234567890abcdef")
@@ -311,7 +452,9 @@ class FeedbackStorageTests(unittest.TestCase):
                 "gen_ai.evaluation.score.label": "Positive",
             },
         ]
-        normal = self.span({"gen_ai.evaluation.name": "correctness"})
+        normal = self.span(
+            {"gen_ai.evaluation.name": "correctness"}, ParentSpanId="1234567890abcdef"
+        )
         malformed_name = self.span(
             {"gen_ai.evaluation.name": ["user_feedback"]}, SpanName="user_feedback"
         )
@@ -410,6 +553,7 @@ class FeedbackStorageTests(unittest.TestCase):
         result = self.select("agent_feedback")[0]
         self.assertEqual(result["feedback_service_name"], "feedback-service")
         self.assertEqual(result["target_kind"], "run")
+        self.assertEqual(result["target_id"], "run-1")
         normal = self.span(
             {
                 "montecarlo.agent_name": self.service,
@@ -422,6 +566,47 @@ class FeedbackStorageTests(unittest.TestCase):
             self.select("code_agent_run_links", "run_id, trace_id"),
             [{"run_id": "run-1", "trace_id": self.target}],
         )
+
+    def test_nonstring_agent_overrides_preserve_existing_conversion(self):
+        for name, expected_name in (
+            (123, "123"),
+            (True, "true"),
+            (["agent"], '["agent"]'),
+            ({"name": "agent"}, '{"name":"agent"}'),
+            (None, self.service),
+            ("", self.service),
+        ):
+            with self.subTest(name=name):
+                trace_id = uuid.uuid4().hex
+                normal = self.span(
+                    {
+                        "montecarlo.agent_name": name,
+                        "montecarlo.association_properties.run_id": "run",
+                    },
+                    TraceId=trace_id,
+                )
+                feedback = self.feedback(
+                    **{
+                        "montecarlo.agent_name": name,
+                        "montecarlo.feedback.trace_id": trace_id,
+                    }
+                )
+                self.insert([normal, feedback])
+                expected = [{"service_name": expected_name}]
+                self.assertEqual(
+                    self.execute(
+                        "SELECT service_name FROM otel_traces.code_agent_run_links "
+                        f"WHERE trace_id = '{trace_id}'"
+                    ),
+                    expected,
+                )
+                self.assertEqual(
+                    self.execute(
+                        "SELECT service_name FROM otel_traces.agent_feedback "
+                        f"WHERE feedback_span_id = '{feedback['SpanId']}'"
+                    ),
+                    expected,
+                )
 
     def test_upgrade_is_repeatable_and_preserves_existing_writer(self):
         migrated = self.execute(
@@ -456,6 +641,13 @@ class FeedbackStorageTests(unittest.TestCase):
     def test_existing_feedback_view_gets_collector_fix_on_upgrade(self):
         # Simulate an already-installed view. CREATE IF NOT EXISTS alone cannot fix it.
         initial = (SQL_DIR / "0032_code_agent_feedback_mv.sql").read_text()
+        start = initial.index("    if(label = 'none', [], arraySlice")
+        end = initial.index(" AS categories,", start)
+        initial = (
+            initial[:start]
+            + "    JSONExtract(attrs, 'montecarlo', 'feedback', 'categories', 'Array(String)')"
+            + initial[end:]
+        )
         self.execute(
             "ALTER TABLE otel_traces.code_agent_feedback_mv MODIFY QUERY WITH"
             + initial.split("AS WITH", 1)[1]
@@ -489,6 +681,54 @@ class FeedbackStorageTests(unittest.TestCase):
             )
         finally:
             self.apply([SQL_DIR / "0036_code_agent_feedback_collector_categories.sql"])
+
+    def test_existing_run_mapping_gets_native_filters_on_upgrade(self):
+        # This is the query used before native JSON filters were added.
+        self.execute("""
+ALTER TABLE otel_traces.code_agent_run_links_mv MODIFY QUERY
+WITH
+    toString(SpanAttributes) AS attrs,
+    JSONExtractString(attrs, 'montecarlo', 'association_properties', 'run_id') AS associated_run_id,
+    coalesce(nullIf(JSONExtractString(attrs, 'montecarlo', 'agent_name'), ''), ServiceName) AS agent_name
+SELECT agent_name AS service_name, associated_run_id AS run_id,
+    lower(TraceId) AS trace_id, min(Timestamp) AS first_seen, max(Timestamp) AS last_seen
+FROM otel_traces.otel_traces
+WHERE SpanName != 'user_feedback'
+  AND JSONExtractString(attrs, 'gen_ai', 'evaluation', 'name') != 'user_feedback'
+  AND agent_name != '' AND associated_run_id != ''
+  AND JSONType(attrs, 'montecarlo', 'association_properties', 'run_id') = 'String'
+  AND length(associated_run_id) <= 256
+  AND match(TraceId, '^[0-9a-fA-F]{32}$') AND lower(TraceId) != repeat('0', 32)
+GROUP BY service_name, run_id, trace_id
+""")
+        try:
+            self.insert(
+                [
+                    self.span({"montecarlo.association_properties.run_id": 123}),
+                    self.span({"montecarlo.association_properties.run_id": "before"}),
+                ]
+            )
+            before = self.execute(
+                "SHOW CREATE TABLE otel_traces.code_agent_run_links_mv"
+            )[0]["statement"]
+            self.assertNotIn("dynamicElement", before)
+            self.apply([SQL_DIR / "0037_code_agent_run_links_native_filters.sql"])
+            after = self.execute(
+                "SHOW CREATE TABLE otel_traces.code_agent_run_links_mv"
+            )[0]["statement"]
+            self.assertIn("dynamicElement", after)
+            self.insert(
+                [
+                    self.span({"montecarlo.association_properties.run_id": 456}),
+                    self.span({"montecarlo.association_properties.run_id": "after"}),
+                ]
+            )
+            self.assertEqual(
+                self.select("code_agent_run_links", "run_id", "ORDER BY run_id"),
+                [{"run_id": "after"}, {"run_id": "before"}],
+            )
+        finally:
+            self.apply([SQL_DIR / "0037_code_agent_run_links_native_filters.sql"])
 
     def test_configured_feedback_retention_runs_on_replicated_tables(self):
         scope = {"agent_feedback", "agent_turn_links", "code_agent_run_links"}
@@ -545,3 +785,35 @@ class FeedbackStorageTests(unittest.TestCase):
                 query
                 + " SETTINGS optimize_use_projections = 0, max_rows_to_read = 10000"
             )
+
+    def test_fresh_mapping_has_projection_before_later_migrations(self):
+        database = "fresh_mapping_" + uuid.uuid4().hex
+        self.execute("CREATE DATABASE " + database)
+        try:
+            self.execute(
+                (SQL_DIR / "0031_code_agent_run_links.sql")
+                .read_text()
+                .replace("'{cluster}'", "'feedback_test'")
+                .replace("otel_traces.", database + ".")
+            )
+            table = database + ".code_agent_run_links"
+            self.execute(
+                f"INSERT INTO {table} SELECT 'agent', toString(number), "
+                "lower(hex(MD5(toString(number)))), now64(9), now64(9) FROM numbers(100000)"
+            )
+            definition = self.execute("SHOW CREATE TABLE " + table)[0]["statement"]
+            self.assertIn("PROJECTION by_trace", definition)
+            self.assertIn("deduplicate_merge_projection_mode = 'rebuild'", definition)
+            expected = self.execute(
+                "SELECT '50000' AS run_id, lower(hex(MD5('50000'))) AS trace_id"
+            )
+            self.assertEqual(
+                self.execute(
+                    f"SELECT run_id, trace_id FROM {table} WHERE service_name = 'agent' "
+                    "AND trace_id = lower(hex(MD5('50000'))) GROUP BY run_id, trace_id "
+                    "SETTINGS max_rows_to_read = 10000"
+                ),
+                expected,
+            )
+        finally:
+            self.execute("DROP DATABASE " + database + " SYNC")

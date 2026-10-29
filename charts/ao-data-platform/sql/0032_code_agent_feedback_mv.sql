@@ -1,11 +1,12 @@
--- JSONExtract functions return defaults for wrong types. An invalid feedback
--- span cannot reject the ordinary spans in the same inserted block.
+-- Invalid feedback never rejects ordinary spans in the same inserted block.
+-- Keep this query identical to 0036_code_agent_feedback_collector_categories.sql.
 CREATE MATERIALIZED VIEW IF NOT EXISTS otel_traces.code_agent_feedback_mv ON CLUSTER '{cluster}'
 TO otel_traces.agent_feedback
 DEFINER = schema_owner SQL SECURITY DEFINER
 AS WITH
-    toString(SpanAttributes) AS attrs,
-    JSONExtractString(attrs, 'gen_ai', 'evaluation', 'name') AS evaluation_name,
+    ifNull(dynamicElement(SpanAttributes.gen_ai.evaluation.name, 'String'), '') AS evaluation_name,
+    -- Guard the value before serialization; WHERE evaluation order is not a gate.
+    toString(if(evaluation_name = 'user_feedback', SpanAttributes, CAST('{}' AS JSON))) AS attrs,
     JSONExtractString(attrs, 'gen_ai', 'evaluation', 'score', 'label') AS label,
     JSONHas(attrs, 'gen_ai', 'evaluation', 'score', 'label') AS has_label,
     JSONExtractString(attrs, 'montecarlo', 'feedback', 'trace_id') AS rated_trace_id,
@@ -23,7 +24,13 @@ SELECT
     label != 'none'
         AND JSONType(attrs, 'gen_ai', 'evaluation', 'explanation') = 'String'
         AND JSONExtractString(attrs, 'gen_ai', 'evaluation', 'explanation') != '' AS has_comment,
-    if(label = 'none', [], JSONExtract(attrs, 'montecarlo', 'feedback', 'categories', 'Array(String)')) AS categories,
+    if(label = 'none', [], arraySlice(arrayFilter(category -> length(category) <= 128, multiIf(
+        JSONType(attrs, 'montecarlo', 'feedback', 'categories') = 'Array',
+            JSONExtract(attrs, 'montecarlo', 'feedback', 'categories', 'Array(String)'),
+        JSONType(attrs, 'montecarlo', 'feedback', 'categories') = 'String',
+            JSONExtract(JSONExtractString(attrs, 'montecarlo', 'feedback', 'categories'), 'Array(String)'),
+        []
+    )), 1, 20)) AS categories,
     toDateTime64(Timestamp, 6) AS submitted_at,
     now64(6) AS collected_at,
     'code' AS source,
