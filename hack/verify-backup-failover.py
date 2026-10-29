@@ -41,7 +41,7 @@ def catalog(api, where):
     check(len({r["name"] for r in rows}) == len(rows), "Duplicate catalog names.")
     return {r["name"]: r for r in rows}
 def actions(api):
-    # v2.8.1 /backup/status shows only the last action; /actions shows all history.
+    # /backup/status shows only the last action; /actions shows all history.
     rows = api.request("GET", "/backup/actions")
     check(isinstance(rows, list) and all(isinstance(r, dict)
               and isinstance(r.get("command"), str) and r["command"].strip() and r.get("status") in
@@ -52,15 +52,15 @@ def actions(api):
     history = []
     for row in mutations:
         identifier = row.get("operation_id", "")
-        local_delete = re.fullmatch(r"delete local ao-otel-(?:full|incremental)-\d{8}T\d{6}Z-[0-9a-f]{8}",
-                                    row["command"])
-        if local_delete:
-            # v2.8.1 records synchronous deletion without an operation ID.
+        scheduled_delete = re.fullmatch(r"delete (?:local|remote) ao-otel-(?:full|incremental)-\d{8}T\d{6}Z-[0-9a-f]{8}",
+                                        row["command"])
+        if scheduled_delete:
+            # The stock server records synchronous deletion without an operation ID.
             # Keep its completed record in comparisons; never ignore deletion.
             check(row["status"] == "success" and all(isinstance(row.get(key), str) and row[key]
                   for key in ("start", "finish")),
-                  "A local deletion is incomplete or unreadable; stop and inspect it.")
-        check(isinstance(identifier, str) and (identifier or local_delete),
+                  "A deletion is incomplete or unreadable; stop and inspect it.")
+        check(isinstance(identifier, str) and (identifier or scheduled_delete),
               "An operation ID is missing; action history cannot be verified.")
         history.append((identifier, row["command"], row.get("start", ""), row["status"], row.get("finish", "")))
     check(len(history) == len(set(history)), "Duplicate action history cannot be verified.")
