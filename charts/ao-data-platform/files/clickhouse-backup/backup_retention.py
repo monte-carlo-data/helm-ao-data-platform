@@ -12,7 +12,8 @@ import json
 import math
 import time
 
-from backup_common import BackupError, CleanupStopped, REQUEST_TIMEOUT_SECONDS, SCHEDULED_NAME
+from backup_common import (BackupError, CleanupStopped, RequestNotSent, REQUEST_TIMEOUT_SECONDS,
+                           RevisionError, RevisionCheckUnavailable, SCHEDULED_NAME)
 from cleanup_backups import (READ_PATHS, catalog, local_record_warnings,
                              plan as validate_remote, scheduled_time)
 
@@ -129,7 +130,7 @@ class RemoteCleaner:
     def request(self, index, method, path):
         remaining = self.deadline - self.clock()
         if remaining <= REQUEST_TIMEOUT_SECONDS + getattr(self.apis[index], "guard_timeout_seconds", 0):
-            raise RetentionTimeLimit("Cleanup time limit reached; no further deletion was sent.")
+            raise RetentionTimeLimit("Cleanup time limit reached before the next request.")
         if method == "GET" and path in READ_PATHS | {"/backup/version"}:
             return self.apis[index].request(method, path)
         pieces = path.split("/")
@@ -151,12 +152,22 @@ class RemoteCleaner:
         self.pending = None
         event = {"copy": index, "location": pieces[3], "name": pieces[4]}
         print("Backup cleanup: " + json.dumps({"event": "delete_requested", **event}, sort_keys=True), flush=True)
-        self.unverified = {**event, "response_status": "unknown"}
         try:
-            return self.apis[index].request(method, path, request_timeout=300)
+            rows = self.apis[index].request(method, path, request_timeout=300)
+        except (RequestNotSent, RevisionError, RevisionCheckUnavailable):
+            print("Backup cleanup: " + json.dumps(
+                {"event": "delete_not_sent", **event}, sort_keys=True), flush=True)
+            raise
         except BackupError:
+            self.unverified = {**event, "response_status": "unknown"}
             raise BackupError("Deletion was not confirmed and may still be running; "
                               "no retry or further deletion was sent.") from None
+        except Exception:
+            # An unexpected transport error does not prove the request stayed local.
+            self.unverified = {**event, "response_status": "unknown"}
+            raise
+        self.unverified = {**event, "response_status": "unknown"}
+        return rows
 
     def idle(self):
         for index in range(len(self.apis)):

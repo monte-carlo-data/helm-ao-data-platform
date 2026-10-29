@@ -9,39 +9,18 @@ This page covers `clickhouse.backup.cleanup`, the S3 preview and whole-set delet
 separate [database-disk record cleanup](backup-local-cleanup.md) option can
 remove older local records while preserving their completed S3 backups.
 
-```yaml
-clickhouse:
-  backup:
-    cleanup:
-      enabled: true
-      dryRun: true
-      keepLast: 2
-      keepDays: 0
-      timeoutSeconds: 1800
-```
+`daily-weekly` is the default policy. Preview and deletion use the same list
+of complete sets. Review that preview first, then change only `dryRun` to
+`false` to permit deletion with the verified Altinity 2.8.2 image. Preview is
+recommended, not an enforced approval step.
 
-## Existing count-and-age preview
-
-The preview keeps the newest `keepLast` individual backups, plus every older
-backup they require. `keepDays` also keeps backups inside the last N days and
-their bases; zero disables that age window. For a 30-day window, set
-`keepDays: 30`. Extra or missed runs do not shorten that window.
-
-For example, with an old full/incremental pair and a new full, `keepLast: 2`
-keeps all three: the old incremental still needs the old full. After a new
-incremental completes, the old pair becomes eligible. The report lists the old
-incremental before its full backup under `delete`; it does not remove either.
-Unrelated remote backups and any bases they use are always preserved.
-
-The defaults (`keepLast: 2`, `keepDays: 0`) keep two individual backups and their
-required bases, not two days. From the second successful run of a new UTC day,
-the previous day's chain can appear under `delete` unless another kept backup
-still needs it. Use `keepDays: 30` for a 30-day production window.
-
-`retentionPolicy: count-and-age` preserves this existing preview behavior.
-Actual deletion requires `retentionPolicy: daily-weekly`, `dryRun: false`, and
-the verified Altinity 2.8.2 image. A preview is recommended but is not an enforced
-approval step: selecting deletion permits it on the next successful backup.
+This replaces the earlier plan to execute the count-and-age preview's `delete`
+list. Count-and-age is still available only as an explicit preview setting;
+its report does **not** show what daily-weekly deletion will remove. Existing
+installs without an explicit policy will see a different preview after this
+upgrade, but no deletion is enabled automatically. If an installation tool
+supplies `count-and-age` explicitly, first change it to `daily-weekly` while
+keeping `dryRun: true`, review the new report, then enable deletion separately.
 
 ## Keep recent daily sets and older weekly sets
 
@@ -81,6 +60,20 @@ These rules do not change daily full backups or four-hour incrementals. Broken
 local records stop this policy because their missing metadata could hide a
 needed base. An unavailable copy also stops cleanup.
 
+## Existing count-and-age preview
+
+Set `retentionPolicy: count-and-age` explicitly to keep the previous preview.
+It keeps the newest `keepLast` individual backups and their required bases.
+`keepDays` also keeps every backup inside the last N days and its bases; zero
+disables that age window. For example, `keepDays: 30` previews keeping every
+backup for that entire window, unlike daily-weekly's fewer older recovery
+points. The old defaults (`keepLast: 2`, `keepDays: 0`) keep two backups and their
+bases, not two days.
+
+This policy cannot delete files. To prepare deletion, switch to a daily-weekly
+preview and inspect that report. Do not use a count-and-age report to approve
+a daily-weekly deletion.
+
 ## Enable S3 deletion
 
 First test with disposable backups and restore one that the preview keeps.
@@ -96,7 +89,11 @@ For each expired backup, dependent incrementals come before their full backup:
    still exists. Records already removed by local cleanup are expected.
 3. Confirm those records are absent, then ask the backup software to remove
    the S3 backup. A remote deletion from a copy with matching local records can
-   otherwise leave native data behind, even with the fixed software.
+   otherwise leave native data behind, even with the fixed software. If the
+   run stops after removing local records, the completed S3 backup remains
+   intact for recovery and the next cleanup run. Removing S3 first would
+   instead leave local-only records that keep their base set and need manual
+   cleanup. This is why the local-first order is intentional.
 4. Check the lists again before attempting another removal. Never force a
    dependency check or retry a request whose result is uncertain.
 
@@ -127,7 +124,7 @@ schedule, an older report is normally removed after about 12 hours. Collect
 these logs elsewhere if you need a longer history.
 
 A completed preview writes a summary followed by one line per entry. For
-example, this report keeps a full backup and its incremental, and proposes
+example, this count-and-age report keeps a full backup and its incremental, and proposes
 removing one older full backup:
 
 ```text
@@ -145,7 +142,9 @@ or key order; those may change.
 counts those candidates. In deletion mode, `deleted` and `deleted_count` record
 only S3 removals whose follow-up checks completed. `deleted_count` is zero in
 preview mode. Per-operation events record local and remote deletion attempts
-and verified removals. `delete_requested` is written only after the time check
+and verified removals. If a password check or connection failure proves a request
+was never sent, `delete_not_sent` records that outcome; it is not listed as an
+unverified deletion. `delete_requested` is written only after the time check
 allows a request to be sent.
 
 If a later deletion or check fails, the report keeps every earlier verified S3
@@ -196,14 +195,29 @@ the 630-second request allowance, so more than 850 seconds must remain before
 starting a deletion. Earlier checks also use the cleanup budget, so configure
 more time than this reserve; the default is 1800 seconds.
 
+| ClickHouse copies | Seconds that must remain before each deletion |
+| --- | ---: |
+| 1 | more than 540 |
+| 2 | more than 850 |
+| 3 | more than 1260 |
+| 4 | more than 1770 |
+| 5 | more than 2380 |
+
+The formula including password checks is `300 + (5*N + 1)*30 + (5*N + 1)*10*N`,
+where `N` is the copy count. With four copies, 1800 seconds leaves little time
+for the earlier checks; with five or more it cannot start any deletion. Increase
+`cleanup.timeoutSeconds` above the reserve plus the time observed for those
+checks. Otherwise repeated green Jobs can leave the entire backlog untouched.
+
 If too little time remains to start another deletion, cleanup sends no further
-deletion and reports `completed: false` with `stop_reason: time_limit`. This is
-an expected pause, and a large backlog may take several scheduled runs. The
-60-second minimum for `cleanup.timeoutSeconds` remains available for previews;
-a deletion run with that budget pauses without starting a deletion. A request
-timeout or unfinished checks after a deletion still need investigation, as
-described above. If the initial reads fail before a removal plan exists, only
-the stop message is available; no deletion has been sent.
+deletion and reports `completed: false` with `stop_reason: time_limit`. A large
+backlog can take several runs, but repeated runs with zero verified removals
+need a longer budget, not just more waiting. The first daily-weekly preview
+read needs more than `30 + 10*N` seconds; a 60-second budget is usable only with
+one or two copies and is not enough to guarantee a full preview. No deletion
+is attempted in a preview. A request timeout or unfinished checks after deletion
+still need investigation. If initial reads fail before a plan exists, only the
+stop message is available and no deletion has been sent.
 
 The Job deadline is `schedule.timeoutSeconds + cleanup.timeoutSeconds + 60`,
 plus `localCleanup.timeoutSeconds` when database-disk cleanup is also enabled.
@@ -230,7 +244,8 @@ The daily-weekly policy stops on broken local metadata and protects local-only d
   removal of a remote catalog entry. They are safe to leave while you inspect
   the interrupted work, but they keep using local pointer space and may still
   refer to native S3 data. They are not remote backups or deletion candidates.
-  This chart has no supported cleanup procedure for these entries.
+  See the interrupted-upload procedure below before deciding whether to keep
+  or remove a readable entry.
 
 A separate warning reports these files on each run until the entries change.
 An entry can appear in both lists. In that case, follow the `local_only`
@@ -246,13 +261,12 @@ scheduled work and wait for any backup, restore, or deletion to finish before
 repairing backup files or restarting a backup container.
 
 - **An incomplete remote backup.** Upload writes table files before the top-level
-  `metadata.json`, so an interrupted upload can leave an entry described as
-  `broken (can't stat metadata.json)`. Check the failed upload and the local
-  backup on the copy that created it. Confirm the remote metadata is incomplete,
-  rather than temporarily unreadable because S3 access failed. Completing or
-  repairing the upload can restore a valid remote entry. Do not remove the catalog entry as a shortcut: that can leave native files
-  without the information needed to clean them up. Investigate or complete the
-  interrupted upload before selecting a healthy backup for automatic cleanup.
+  `metadata.json`, so an interrupted upload can leave `broken (can't stat
+  metadata.json)`. Confirm this is incomplete metadata rather than failed S3
+  access. Keep the complete local record on the copy that created the backup.
+  See [recover an interrupted upload](#recover-an-interrupted-upload) for
+  resuming it or deliberately abandoning it. Both local and S3 cleanup stop
+  until the incomplete remote entry is repaired or removed.
 - **A failed or cancelled deletion in API history.** The preview stops while
   any copy's history contains a failed or cancelled `delete` command, even
   if a later attempt succeeded. Inspect the affected backup and any partial
@@ -269,6 +283,61 @@ repairing backup files or restarting a backup container.
 
 After addressing the cause, check the next preview's logs. Job success alone
 does not show that the preview recovered.
+
+## Recover an interrupted upload
+
+Pause the schedule and wait for operations to finish on every copy first. Check
+that the incomplete remote entry belongs to the failed upload and that the copy
+which created it still has a complete, readable local record. Do not clear that
+record: it describes the native objects and, for an incremental, its required
+base. Check that the base is complete and retained before resuming.
+
+Use the authenticated backup API on the creating copy to resume the upload:
+
+```text
+POST /backup/upload/<backup-name>?resume=true
+```
+
+The equivalent command with a working CLI configuration is:
+
+```sh
+clickhouse-backup --config <configuration-file> upload --resume <backup-name>
+```
+
+A plain `upload` refuses an existing remote entry. In Altinity 2.8.2 the per-request
+resume flag works for this upload even with `use_resumable_state: false`. The CLI
+help says resume is ignored for embedded backups, but that statement does not
+match this upload path. The upload uses the local record's base, and finishes
+the remote `.backup` and `metadata.json` files. Wait for the operation to succeed,
+then check every copy's remote list: the entry must be complete, and an
+incremental must still name the same required backup. Run a new preview before
+allowing automatic removal again.
+
+If the backup must instead be abandoned, first confirm that no retained backup
+needs it and record its exact name and creating copy. With its complete local
+record still present, use that copy's stock `delete remote <backup-name>` command
+(or `POST /backup/delete/remote/<backup-name>`). For an incomplete remote entry,
+this removes the broken catalog without removing native data. Confirm the
+remote entry is absent. The local record is now `local_only`: it consumes disk
+space and, for an incremental, keeps its base's entire set out of automatic
+cleanup until the record is removed.
+
+To finish that deliberate abandonment, use `delete local <backup-name>` on the
+creating copy (or `POST /backup/delete/local/<backup-name>`). That record's
+pointers allow the stock tool to remove the abandoned native objects once the
+remote entry is gone. Check both lists and the expected S3 files afterward.
+Do not use force deletion or remove directories by hand. If the creating copy's
+local record is missing or broken, stop and investigate instead: deleting the
+remote catalog can then leave native files without the records needed to
+remove them. A failed deletion history entry must also be investigated and
+cleared as described above before cleanup can continue.
+
+The disposable Docker tests remove the final catalog files to reproduce an
+incomplete upload. With stock 2.8.2, resuming full and incremental uploads
+recreates those files, preserves the required base and native objects, and
+allows both backups to be restored on a separate copy. The abandonment test
+also checks that remote deletion leaves native data alone, then local deletion
+removes the abandoned incremental's objects without changing its full base.
 
 ## Native files and saved S3 versions
 

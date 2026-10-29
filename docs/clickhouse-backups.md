@@ -86,7 +86,7 @@ Create these before setting `clickhouse.backup.enabled: true`:
   will fail. If restricting `ListBucket` by prefix, allow both subdirectories.
 - For SSE-KMS encryption, `kms:GenerateDataKey` and `kms:Decrypt` on the bucket's
   encryption key, with a key policy that permits the role to use it.
-- No lifecycle expiration, including noncurrent-version expiration, covering
+- No lifecycle expiration of current object versions covering
   `<path>/native/` or `<path>/catalog/`. The chart cannot inspect or change bucket
   lifecycle rules; removing older files can break newer incremental backups.
 - Separate database backup and freshness-probe passwords in your external secret
@@ -280,8 +280,9 @@ requires exactly two replicas and an idle, unsuspended CronJob with schedule
 
 ## Optional retention previews (5.3.0+)
 
-Enable `clickhouse.backup.cleanup.enabled` to report which older backups fall
-outside `keepLast` and `keepDays` after each verified backup. It is disabled by
+Enable `clickhouse.backup.cleanup.enabled` with explicit
+`cleanup.retentionPolicy: count-and-age` to preview backups outside
+`keepLast` and `keepDays` after each verified backup. It is disabled by
 default. The report preserves every required base and unrelated remote backup.
 Every configured copy must be available and report matching remote catalogs;
 single-copy clusters are supported too. Known incomplete
@@ -296,8 +297,8 @@ for both backup and cleanup before the next scheduled run.
 
 ## Optional S3 deletion (5.8.0+)
 
-`cleanup.retentionPolicy: daily-weekly` selects complete full-backup/incremental
-sets. The default windows keep daily sets from the latest seven UTC dates and
+`cleanup.retentionPolicy: daily-weekly` is the new chart default and selects
+complete full-backup/incremental sets for both preview and deletion. The default windows keep daily sets from the latest seven UTC dates and
 one available day per older UTC week through thirty dates. Start with
 `cleanup.dryRun: true`. Explicitly setting it to `false` permits deletion after
 a verified backup. Every copy must run the verified Altinity 2.8.2 image.

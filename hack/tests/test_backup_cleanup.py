@@ -452,7 +452,8 @@ class PreviewTests(unittest.TestCase):
 class MainCleanupTests(unittest.TestCase):
     def run_main(self, world, **settings):
         output, errors = io.StringIO(), io.StringIO()
-        env = dict(BACKUP_CLEANUP_ENABLED="true", BACKUP_KEEP_LAST="1", BACKUP_KEEP_DAYS="3")
+        env = dict(BACKUP_CLEANUP_ENABLED="true", BACKUP_KEEP_LAST="1", BACKUP_KEEP_DAYS="3",
+                   BACKUP_RETENTION_POLICY="count-and-age")
         env.update(settings)
         with mock.patch.dict(os.environ, env, clear=True), \
                 mock.patch.dict(sys.modules, {"cleanup_backups": cleanup}), \
@@ -549,7 +550,7 @@ with mock.patch("urllib.request.build_opener", return_value=transport), \
         env = dict(os.environ, PYTHONPATH=os.pathsep.join([str(Path(__file__).parent), str(DIRECTORY)]),
                    POD_NAMESPACE="test",
                    BACKUP_PASSWORD_REVISION="one", BACKUP_CLEANUP_ENABLED="true",
-                   BACKUP_CLEANUP_DRY_RUN="true", BACKUP_KEEP_DAYS="3")
+                   BACKUP_CLEANUP_DRY_RUN="true", BACKUP_KEEP_DAYS="3", BACKUP_RETENTION_POLICY="count-and-age")
         for copies in (1, 2, 3):
             for keep_last in ("1", "0"):
                 with self.subTest(copies=copies, keep_last=keep_last):
@@ -607,7 +608,7 @@ class EntryPointTransport:
 class CleanupChartTests(unittest.TestCase):
     def test_cleanup_is_explicit_dry_run_and_shares_backup_job(self):
         from test_backup_chart import render, one
-        docs = render("clickhouse.backup.cleanup.enabled=true", "clickhouse.backup.cleanup.keepLast=3",
+        docs = render("clickhouse.backup.cleanup.enabled=true", "clickhouse.backup.cleanup.retentionPolicy=count-and-age", "clickhouse.backup.cleanup.keepLast=3",
                       "clickhouse.backup.cleanup.keepDays=7", "clickhouse.backup.cleanup.timeoutSeconds=900")
         self.assertEqual(len([doc for doc in docs if doc["kind"] == "CronJob"]), 1)
         job = one(docs, "CronJob", "otel-backup")["spec"]["jobTemplate"]["spec"]
@@ -632,11 +633,11 @@ class CleanupChartTests(unittest.TestCase):
                           f"cleanup.{key} must be an integer >= {minimum}") for value in invalid)
         for setting, message in cases:
             with self.subTest(setting=setting), self.assertRaisesRegex(AssertionError, message):
-                render("clickhouse.backup.cleanup.enabled=true", setting)
+                render("clickhouse.backup.cleanup.enabled=true", "clickhouse.backup.cleanup.retentionPolicy=count-and-age", setting)
 
     def test_minimum_integer_settings_render(self):
         from test_backup_chart import render, one
-        docs = render("clickhouse.backup.cleanup.enabled=true", "clickhouse.backup.cleanup.keepLast=1",
+        docs = render("clickhouse.backup.cleanup.enabled=true", "clickhouse.backup.cleanup.retentionPolicy=count-and-age", "clickhouse.backup.cleanup.keepLast=1",
                       "clickhouse.backup.cleanup.keepDays=0", "clickhouse.backup.cleanup.timeoutSeconds=60")
         deadline = one(docs, "CronJob", "otel-backup")["spec"]["jobTemplate"]["spec"]["activeDeadlineSeconds"]
         self.assertEqual(deadline, 10800 + 60 + 60)
@@ -646,7 +647,7 @@ class CleanupChartTests(unittest.TestCase):
         for value in ("false", "not-boolean", "1"):
             with self.subTest(value=value), self.assertRaisesRegex(
                     AssertionError, "count-and-age supports preview only|dryRun must be a boolean"):
-                render("clickhouse.backup.cleanup.enabled=true", "clickhouse.backup.cleanup.dryRun=" + value)
+                render("clickhouse.backup.cleanup.enabled=true", "clickhouse.backup.cleanup.retentionPolicy=count-and-age", "clickhouse.backup.cleanup.dryRun=" + value)
 
     def test_cleanup_enabled_requires_a_boolean(self):
         from test_backup_chart import CHART, HELM

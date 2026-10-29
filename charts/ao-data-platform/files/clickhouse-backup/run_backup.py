@@ -28,6 +28,7 @@ import urllib.request
 
 
 from backup_common import (BackupError, CleanupStopped, DELETION_UNAVAILABLE, REQUEST_TIMEOUT_SECONDS,
+                           RequestNotSent, RevisionError, RevisionCheckUnavailable,
                            SCHEDULED_NAME, broken_local_entry, scheduled_name)
 
 
@@ -44,20 +45,8 @@ SETTINGS output_format_json_quote_64bit_integers = 0
 FORMAT JSONEachRow"""
 
 
-class RevisionError(BackupError):
-    """A password rotation must stop the whole Job, rather than trigger failover."""
-
-
-class RevisionCheckUnavailable(BackupError):
-    """Credentials must not be sent until the revision can be checked again."""
-
-
 class AuthenticationError(BackupError):
     """The backup server rejected a credential; do not send it again."""
-
-
-class RequestNotSent(BackupError):
-    """The request was refused locally or could not establish a connection."""
 
 
 class ReadUnavailable(BackupError):
@@ -538,7 +527,7 @@ def remote_cleanup_options(validate_numbers=True):
     if enabled == "false":
         return None
     dry_run = os.environ.get("BACKUP_CLEANUP_DRY_RUN", "true")
-    policy = os.environ.get("BACKUP_RETENTION_POLICY", "count-and-age")
+    policy = os.environ.get("BACKUP_RETENTION_POLICY", "daily-weekly")
     if dry_run not in ("true", "false"):
         raise BackupError("S3 cleanup dry-run must be true or false.")
     if policy not in ("count-and-age", "daily-weekly"):

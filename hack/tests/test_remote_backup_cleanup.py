@@ -6,6 +6,7 @@ import io
 from pathlib import Path
 import sys
 import unittest
+from unittest import mock
 
 DIRECTORY = Path(__file__).resolve().parents[2] / "charts/ao-data-platform/files/clickhouse-backup"
 sys.path.insert(0, str(DIRECTORY))
@@ -235,6 +236,27 @@ class ExecutionTests(unittest.TestCase):
                 self.assertTrue(all(call[3] == {"request_timeout": 300} for call in world.writes()))
                 self.assertEqual(world.output.getvalue().count('"event": "delete_requested"'),
                                  len(world.writes()))
+
+    def test_request_refused_before_sending_is_not_reported_as_running(self):
+        from run_backup import RequestNotSent, RevisionError, RevisionCheckUnavailable
+        for error in (RequestNotSent("connection refused; no request was sent"),
+                      RevisionError("password changed; no request was sent"),
+                      RevisionCheckUnavailable("password check unavailable; no request was sent")):
+            world = World()
+            original = world.apis[0].request
+            def refused(method, path, **options):
+                if method == "POST":
+                    raise error
+                return original(method, path, **options)
+            with self.subTest(error=type(error).__name__), \
+                    mock.patch.object(world.apis[0], "request", side_effect=refused), \
+                    self.assertRaises(retention.CleanupStopped) as caught:
+                world.run()
+            self.assertEqual(caught.exception.result["unverified_deletions"], [])
+            self.assertIn("no request was sent", str(caught.exception))
+            self.assertNotIn("may still be running", str(caught.exception))
+            self.assertEqual(world.writes(), [])
+            self.assertIn('"event": "delete_not_sent"', world.output.getvalue())
 
     def test_deletion_also_reserves_request_guard_time(self):
         for timeout, completed in ((850, False), (851, True)):

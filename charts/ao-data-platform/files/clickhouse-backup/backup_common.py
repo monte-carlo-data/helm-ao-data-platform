@@ -14,6 +14,18 @@ class BackupError(Exception):
     """A safe-to-log failure message, without server bodies or credentials."""
 
 
+class RequestNotSent(BackupError):
+    """The request was refused locally or could not establish a connection."""
+
+
+class RevisionError(BackupError):
+    """A password rotation stops the Job before sending another request."""
+
+
+class RevisionCheckUnavailable(BackupError):
+    """Credentials must not be sent before the revision can be checked."""
+
+
 class CleanupStopped(BackupError):
     """Preserve verified removals and any deletion still needing confirmation."""
 

@@ -469,7 +469,8 @@ class BackupChartTests(unittest.TestCase):
             render("clickhouse.backup.localCleanup.enabled=true", backup=False)
         with self.assertRaisesRegex(AssertionError, "count-and-age supports preview only"):
             render("clickhouse.backup.localCleanup.enabled=true", "clickhouse.backup.localCleanup.dryRun=false",
-                   "clickhouse.backup.cleanup.enabled=true", "clickhouse.backup.cleanup.dryRun=false")
+                   "clickhouse.backup.cleanup.enabled=true", "clickhouse.backup.cleanup.dryRun=false",
+                   "clickhouse.backup.cleanup.retentionPolicy=count-and-age")
 
     def test_both_cleanup_timeouts_are_included_in_job_and_notes(self):
         docs = render("clickhouse.backup.localCleanup.enabled=true", "clickhouse.backup.cleanup.enabled=true")
@@ -484,10 +485,9 @@ class BackupChartTests(unittest.TestCase):
         self.assertIn("WARNING:", notes)
         self.assertIn("1800 seconds for local backup cleanup", notes)
 
-    def test_daily_weekly_cleanup_is_explicit_and_wires_complete_settings(self):
+    def test_daily_weekly_cleanup_is_default_and_wires_complete_settings(self):
         for dry_run in (True, False):
             docs = render("clickhouse.backup.cleanup.enabled=true",
-                          "clickhouse.backup.cleanup.retentionPolicy=daily-weekly",
                           "clickhouse.backup.cleanup.dailyDays=8",
                           "clickhouse.backup.cleanup.historyDays=35",
                           "clickhouse.backup.cleanup.dryRun=" + str(dry_run).lower())

@@ -126,6 +126,10 @@ cleanup.
 
 ## When cleanup stays stopped
 
+An incomplete remote upload stops local cleanup too, even when S3 cleanup
+is disabled. See [recover an interrupted upload](backup-cleanup.md#recover-an-interrupted-upload)
+before clearing its local records or remote entry.
+
 First pause the schedule with `clickhouse.backup.schedule.suspend: true` and
 wait for any backup, restore, download, or deletion to finish on every copy.
 Pausing the schedule does not cancel an existing Job or server operation.

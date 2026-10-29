@@ -1049,8 +1049,6 @@ class APITests(unittest.TestCase):
             self.assertEqual(api.call_args_list[0].kwargs["guard_timeout_seconds"], 10)
             self.assertEqual(api.call_args_list[1].kwargs["guard_timeout_seconds"], 10)
             self.assertFalse(api.call_args_list[1].kwargs["backup_api"])
-            self.assertEqual(api.call_args_list[0].kwargs["guard_timeout_seconds"], 10)
-            self.assertEqual(api.call_args_list[1].kwargs["guard_timeout_seconds"], 10)
             self.assertEqual(read.call_args_list, [mock.call(Path(path)) for path in passwords])
             copy_guard = api.call_args_list[0].kwargs["guard"]
             self.assertIs(copy_guard, api.call_args_list[1].kwargs["guard"])
@@ -1135,7 +1133,8 @@ class APITests(unittest.TestCase):
 
     def test_cleanup_deletion_is_rejected_before_any_backup_request(self):
         for value in ("false", "invalid", ""):
-            settings = dict(self.settings, BACKUP_CLEANUP_ENABLED="true", BACKUP_CLEANUP_DRY_RUN=value)
+            settings = dict(self.settings, BACKUP_CLEANUP_ENABLED="true", BACKUP_CLEANUP_DRY_RUN=value,
+                            BACKUP_RETENTION_POLICY="count-and-age")
             errors = io.StringIO()
             with self.subTest(value=value), mock.patch.dict(backup.os.environ, settings, clear=True), \
                     mock.patch.object(backup, "configured_clients") as clients, \
@@ -1157,6 +1156,27 @@ class APITests(unittest.TestCase):
                     mock.patch.object(backup, "configured_clients") as clients, redirect_stderr(io.StringIO()):
                 self.assertEqual(backup.main(), 1)
             clients.assert_not_called()
+
+    def test_daily_weekly_preview_uses_the_same_policy_options_as_deletion(self):
+        for explicit in (False, True):
+            remote = mock.Mock()
+            remote.Cleaner.return_value.run.return_value = {
+                "mode": "dry-run", "retention_policy": "daily-weekly", "daily_days": 8,
+                "history_days": 35, "kept": [FULL], "delete": [], "deleted": [],
+                "broken_local": [], "local_only": []}
+            settings = dict(self.settings, BACKUP_CLEANUP_ENABLED="true", BACKUP_CLEANUP_DRY_RUN="true",
+                            BACKUP_DAILY_DAYS="8", BACKUP_HISTORY_DAYS="35")
+            if explicit:
+                settings["BACKUP_RETENTION_POLICY"] = "daily-weekly"
+            with self.subTest(explicit=explicit), mock.patch.dict(backup.os.environ, settings, clear=True), \
+                    mock.patch.dict("sys.modules", {"cleanup_backups": remote}), \
+                    mock.patch.object(backup, "configured_clients", return_value=([mock.Mock()], [mock.Mock()])), \
+                    mock.patch.object(backup.Scheduler, "run", return_value=FULL), \
+                    redirect_stdout(io.StringIO()):
+                self.assertEqual(backup.main(), 0)
+            remote.Cleaner.assert_called_once_with(mock.ANY, keep_last=2, keep_days=0, timeout=1800,
+                                                  retention_policy="daily-weekly", daily_days=8, history_days=35)
+            remote.Cleaner.return_value.run.assert_called_once_with(latest_backup=FULL, execute=False)
 
     def test_daily_weekly_deletion_follows_successful_backup_and_local_cleanup(self):
         events = []

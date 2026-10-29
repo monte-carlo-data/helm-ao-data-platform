@@ -91,12 +91,12 @@ clickhouse:
       enabled: false
       # Review a preview first. Deletion requires daily-weekly and the 2.8.2 image.
       dryRun: true
-      # Keep the existing preview policy unless whole-set retention is selected.
-      retentionPolicy: count-and-age
+      # Preview the same complete sets that deletion will remove.
+      retentionPolicy: daily-weekly
       # count-and-age preview settings:
       keepLast: 2
       # Also keep every backup from the last N days, plus their bases.
-      # 0 disables the age window so only keepLast applies. Use 30 for real data.
+      # 0 disables the age window so only keepLast applies.
       keepDays: 0
       # daily-weekly settings: every recent UTC day, then one day's complete
       # sets per older Monday-Sunday week, within historyDays including today.
