@@ -97,9 +97,9 @@ spec:
               # is the source of truth and keeps existing tables in sync on upgrade.
               # Scope covers spans telemetry plus its derived annotations — the
               # conversations source (conversations_normalized), the conversation
-              # and span eval scores, the cluster assignments, and the trajectory
-              # trigger ledger — all designed
-              # to age out in lockstep with the telemetry they annotate.
+              # and span eval scores, the cluster assignments, the trajectory
+              # trigger ledger, and the agent feedback with its turn links — all
+              # designed to age out in lockstep with the telemetry they annotate.
               # Excluded: the llm_* tables are LLM-worker queue state, not telemetry,
               # and keep their own fixed TTL (sql/0008–0010). llm_worker_info and
               # conversation_rollup_watermarks are current-state control metadata
@@ -113,6 +113,8 @@ spec:
               modify_ttl otel_traces.span_eval_scores "scored_at + toIntervalDay({{ .Values.clickhouse.ttlDays }})"
               modify_ttl otel_traces.conversation_cluster_assignments "classified_at + toIntervalDay({{ .Values.clickhouse.ttlDays }})"
               modify_ttl otel_traces.trajectory_trigger_ledger "trigger_start + toIntervalDay({{ .Values.clickhouse.ttlDays }})"
+              modify_ttl otel_traces.agent_feedback "submitted_at + toIntervalDay({{ .Values.clickhouse.ttlDays }})"
+              modify_ttl otel_traces.agent_turn_links "turn_start_time + toIntervalDay({{ .Values.clickhouse.ttlDays }})"
               echo "TTL configuration complete."
               # Cap system log retention at 7 days. CH otherwise grows these
               # tables without bound, which dominates disk over months on small

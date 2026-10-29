@@ -1,8 +1,9 @@
 apiVersion: v2
 name: ao-data-platform
 description: Monte Carlo data platform — ClickHouse, OTel collector, and schema management
-# 5.8.0 adds optional whole-set S3 retention using the stock backup deletion fix.
-version: 5.8.0
+# 5.9.0 adds the agent_feedback and agent_turn_links tables. See README
+# "Upgrading to 5.9.0".
+version: 5.9.0
 type: application
 # minDomains on the ClickHouse/Keeper zone topologySpreadConstraints is GA in
 # Kubernetes 1.30. Declare the floor so a render/install against an older API

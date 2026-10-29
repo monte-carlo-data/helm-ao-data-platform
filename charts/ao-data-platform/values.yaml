@@ -118,7 +118,7 @@ clickhouse:
   # trace-id timestamp index, the normalized spans, the conversation turns
   # (conversations_normalized), and the derived annotations
   # (conversation_eval_scores, span_eval_scores, conversation_cluster_assignments,
-  # trajectory_trigger_ledger).
+  # trajectory_trigger_ledger, agent_feedback, agent_turn_links).
   # The schema job re-applies this on every install and upgrade via
   # `ALTER TABLE … MODIFY TTL`, so changing it here takes effect on existing
   # tables (unlike the system-log TTLs); the SQL files carry the same value as
