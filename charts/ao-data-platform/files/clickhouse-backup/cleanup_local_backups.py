@@ -128,7 +128,7 @@ class LocalCleaner:
 
     def request(self, index, method, path):
         remaining = self.deadline - self.clock()
-        if remaining <= REQUEST_TIMEOUT_SECONDS:
+        if remaining <= REQUEST_TIMEOUT_SECONDS + getattr(self.apis[index], "guard_timeout_seconds", 0):
             raise LocalCleanupTimeLimit("Local cleanup time limit reached; no further deletion was sent.")
         if method == "GET" and path in READ_PATHS:
             return self.apis[index].request(method, path)
@@ -139,7 +139,10 @@ class LocalCleaner:
         # After deletion, snapshot() reads actions twice and both lists on
         # every copy. Reserve each request's full timeout and one extra read
         # timeout for processing before starting an irreversible operation.
-        required = DELETE_TIMEOUT_SECONDS + (4 * len(self.apis) + 1) * REQUEST_TIMEOUT_SECONDS
+        # Every API request first checks the password revision on every Pod.
+        guard_seconds = (getattr(self.apis[index], "guard_timeout_seconds", 0)
+                         + 4 * sum(getattr(api, "guard_timeout_seconds", 0) for api in self.apis))
+        required = DELETE_TIMEOUT_SECONDS + (4 * len(self.apis) + 1) * REQUEST_TIMEOUT_SECONDS + guard_seconds
         if remaining <= required:
             raise LocalCleanupTimeLimit("Not enough cleanup time remains for a deletion and its checks; "
                                         "no further deletion was sent.")

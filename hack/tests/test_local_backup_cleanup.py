@@ -462,6 +462,43 @@ class OperationTests(unittest.TestCase):
                         self.assertTrue(all(call[3] == {"request_timeout": 300}
                                             for call in world.writes()))
 
+    def test_password_checks_are_included_in_read_and_delete_time_limits(self):
+        for copies in (1, 2, 3):
+            guard = 10 * copies
+            required = 300 + (4 * copies + 1) * 30 + (4 * copies + 1) * guard
+            for timeout in (required, required + 1):
+                world = World(copies)
+                for api in world.apis:
+                    api.guard_timeout_seconds = guard
+                with self.subTest(copies=copies, timeout=timeout):
+                    result = world.run(execute=True, timeout=timeout, clock=lambda: 0)
+                    self.assertEqual(result["completed"], timeout > required)
+                    self.assertEqual(len(world.writes()), 2 * copies if timeout > required else 0)
+                    if timeout <= required:
+                        self.assertNotIn("delete_requested", world.output.getvalue())
+            cleaner = cleanup.LocalCleaner(world.apis, timeout=30 + guard, clock=lambda: 0)
+            before = len(world.calls)
+            with self.assertRaises(cleanup.LocalCleanupTimeLimit):
+                cleaner.request(0, "GET", "/backup/actions")
+            self.assertEqual(len(world.calls), before)
+
+    def test_slow_password_checks_still_allow_deletion_verification(self):
+        world = World()
+        for api in world.apis:
+            api.guard_timeout_seconds = 20
+        clock = [0]
+        def advance(index, method, path):
+            clock[0] += 20
+            clock[0] += 299 if method == "POST" else 29
+        world.before_request = advance
+        # Three initial snapshots consume 24 * 49 seconds. Leave enough for
+        # one deletion, all eight follow-up reads, and their password checks.
+        result = world.run(execute=True, timeout=24 * 49 + 751, clock=lambda: clock[0])
+        self.assertFalse(result["completed"])
+        self.assertEqual(result["stop_reason"], "time_limit")
+        self.assertEqual(result["deleted"], [{"copy": 0, "name": AI}])
+        self.assertEqual(len(world.writes()), 1)
+
     def test_limit_reached_immediately_before_delete_has_no_request_log(self):
         world = World()
         # Three snapshots (four reads per copy) have finished. Expire at the
