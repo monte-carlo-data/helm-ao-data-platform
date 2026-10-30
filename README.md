@@ -1140,19 +1140,16 @@ opentelemetry-collector:
 
 The collector's ClickHouse endpoint sets `input_format_try_infer_dates=0` and
 `input_format_try_infer_datetimes=0` on its connections.
-Both settings prevent ClickHouse's JSON text-input parser from changing a string
-run ID based on other agents in the same batch. Feedback sent in a later batch
-then matches every trace under the original ID. Keep both query parameters when
-overriding `opentelemetry-collector.config.exporters.clickhouse.endpoint`. Changing the
+Both settings are required to preserve the original text of date-looking run IDs,
+including when one batch contains spans from different agents. Feedback sent in a
+later batch can then match traces using the original ID. Keep both query parameters
+when overriding `opentelemetry-collector.config.exporters.clickhouse.endpoint`. Changing the
 collector configuration restarts its pods, so the settings apply to new
 connections. Complete that rollout before sending feedback. Changing only a
 ClickHouse user profile does not update already-open collector connections.
 
 For example, a custom TLS endpoint keeps
 `?secure=true&input_format_try_infer_dates=0&input_format_try_infer_datetimes=0`.
-The collector's native JSON writer was also checked with its original settings
-and already preserved the tested strings. These settings make preservation
-explicit and cover JSON text inserts made with the same settings.
 
 This preserves the original text of date-looking strings in all new span,
 resource, event, and link attributes. Numeric attributes and the declared
