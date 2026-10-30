@@ -16,6 +16,7 @@ import unittest
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest import mock
 
 CHART = Path(__file__).resolve().parents[3] / "charts/ao-data-platform"
 SQL_DIR = CHART / "sql"
@@ -43,6 +44,53 @@ RUNTIME_CONFIG = """<clickhouse>
 <default_replica_path>/clickhouse/tables/{uuid}/{shard}</default_replica_path>
 <default_replica_name>{replica}</default_replica_name>
 </clickhouse>"""
+
+
+def wait_for_clickhouse(container):
+    for _ in range(30):
+        try:
+            ready = subprocess.run(
+                [
+                    "docker",
+                    "exec",
+                    container,
+                    "clickhouse-client",
+                    "--query",
+                    "SELECT 1",
+                ],
+                check=False,
+                capture_output=True,
+                timeout=3,
+            )
+            if ready.returncode == 0:
+                return
+        except subprocess.TimeoutExpired:
+            pass
+        time.sleep(1)
+    raise AssertionError("Disposable ClickHouse server did not become ready.")
+
+
+class FeedbackReadinessTests(unittest.TestCase):
+    @mock.patch(__name__ + ".time.sleep")
+    @mock.patch(__name__ + ".subprocess.run")
+    def test_retries_a_timed_out_probe_before_success(self, run, sleep):
+        run.side_effect = [
+            subprocess.TimeoutExpired("clickhouse-client", 3),
+            subprocess.CompletedProcess("clickhouse-client", 0),
+        ]
+        wait_for_clickhouse("test-container")
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_args.kwargs["timeout"], 3)
+        sleep.assert_called_once_with(1)
+
+    @mock.patch(__name__ + ".time.sleep")
+    @mock.patch(__name__ + ".subprocess.run")
+    def test_repeated_timeouts_stop_after_thirty_probes(self, run, sleep):
+        run.side_effect = subprocess.TimeoutExpired("clickhouse-client", 3)
+        with self.assertRaisesRegex(AssertionError, "did not become ready"):
+            wait_for_clickhouse("test-container")
+        self.assertEqual(run.call_count, 30)
+        self.assertEqual(sleep.call_count, 30)
 
 
 class FeedbackDefinitionTests(unittest.TestCase):
@@ -153,25 +201,7 @@ class FeedbackStorageTests(unittest.TestCase):
             text=True,
             timeout=45,
         )
-        for attempt in range(30):
-            ready = subprocess.run(
-                [
-                    "docker",
-                    "exec",
-                    cls.container,
-                    "clickhouse-client",
-                    "--query",
-                    "SELECT 1",
-                ],
-                check=False,
-                capture_output=True,
-                timeout=3,
-            )
-            if ready.returncode == 0:
-                break
-            time.sleep(1)
-        else:
-            raise AssertionError("Disposable ClickHouse server did not become ready.")
+        wait_for_clickhouse(cls.container)
         cls.database = "feedback_test_" + uuid.uuid4().hex
         cls.execute(
             "CREATE USER schema_owner; GRANT ALL ON otel_traces.* TO schema_owner"
@@ -883,14 +913,17 @@ class FeedbackStorageTests(unittest.TestCase):
         finally:
             self.apply([SQL_DIR / "0036_code_agent_feedback_collector_categories.sql"])
 
-    def test_existing_run_mapping_gets_date_shaped_ids_on_upgrade(self):
-        # Earlier installations read only the String variant of a run ID.
+    def test_upgrade_stops_linking_inferred_run_ids(self):
+        # Replace the previous query, which serialized inferred dates as strings.
         self.execute("""
 ALTER TABLE otel_traces.code_agent_run_links_mv MODIFY QUERY
 WITH
-    ifNull(dynamicElement(SpanAttributes.montecarlo.association_properties.run_id, 'String'), '') AS associated_run_id,
     (SpanName != 'user_feedback'
         AND ifNull(dynamicElement(SpanAttributes.gen_ai.evaluation.name, 'String'), '') != 'user_feedback'
+        AND isNotNull(SpanAttributes.montecarlo.association_properties.run_id)) AS has_run_value,
+    toString(if(has_run_value, SpanAttributes.^montecarlo.association_properties, CAST('{}' AS JSON))) AS association_attrs,
+    JSONExtractString(association_attrs, 'run_id') AS associated_run_id,
+    (has_run_value AND JSONType(association_attrs, 'run_id') = 'String'
         AND associated_run_id != '' AND length(associated_run_id) <= 256) AS is_run_span,
     -- Read only Monte Carlo attributes to preserve existing agent-name conversion.
     toString(if(is_run_span, SpanAttributes.^montecarlo, CAST('{}' AS JSON))) AS agent_attrs,
@@ -915,23 +948,8 @@ GROUP BY service_name, run_id, trace_id;
                     self.span({"montecarlo.association_properties.run_id": "before"}),
                 ]
             )
-            # Simulate a JSON text insert with the default inference settings.
-            # Inserts using the collector's settings disable both kinds of inference.
-            self.insert(
-                [
-                    self.span(
-                        {"montecarlo.association_properties.run_id": "2026-10-29"}
-                    ),
-                    self.feedback(**{"montecarlo.feedback.run_id": "2026-10-29"}),
-                ],
-                legacy_inference=True,
-            )
             self.assertEqual(
                 self.select("code_agent_run_links", "run_id"), [{"run_id": "before"}]
-            )
-            self.assertEqual(
-                self.select("agent_feedback", "target_id"),
-                [{"target_id": "2026-10-29"}],
             )
             self.apply([SQL_DIR / "0037_code_agent_run_links_native_filters.sql"])
             self.insert(
@@ -946,10 +964,66 @@ GROUP BY service_name, run_id, trace_id;
             )
             self.assertEqual(
                 self.select("code_agent_run_links", "run_id", "ORDER BY run_id"),
+                [{"run_id": "after"}, {"run_id": "before"}],
+            )
+            self.insert(
+                [self.span({"montecarlo.association_properties.run_id": "2026-10-29"})]
+            )
+            self.assertEqual(
+                self.select("code_agent_run_links", "run_id", "ORDER BY run_id"),
                 [{"run_id": "2026-10-29"}, {"run_id": "after"}, {"run_id": "before"}],
             )
         finally:
             self.apply([SQL_DIR / "0037_code_agent_run_links_native_filters.sql"])
+
+    def test_old_collector_date_cannot_alias_a_new_string_run(self):
+        for original, rewritten in (
+            ("2026-1-5", "2026-01-05"),
+            ("2026-02-30", "2026-03-02"),
+            ("2026-10-29 12:00:00.123456", "2026-10-29 12:00:00.123456000"),
+        ):
+            with self.subTest(original=original):
+                old_trace, new_trace = uuid.uuid4().hex, uuid.uuid4().hex
+                self.insert(
+                    [
+                        self.span(
+                            {"montecarlo.association_properties.run_id": original},
+                            TraceId=old_trace,
+                        )
+                    ],
+                    legacy_inference=True,
+                )
+                raw = self.execute(
+                    "SELECT dynamicType(SpanAttributes.montecarlo.association_properties.run_id) AS kind "
+                    f"FROM otel_traces.otel_traces WHERE TraceId = '{old_trace}'"
+                )
+                self.assertTrue(raw[0]["kind"].startswith("Date"), raw)
+                self.assertEqual(
+                    self.select(
+                        "code_agent_run_links",
+                        "trace_id",
+                        f"AND trace_id = '{old_trace}'",
+                    ),
+                    [],
+                )
+                self.insert(
+                    [
+                        self.span(
+                            {"montecarlo.association_properties.run_id": rewritten},
+                            TraceId=new_trace,
+                        )
+                    ]
+                )
+                self.insert(
+                    [self.feedback(**{"montecarlo.feedback.run_id": rewritten})]
+                )
+                matched = self.execute(
+                    "SELECT DISTINCT l.trace_id FROM otel_traces.agent_feedback AS f "
+                    "INNER JOIN otel_traces.code_agent_run_links AS l "
+                    "ON f.service_name = l.service_name AND f.target_id = l.run_id "
+                    f"WHERE f.service_name = '{self.service}' AND f.target_id = '{rewritten}'"
+                )
+                self.assertEqual(matched, [{"trace_id": new_trace}])
 
     def test_feedback_table_backlog_rejects_insert_and_recovers(self):
         self.execute("SYSTEM STOP MERGES otel_traces.agent_feedback")

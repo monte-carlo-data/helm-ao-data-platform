@@ -3,13 +3,10 @@
 ALTER TABLE otel_traces.code_agent_run_links_mv ON CLUSTER '{cluster}'
 MODIFY QUERY
 WITH
+    -- Inferred dates can turn an opaque ID into a different run's key.
+    ifNull(dynamicElement(SpanAttributes.montecarlo.association_properties.run_id, 'String'), '') AS associated_run_id,
     (SpanName != 'user_feedback'
         AND ifNull(dynamicElement(SpanAttributes.gen_ai.evaluation.name, 'String'), '') != 'user_feedback'
-        AND isNotNull(SpanAttributes.montecarlo.association_properties.run_id)) AS has_run_value,
-    -- JSON can infer Date/DateTime for string IDs; read their serialized string form.
-    toString(if(has_run_value, SpanAttributes.^montecarlo.association_properties, CAST('{}' AS JSON))) AS association_attrs,
-    JSONExtractString(association_attrs, 'run_id') AS associated_run_id,
-    (has_run_value AND JSONType(association_attrs, 'run_id') = 'String'
         AND associated_run_id != '' AND length(associated_run_id) <= 256) AS is_run_span,
     -- Read only Monte Carlo attributes to preserve existing agent-name conversion.
     toString(if(is_run_span, SpanAttributes.^montecarlo, CAST('{}' AS JSON))) AS agent_attrs,

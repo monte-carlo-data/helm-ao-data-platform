@@ -1,0 +1,47 @@
+{{/* Validate the same rendered config used by the collector subchart. Do not
+rewrite endpoints: their host, TLS settings, and other options belong to the user. */}}
+{{- $collector := index .Subcharts "opentelemetry-collector" -}}
+{{- $values := $collector.Values -}}
+{{- $required := "The collector ClickHouse endpoint must contain input_format_try_infer_dates=0 and input_format_try_infer_datetimes=0, each exactly once as literal query parameters. Preserve these settings when changing the host, port, or TLS options." -}}
+{{- if or (not $values.configMap.create) $values.configMap.existingName -}}
+  {{- $verified := .Values.collectorEndpointValidation.externalConfigVerified -}}
+  {{- if not (and (kindIs "bool" $verified) $verified) -}}
+    {{- fail (printf "Helm cannot inspect an externally managed collector ConfigMap. %s Verify its active configuration, then set collectorEndpointValidation.externalConfigVerified=true." $required) -}}
+  {{- end -}}
+{{- else -}}
+  {{- $template := "opentelemetry-collector.deploymentConfig" -}}
+  {{- if eq $values.mode "daemonset" -}}
+    {{- $template = "opentelemetry-collector.daemonsetConfig" -}}
+  {{- end -}}
+  {{- $config := include $template $collector | fromYaml -}}
+  {{- range $pipeline := $config.service.pipelines -}}
+    {{- range $name := $pipeline.exporters -}}
+      {{- if or (eq $name "clickhouse") (hasPrefix "clickhouse/" $name) -}}
+        {{- $exporter := index $config.exporters $name | default dict -}}
+        {{- $endpoint := $exporter.endpoint | default "" -}}
+        {{- $withoutFragment := splitList "#" $endpoint | first -}}
+        {{- $query := index (splitn "?" 2 $withoutFragment) "_1" | default "" -}}
+        {{- $settings := dict -}}
+        {{- if contains ";" $query -}}
+          {{- fail $required -}}
+        {{- end -}}
+        {{- range $pair := splitList "&" $query -}}
+          {{- $key := splitList "=" $pair | first -}}
+          {{/* Encoded keys could hide a duplicate setting from this check. */}}
+          {{- if contains "%" $key -}}
+            {{- fail (printf "%s Use unescaped query parameter names." $required) -}}
+          {{- end -}}
+          {{- if or (eq $key "input_format_try_infer_dates") (eq $key "input_format_try_infer_datetimes") -}}
+            {{- if or (hasKey $settings $key) (ne $pair (printf "%s=0" $key)) -}}
+              {{- fail $required -}}
+            {{- end -}}
+            {{- $_ := set $settings $key true -}}
+          {{- end -}}
+        {{- end -}}
+        {{- if not (and (hasKey $settings "input_format_try_infer_dates") (hasKey $settings "input_format_try_infer_datetimes")) -}}
+          {{- fail $required -}}
+        {{- end -}}
+      {{- end -}}
+    {{- end -}}
+  {{- end -}}
+{{- end -}}

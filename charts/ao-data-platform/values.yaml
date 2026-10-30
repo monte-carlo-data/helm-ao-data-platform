@@ -588,11 +588,19 @@ llmWorker:
     limits:
       memory: 1Gi
 
+# Helm cannot read a collector ConfigMap supplied outside this chart. Set true
+# only after verifying that every active ClickHouse exporter endpoint contains
+# input_format_try_infer_dates=0 and input_format_try_infer_datetimes=0.
+collectorEndpointValidation:
+  externalConfigVerified: false
+
 # OTel Collector subchart values
 # NOTE: The config below assumes tls.enabled=true (the default). If you set
 # tls.enabled=false, also override the opentelemetry-collector section to
-# remove TLS receiver config, change the exporter endpoint back to port 9000,
-# and remove the extraVolumes/extraVolumeMounts for TLS secrets.
+# remove TLS receiver config, change the exporter endpoint to
+# tcp://clickhouse-otel.{{ .Release.Namespace }}.svc.cluster.local:9000?input_format_try_infer_dates=0&input_format_try_infer_datetimes=0,
+# and remove the extraVolumes/extraVolumeMounts for TLS secrets. Keep both query
+# parameters; rendering fails if either is missing from the active endpoint.
 opentelemetry-collector:
   fullnameOverride: opentelemetry-collector
   mode: deployment
