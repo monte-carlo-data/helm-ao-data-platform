@@ -1033,6 +1033,12 @@ jobs:
             docker pull chainguard/minio@sha256:0f95aa412a12351a95bb43c3b54b66440eb0aa022bb3f3458942678a489e915b
             docker pull cgr.dev/chainguard/minio-client@sha256:72f9978d415ea8294d78051fb3aee2fd258d449237633f77f100b5367bb5225d
       - run:
+          name: Test replicated feedback storage and upgrade queries
+          no_output_timeout: 5m
+          command: |
+            RUN_FEEDBACK_RUNTIME=1 PYTHONDONTWRITEBYTECODE=1 /tmp/backup-runtime-tests/bin/python \
+              -m unittest discover -s hack/tests/runtime -p test_code_agent_feedback_runtime.py -v
+      - run:
           name: Test stock backups, local and S3 cleanup, and recovery
           no_output_timeout: 15m
           command: |

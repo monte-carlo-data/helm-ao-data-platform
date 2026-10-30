@@ -22,6 +22,8 @@ The ClickHouse instance ships with production hardening: a capped memory ceiling
 
 > **Chart-version bumps no longer recreate ClickHouse:** the ClickHouse operator propagates only a fixed allowlist of stable labels onto the resources it generates. A chart-version bump changes the volatile `helm.sh/chart` label, but that label is no longer stamped onto the StatefulSet's immutable `volumeClaimTemplates`, so the bump no longer forces a delete/recreate of the ClickHouse StatefulSet.
 
+> **Upgrading to 5.10.0:** adds code-agent feedback ingestion and the compact `code_agent_run_links` table. Follow [Upgrading to 5.10.0](#upgrading-to-5100) before sending feedback spans. Both collector date-inference settings are required, including for custom endpoints and installs without TLS. Use trace IDs for runs that started before the schema job and collector rollout both completed; their run links may be incomplete. Feedback is retained separately and excluded from normalized traces, conversations, and trace time bounds. The schema job extends existing feedback tables without changing existing writers. Retention follows `clickhouse.ttlDays`. Feedback extraction runs during raw trace inserts, so a backlog of unmerged data in the shared `agent_feedback` table can also reject ordinary spans, including batches with no feedback. This dependency starts on install and remains after rollback because the feedback view is kept. Before rolling back below 5.10.0, stop sending feedback: an older chart can restore normalization that treats feedback as ordinary spans. A rollback retains the new tables, views, and rows. It restores older `spans_normalized_mv` behavior, while the trace-time view continues excluding feedback and the feedback views keep writing. Rolling back to a version without the feedback grants, such as 5.8.0, also revokes `monte_carlo` INSERT on `agent_feedback` and `agent_turn_links`; the 5.9.0 prerequisite retains those grants.
+
 > **Upgrading to 5.9.0:** adds the `agent_feedback` and `agent_turn_links` tables, which hold end-user feedback on agent responses and map each rated turn to its trace, and grants the `monte_carlo` user INSERT on both. Both follow `clickhouse.ttlDays`. The upgrade does not restart ClickHouse or Keeper pods. A `helm rollback` below 5.9.0 revokes the INSERT grants while the tables and their rows remain. Monte Carlo checks the grants hourly, so within an hour it stops writing and reading feedback here, and the rows expire with `clickhouse.ttlDays`.
 
 > **Upgrading to 5.8.0:** changes the default backup image to official Altinity 2.8.2. With backups enabled, that image change rolls ClickHouse pods; review and schedule the upgrade accordingly. S3 cleanup stays off by default. Its default preview policy changes to `daily-weekly`, which selects whole full-backup/incremental sets. Existing explicit `count-and-age` settings remain preview-only and do not describe the daily-weekly deletion list. Review a daily-weekly report with `dryRun: true`, then change only `dryRun` before permitting deletion. All copies must report 2.8.2 for deletion. Versioned buckets preserve older file versions only with restricted writer permissions; an optional expiry rule can remove them later. Test versioned cleanup, recovery, and eventual version expiry in an isolated AWS bucket before enabling them on existing backups. See [backup cleanup](docs/backup-cleanup.md), including its AWS role requirements.
@@ -52,7 +54,7 @@ The ClickHouse instance ships with production hardening: a capped memory ceiling
 >
 > **Upgrading to 2.3.0:** every install now renders a `ClickHouseKeeperInstallation` alongside the ClickHouse server — 3 Keeper voters with a hard one-voter-per-AZ topology spread by default. On clusters that can't schedule across three zones (local dev, single-AZ), the extra voters stay `Pending`; set `keeper.replicasCount: 1` there. The ClickHouse server is wired to Keeper from this version, but the tables are still plain `MergeTree` and don't use it yet — runtime behavior is otherwise unchanged. The Keeper client port ships network-isolated by a `NetworkPolicy` (inert on clusters without a NetworkPolicy engine) with a trimmed four-letter-word allowlist — see [Keeper network exposure and hardening](#keeper-network-exposure-and-hardening).
 
-> **Telemetry retention** is controlled by `clickhouse.ttlDays` (default 30 days), covering the raw traces, the trace-id timestamp index, the normalized spans, the conversation turns (`conversations_normalized`), and their derived annotations (`conversation_eval_scores`, `span_eval_scores`, `conversation_cluster_assignments`, `trajectory_trigger_ledger`, `agent_feedback`, `agent_turn_links`). Unlike the system-log TTLs above, the schema migration Job re-applies this on every install and upgrade (`ALTER TABLE … MODIFY TTL`), so changing the value updates existing tables — no manual ALTER needed. The Job sets `materialize_ttl_after_modify = 0`, so the change is metadata-only: *raising* the TTL takes effect immediately, while *lowering* it purges newly-expired rows lazily on the next background merge rather than at once. To force an immediate purge after lowering, run `ALTER TABLE otel_traces.<table> MATERIALIZE TTL` per affected table. The `llm_*` worker queue tables (`llm_inputs`, `llm_results`, `llm_batches`) are LLM-pipeline state rather than telemetry and are **not** governed by this value — they keep a fixed 30-day TTL defined in their SQL. `llm_worker_info` and `conversation_rollup_watermarks` are current-state control metadata and carry no TTL at all.
+> **Telemetry retention** is controlled by `clickhouse.ttlDays` (default 30 days), covering the raw traces, the trace-id timestamp index, the normalized spans, the conversation turns (`conversations_normalized`), and their derived annotations (`conversation_eval_scores`, `span_eval_scores`, `conversation_cluster_assignments`, `trajectory_trigger_ledger`, `agent_feedback`, `agent_turn_links`, `code_agent_run_links`). Unlike the system-log TTLs above, the schema migration Job re-applies this on every install and upgrade (`ALTER TABLE … MODIFY TTL`), so changing the value updates existing tables — no manual ALTER needed. The Job sets `materialize_ttl_after_modify = 0`, so the change is metadata-only: *raising* the TTL takes effect immediately, while *lowering* it purges newly-expired rows lazily on the next background merge rather than at once. To force an immediate purge after lowering, run `ALTER TABLE otel_traces.<table> MATERIALIZE TTL` per affected table. The `llm_*` worker queue tables (`llm_inputs`, `llm_results`, `llm_batches`) are LLM-pipeline state rather than telemetry and are **not** governed by this value — they keep a fixed 30-day TTL defined in their SQL. `llm_worker_info` and `conversation_rollup_watermarks` are current-state control metadata and carry no TTL at all.
 
 > **Operating `conversation_rollup_watermarks`.** The table holds one completeness cursor per `service_name`, published by the conversation turn rollup writer. Two operator facts follow from its engine (`ReplicatedReplacingMergeTree` versioned on the cursor itself). A cursor that has run ahead of what was actually written cannot be corrected by re-publishing a lower one — a lower cursor loses both the read and the merge by design — so correcting one means pausing the writer, deleting that `service_name`'s rows, and confirming the delete landed everywhere before resuming it. Pausing the writer is a Monte Carlo-side action, not a chart knob: the writer is Monte Carlo's scheduled job and reaches this cluster through the `monte_carlo` credential this chart provisions, so coordinate the pause with Monte Carlo before deleting. The delete is an `ALTER DELETE` and the confirmations read `system.mutations` and go through `clusterAllReplicas` (`READ ON REMOTE`) — no single service user holds that combination by design, so the correction runs as the break-glass `admin` user: set `clickhouse.admin.enabled=true`, then `kubectl exec` into the ClickHouse pod (admin is loopback-only by default) and run the statements there. The mutation is asynchronous and completes per replica, so both confirmations go through `clusterAllReplicas`:
 >
@@ -938,7 +940,7 @@ helm upgrade ao-data-platform oci://registry-1.docker.io/montecarlodata/ao-data-
 |-------|---------|-------------|
 | `clickhouse.replicasCount` | `2` | Number of ClickHouse replicas in the single-shard cluster. Default is the HA shape (hard per-zone spread; also sets `minDomains` on the zone constraint, so this value is a ceiling — it must not exceed the number of availability zones with eligible nodes, or the excess replicas stay `Pending` permanently instead of co-locating); set `1` for dev/single-AZ installs. On installs with pre-existing plain-`MergeTree` data, hold at `1` until the in-place conversion has verified — see [ClickHouse replication and Keeper](#clickhouse-replication-and-keeper). |
 | `clickhouse.storageSize` | `100Gi` | PVC size for ClickHouse data. |
-| `clickhouse.ttlDays` | `30` | Retention in days for the telemetry tables (raw traces, trace-id index, normalized spans, conversation turns) and their derived annotations (`conversation_eval_scores`, `span_eval_scores`, `conversation_cluster_assignments`, `trajectory_trigger_ledger`, `agent_feedback`, `agent_turn_links`). Re-applied on every install/upgrade via `ALTER TABLE … MODIFY TTL`. Does **not** govern the `llm_*` worker queue tables (they keep a fixed TTL) or the no-TTL control-state tables (`llm_worker_info`, `conversation_rollup_watermarks`). See the telemetry-retention note above. |
+| `clickhouse.ttlDays` | `30` | Retention in days for the telemetry tables (raw traces, trace-id index, normalized spans, conversation turns) and their derived annotations (`conversation_eval_scores`, `span_eval_scores`, `conversation_cluster_assignments`, `trajectory_trigger_ledger`, `agent_feedback`, `agent_turn_links`, `code_agent_run_links`). Re-applied on every install/upgrade via `ALTER TABLE … MODIFY TTL`. Does **not** govern the `llm_*` worker queue tables (they keep a fixed TTL) or the no-TTL control-state tables (`llm_worker_info`, `conversation_rollup_watermarks`). See the telemetry-retention note above. |
 | `clickhouse.nodeSelector` | `{}` | Node selector for the ClickHouse pod (wired into the CHI's `podTemplate`) |
 | `clickhouse.tolerations` | `[]` | Tolerations for the ClickHouse pod (wired into the CHI's `podTemplate`) |
 | `clickhouse.otel.secret` | `ao-clickhouse-otel-credentials` | Name of the K8s Secret (created by ESO) with a `password` key |
@@ -1132,4 +1134,144 @@ opentelemetry-collector:
               matchLabels:
                 clickhouse.altinity.com/app: chop
             topologyKey: kubernetes.io/hostname
+```
+
+## Code-agent feedback
+
+### Upgrading to 5.10.0
+
+1. Check the collector's active ClickHouse endpoint before upgrading. Keep both
+   settings shown below, including on port 9000 when TLS is disabled. The chart
+   rejects a generated configuration that omits either setting, enables either
+   kind of date inference, or repeats either parameter. This includes
+   `alternateConfig` and templated endpoints; other endpoint options are left
+   unchanged. Query parameter names must be written without percent escapes.
+   For an externally managed ConfigMap, Helm cannot inspect its contents:
+   verify every active ClickHouse exporter yourself, then set
+   `collectorEndpointValidation.externalConfigVerified=true` to confirm that
+   check. Setting this value does not change or verify the external ConfigMap.
+2. Upgrade the chart, then wait for the schema job and every collector pod to
+   finish updating. Helm does not order those two operations. Old collector
+   pods can still change date-looking run IDs while the rollout is in progress.
+   The run-link view accepts only values stored as strings; it leaves out
+   inferred dates and times rather than linking the rewritten ID to another run.
+3. Enable feedback after both operations finish. Use trace IDs for any run that
+   started before they both finished, including a run that spans the upgrade.
+   Those runs may have missing links; a later span does not recover links for
+   their earlier traces. Runs started afterward can use their original run IDs.
+
+To reduce the number of affected runs, first add both endpoint settings to the
+currently installed chart and finish that collector rollout, then upgrade to
+5.10.0. This is optional; it does not rebuild historical links. These checks
+prevent new incorrect links, but do not change or remove links already stored.
+
+The collector's ClickHouse endpoint sets `input_format_try_infer_dates=0` and
+`input_format_try_infer_datetimes=0` on its connections.
+Both settings are required to preserve the original text of date-looking run IDs,
+including when one batch contains spans from different agents. Feedback sent in a
+later batch can then match traces using the original ID. Keep both query parameters
+when overriding `opentelemetry-collector.config.exporters.clickhouse.endpoint`. Changing the
+collector configuration restarts its pods, so the settings apply to new
+connections. Complete that rollout before sending feedback. Changing only a
+ClickHouse user profile does not update already-open collector connections.
+
+For example, a custom TLS endpoint keeps
+`?secure=true&input_format_try_infer_dates=0&input_format_try_infer_datetimes=0`.
+Without TLS, use
+`tcp://clickhouse-otel.<namespace>.svc.cluster.local:9000?input_format_try_infer_dates=0&input_format_try_infer_datetimes=0`.
+
+This preserves the original text of date-looking strings in all new span,
+resource, event, and link attributes. Numeric attributes and the declared
+timestamp and duration columns keep their types. Existing stored values are
+not rewritten; an ID already changed by date inference cannot be recovered
+from its stored value alone. Rollback removes these settings and restores the
+older inference behavior, so stop sending feedback before rolling back.
+
+### Feedback spans
+
+A span with `gen_ai.evaluation.name = user_feedback` carries the current rating,
+categories, and comment for a trace. Name the span `user_feedback`. Supply either
+`montecarlo.feedback.trace_id` (a nonzero 32-character hexadecimal trace ID) or
+`montecarlo.feedback.run_id` (at most 256 UTF-8 bytes). A child feedback span can
+omit both and use its own trace ID. A span with both targets, or a root span with
+neither target, stays raw without extracting feedback.
+
+Identify the rated agent with a nonempty string in `montecarlo.agent_name`.
+If that attribute is absent or empty, the sending span's service name is used.
+When feedback comes from a separate service, set `montecarlo.agent_name` to the
+rated agent's name so readers can find it.
+
+Each feedback span replaces the target's earlier state. The optional
+`gen_ai.evaluation.score.label` accepts `positive`, `negative`, or `none`; `none`
+clears the whole feedback state. An omitted label records no rating, even if an
+earlier event had one. Labels are case-sensitive; other values leave the event
+raw without extracting feedback. `gen_ai.evaluation.explanation` carries an
+optional comment, and `montecarlo.feedback.categories` is an array of strings.
+The extractor also accepts the JSON-array string produced by the collector.
+Non-array values and malformed JSON become an empty list. The extractor drops
+non-string and whitespace-only entries, skips whole entries longer than 128
+UTF-8 bytes, and keeps the first 20 remaining entries. It preserves the text of
+accepted entries.
+Client span timestamps determine ordering and retention, so emitting clocks must
+be accurate.
+
+The span name `user_feedback` is reserved. A span with that name, or with
+`gen_ai.evaluation.name = user_feedback`, is excluded from normal traces,
+conversations, trace time bounds, and run links, even when its feedback attributes
+are missing or invalid. Choose another name for an ordinary application span.
+
+`agent_feedback` stores rating metadata and the exact raw-span location. Comment
+text, user identity, and optional numeric scores stay in the raw span. Feedback
+can arrive before its trace. Readers join targets when reading and choose the
+newest event before applying rating filters. Direct trace targets do not need a
+run link. Resolve the account's own store and match the exact agent service name
+on every read; these tables are not a boundary between untrusted tenants.
+
+Use `source` to distinguish the feedback writers. For `source = 'code'`,
+`target_kind` specifies a trace or run ID. Cortex rows have `source = 'cortex'`;
+their `request_id` identifies a turn and resolves through `agent_turn_links`.
+Do not interpret a Cortex row's default `target_kind` as a code-agent run.
+`target_id` currently equals `request_id` for both writers. Code readers use
+`target_id`; `request_id` remains the existing column used to order the table.
+
+`code_agent_run_links` combines ordinary spans carrying
+`montecarlo.association_properties.run_id`. A run can map to several traces.
+Links require a native string run ID and a span ingested after the run-link view
+exists. Inferred dates and times are omitted because their original text cannot
+be recovered reliably. No historical links are built. Use trace IDs for runs
+that started before the schema job and collector rollout both completed, as
+described in [Upgrading to 5.10.0](#upgrading-to-5100).
+Readers group by `(service_name, run_id, trace_id)` and read `min(first_seen)` and
+`max(last_seen)` so results remain correct before background merges. Feedback
+spans never extend these times. For string agent names, the name matches
+normalized spans: `montecarlo.agent_name` takes precedence over the emitting
+service name.
+The `by_trace` projection also stores this compact mapping in trace order, so
+page reads can find run IDs without scanning the agent's entire run history.
+It adds a second copy of mapping data and rebuilds during aggregation merges.
+Trace lookups should use `GROUP BY run_id, trace_id`: on ClickHouse 26.2 and
+26.4.3, `SELECT DISTINCT` does not select this projection. The runtime test checks the
+query plan and row-read limit against 100,000 mapping rows.
+
+The feedback views run as `schema_owner`. The collector still inserts only into
+the raw table. Malformed feedback stays raw and never becomes a normalized
+trace. No historical span rewrite runs during upgrade.
+
+The feedback table also accepts writes from the Cortex sync. Installing the chart
+adds this dependency before any code feedback is sent. Rolling the chart back
+keeps the feedback view, so that dependency remains. If ClickHouse rejects writes
+to `agent_feedback`, that failure can reject ordinary raw trace inserts too,
+including batches with no feedback. This happens, for example, when
+unmerged data parts reach the table's insert limit. The collector retries failed
+writes within its configured queue and retry limits; a prolonged failure can
+exhaust those limits. The runtime test checks this failure and a successful retry
+after the table accepts writes again.
+
+Local SQL checks start and remove a disposable ClickHouse container with Keeper,
+using the chart-default image and no host ports. They run replicated tables,
+distributed schema changes, retention updates, and projection checks. Docker is
+required; set `CLICKHOUSE_TEST_IMAGE` to test another supported image:
+
+```sh
+RUN_FEEDBACK_RUNTIME=1 python3 -m unittest discover -s hack/tests/runtime -p test_code_agent_feedback_runtime.py -v
 ```
