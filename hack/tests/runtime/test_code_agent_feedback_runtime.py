@@ -20,6 +20,10 @@ from pathlib import Path
 CHART = Path(__file__).resolve().parents[3] / "charts/ao-data-platform"
 SQL_DIR = CHART / "sql"
 CH_IMAGE = os.getenv("CLICKHOUSE_TEST_IMAGE", "clickhouse/clickhouse-server:26.4.3")
+COLLECTOR_JSON_SETTINGS = {
+    "input_format_try_infer_dates": "0",
+    "input_format_try_infer_datetimes": "0",
+}
 RUNTIME_CONFIG = """<clickhouse>
 <logger><level>error</level><console>1</console></logger>
 <max_thread_pool_size>256</max_thread_pool_size>
@@ -69,7 +73,12 @@ class FeedbackDefinitionTests(unittest.TestCase):
 @unittest.skipUnless(os.getenv("RUN_FEEDBACK_RUNTIME") == "1", "opt-in ClickHouse test")
 class FeedbackStorageTests(unittest.TestCase):
     @classmethod
-    def execute(cls, sql):
+    def execute(cls, sql, *, collector_insert=False):
+        settings = (
+            [f"--{name}={value}" for name, value in COLLECTOR_JSON_SETTINGS.items()]
+            if collector_insert
+            else []
+        )
         result = subprocess.run(
             [
                 "docker",
@@ -77,6 +86,7 @@ class FeedbackStorageTests(unittest.TestCase):
                 "-i",
                 cls.container,
                 "clickhouse-client",
+                *settings,
                 "--multiquery",
                 "--format",
                 "JSONEachRow",
@@ -181,10 +191,11 @@ class FeedbackStorageTests(unittest.TestCase):
         self.target = uuid.uuid4().hex
         self.day = datetime.now(UTC).date()
 
-    def insert(self, rows):
+    def insert(self, rows, *, legacy_inference=False):
         self.execute(
             "INSERT INTO otel_traces.otel_traces FORMAT JSONEachRow\n"
-            + "\n".join(json.dumps(row) for row in rows)
+            + "\n".join(json.dumps(row) for row in rows),
+            collector_insert=not legacy_inference,
         )
 
     def span(self, attrs=None, **overrides):
@@ -367,6 +378,8 @@ class FeedbackStorageTests(unittest.TestCase):
     def test_date_shaped_run_ids_link_to_the_same_feedback_target(self):
         values = [
             "2026-10-29",
+            "2026-1-5",
+            "2026-02-30",
             "2026-10-29 12:00:00",
             "2026-10-29 12:00:00.123456",
             "2026-10-29T12:00:00Z",
@@ -397,14 +410,12 @@ class FeedbackStorageTests(unittest.TestCase):
                 )
                 self.assertEqual(len(result), 1)
                 self.assertEqual(result[0]["target_kind"], "run")
-                self.assertTrue(result[0]["target_id"])
-                if value in ("2026-10-29", "2026-10-29 12:00:00"):
-                    self.assertEqual(result[0]["target_id"], value)
-                    stored_type = self.execute(
-                        "SELECT dynamicType(SpanAttributes.montecarlo.association_properties.run_id) AS stored_type FROM otel_traces.otel_traces "
-                        + f"WHERE SpanId = '{normal['SpanId']}'"
-                    )[0]["stored_type"]
-                    self.assertTrue(stored_type.startswith("Date"), stored_type)
+                self.assertEqual(result[0]["target_id"], value)
+                stored_type = self.execute(
+                    "SELECT dynamicType(SpanAttributes.montecarlo.association_properties.run_id) AS stored_type FROM otel_traces.otel_traces "
+                    + f"WHERE SpanId = '{normal['SpanId']}'"
+                )[0]["stored_type"]
+                self.assertEqual(stored_type, "String")
                 self.assertEqual(
                     self.select(
                         "code_agent_run_links",
@@ -413,6 +424,82 @@ class FeedbackStorageTests(unittest.TestCase):
                     ),
                     [{"run_id": result[0]["target_id"], "trace_id": trace_id}],
                 )
+
+    def test_run_ids_survive_mixed_agents_and_separate_feedback_batches(self):
+        for value in (
+            "2026-10-29",
+            "2026-1-5",
+            "2026-02-30",
+            "2026-10-29 12:00:00.123456",
+        ):
+            with self.subTest(run_id=value):
+                mixed_trace, single_trace = uuid.uuid4().hex, uuid.uuid4().hex
+                other = self.span(
+                    {"montecarlo.association_properties.run_id": "2026-10-29 12:00:00"},
+                    ServiceName="other_" + self.service,
+                )
+                mixed = self.span(
+                    {"montecarlo.association_properties.run_id": value},
+                    TraceId=mixed_trace,
+                )
+                self.insert([other, mixed])
+                self.insert(
+                    [
+                        self.span(
+                            {"montecarlo.association_properties.run_id": value},
+                            TraceId=single_trace,
+                        )
+                    ]
+                )
+                event = self.feedback(**{"montecarlo.feedback.run_id": value})
+                self.insert([event])
+                joined = self.execute(
+                    "SELECT f.target_id, groupUniqArray(l.trace_id) AS traces "
+                    "FROM otel_traces.agent_feedback f INNER JOIN otel_traces.code_agent_run_links l "
+                    "ON f.service_name = l.service_name AND f.target_id = l.run_id "
+                    f"WHERE f.feedback_span_id = '{event['SpanId']}' GROUP BY f.target_id"
+                )
+                self.assertEqual(len(joined), 1)
+                self.assertEqual(joined[0]["target_id"], value)
+                self.assertCountEqual(joined[0]["traces"], [mixed_trace, single_trace])
+
+    def test_ingest_preserves_attribute_text_and_typed_telemetry_fields(self):
+        value = "2026-10-29 12:00:00.123456"
+        row = self.span({"text": value, "count": 12, "fraction": 1.5})
+        row.update(
+            {
+                "ResourceAttributes": {"text": value},
+                "Events.Timestamp": [row["Timestamp"]],
+                "Events.Name": ["event"],
+                "Events.Attributes": [{"text": value}],
+                "Links.TraceId": [uuid.uuid4().hex],
+                "Links.SpanId": [uuid.uuid4().hex[:16]],
+                "Links.TraceState": [""],
+                "Links.Attributes": [{"text": value}],
+            }
+        )
+        self.insert([row])
+        stored = self.execute(
+            "SELECT toString(SpanAttributes) AS span, toString(ResourceAttributes) AS resource, "
+            "arrayMap(x -> toString(x), `Events.Attributes`) AS events, "
+            "arrayMap(x -> toString(x), `Links.Attributes`) AS links, "
+            "toString(Timestamp) AS timestamp, Duration AS duration, "
+            "arrayMap(x -> toString(x), `Events.Timestamp`) AS event_times "
+            f"FROM otel_traces.otel_traces WHERE SpanId = '{row['SpanId']}'"
+        )[0]
+        self.assertEqual(
+            json.loads(stored["span"]), {"text": value, "count": 12, "fraction": 1.5}
+        )
+        self.assertEqual(json.loads(stored["resource"]), {"text": value})
+        self.assertEqual(
+            [json.loads(item) for item in stored["events"]], [{"text": value}]
+        )
+        self.assertEqual(
+            [json.loads(item) for item in stored["links"]], [{"text": value}]
+        )
+        self.assertEqual(stored["timestamp"], row["Timestamp"])
+        self.assertEqual(stored["event_times"], [row["Timestamp"]])
+        self.assertEqual(stored["duration"], row["Duration"])
 
     def test_child_feedback_with_run_target_does_not_rate_its_own_trace(self):
         event = self.feedback(
@@ -828,15 +915,16 @@ GROUP BY service_name, run_id, trace_id;
                     self.span({"montecarlo.association_properties.run_id": "before"}),
                 ]
             )
-            # Insert date strings in their own block so JSON infers Date rather than
-            # combining them with unrelated string IDs into the String variant.
+            # Simulate a JSON text insert with the default inference settings.
+            # Inserts using the collector's settings disable both kinds of inference.
             self.insert(
                 [
                     self.span(
                         {"montecarlo.association_properties.run_id": "2026-10-29"}
                     ),
                     self.feedback(**{"montecarlo.feedback.run_id": "2026-10-29"}),
-                ]
+                ],
+                legacy_inference=True,
             )
             self.assertEqual(
                 self.select("code_agent_run_links", "run_id"), [{"run_id": "before"}]
@@ -853,7 +941,8 @@ GROUP BY service_name, run_id, trace_id;
                 ]
             )
             self.insert(
-                [self.span({"montecarlo.association_properties.run_id": "2026-10-29"})]
+                [self.span({"montecarlo.association_properties.run_id": "2026-10-29"})],
+                legacy_inference=True,
             )
             self.assertEqual(
                 self.select("code_agent_run_links", "run_id", "ORDER BY run_id"),

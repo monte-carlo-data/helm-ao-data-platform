@@ -722,7 +722,9 @@ opentelemetry-collector:
 
     exporters:
       clickhouse:
-        endpoint: tcp://clickhouse-otel.{{ .Release.Namespace }}.svc.cluster.local:9440?secure=true
+        # Preserve string attributes exactly, including date-looking run IDs.
+        # Keep both inference settings when overriding the endpoint.
+        endpoint: tcp://clickhouse-otel.{{ .Release.Namespace }}.svc.cluster.local:9440?secure=true&input_format_try_infer_dates=0&input_format_try_infer_datetimes=0
         json: true
         database: otel_traces
         username: otel
