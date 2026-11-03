@@ -1,6 +1,6 @@
 -- Arrival stamp for the conversation rollup writer's completeness gate. The
--- writer (monolith conversation_materialization) may advance a service's
--- watermark past event time T only once every span with start_time < T has
+-- writer may advance a service's watermark past event time T only once every
+-- span with start_time < T has
 -- arrived, and spans_normalized carries only event-time columns (start_time,
 -- end_time, duration_ns) — so the arrival signal has to be added here. One
 -- MATERIALIZED expression answers all three gate inputs per row and per

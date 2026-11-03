@@ -672,6 +672,10 @@ CircleCI runs on every push:
 - **Publish (dev)** — `dev` branch pushes publish two pre-release artifacts to Docker Hub: `0.0.0-latest` (floating, overwritten every push) and `<chart-version>-dev.g<full-commit-sha>` (one exact version per commit).
 - **Publish (release)** — `v*` git tag pushes on `main`-ancestor commits publish the numbered version to Docker Hub.
 
+### Schema SQL
+
+The files in `charts/ao-data-platform/sql/` are generated upstream and copied here. Don't edit, add or remove them in this repository. `sql/MANIFEST.sha256` records each file's checksum, and the lint job fails when a file differs from it, is missing, or isn't listed. A release that picks up a new table must also grant it in `templates/clickhouse-installation.yaml`.
+
 ### Versioning
 
 Two flows, by branch/tag:

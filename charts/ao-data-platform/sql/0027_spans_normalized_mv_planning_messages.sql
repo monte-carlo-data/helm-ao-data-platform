@@ -7,9 +7,9 @@
 -- into role. Spans without a parseable list keep the single planning.query
 -- prompt.
 --
--- Keep the prompt, text and tool_calls arms in lockstep with the read
--- template (monolith agent_observability_queries.yaml, ``native``). Two
--- differences are deliberate; do not sync them away:
+-- Keep the prompt, text and tool_calls arms in lockstep with the backend's
+-- native read template. Two differences are deliberate; do not sync them
+-- away:
 --   * The cortex_search/cortex_analyst arms fold tool-span content into the
 --     prompt and completion, because spans_normalized has no tool I/O columns.
 --     Removing them drops all Cortex tool-span content from ClickHouse.

@@ -1,4 +1,4 @@
--- Durable per-conversation cluster assignments. Written as a Q4-sibling INSERT
+-- Durable per-conversation cluster assignments. Written as a sibling INSERT
 -- in the same LLM batch as classification (no separate write service). space_uuid
 -- distinguishes taxonomies (per (account, agent, scope)) assigning the same
 -- conversation. The read path collapses turns to conversation grain, INNER JOINs

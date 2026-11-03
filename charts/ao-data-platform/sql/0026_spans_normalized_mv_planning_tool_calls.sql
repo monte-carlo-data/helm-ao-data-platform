@@ -17,5 +17,3 @@
 --   * Discovery keeps idx=0 for a step whose tool_selection.name is a
 --     non-empty array, so a tool-only step has one completion with an empty
 --     message and its tool calls.
---
--- Mirrored from monolith 0019_spans_normalized_mv_planning_tool_calls.sql.

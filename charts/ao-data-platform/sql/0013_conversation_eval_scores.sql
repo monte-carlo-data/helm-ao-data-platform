@@ -1,4 +1,4 @@
--- Durable per-conversation eval scores. Written as a Q4-sibling INSERT in the
+-- Durable per-conversation eval scores. Written as a sibling INSERT in the
 -- same LLM batch_group as monitor execution (no separate write service).
 -- monitor_uuid distinguishes N monitors scoring the same conversation. The read
 -- path returns the latest row per (service_name, monitor_uuid, conversation_id,

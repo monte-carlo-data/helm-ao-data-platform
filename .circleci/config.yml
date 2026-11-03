@@ -824,57 +824,27 @@ jobs:
             fi
             echo "Dev shape rendered correctly with plain-HTTP readiness."
       - run:
-          name: Schema SQL is clustered-only
-          # Every table the chart creates must be a path-less Replicated* engine
-          # and every DDL statement must run ON CLUSTER — a plain-MergeTree or
-          # non-cluster statement installs fine on one replica, then surfaces as
-          # a missing table or an independent empty lineage on the other. Pure
-          # source greps; no render needed.
+          name: Schema SQL matches its manifest
+          # The SQL files are generated upstream, where the schema rules (ON
+          # CLUSTER DDL, path-less Replicated engines, one live MODIFY QUERY
+          # writer per view, pinned view definers) are enforced, and copied here
+          # with MANIFEST.sha256. This fails on a file edited, added or removed
+          # here instead of upstream.
           command: |
-            fail=0
-            ddl=$(grep -En '^(CREATE|ALTER|DROP|RENAME|ATTACH|DETACH|TRUNCATE) ' charts/ao-data-platform/sql/*.sql || true)
-            if [ -z "$ddl" ]; then
-              echo "Sanity check failed: no DDL statements matched in charts/ao-data-platform/sql/ — the grep pattern has drifted."
+            cd charts/ao-data-platform/sql
+            listed=$(grep -v '^#' MANIFEST.sha256 | awk '{ print $2 }' | sort)
+            present=$(ls *.sql | sort)
+            if [ "$listed" != "$present" ]; then
+              echo "SQL files differ from MANIFEST.sha256 (< listed, > present):"
+              diff <(echo "$listed") <(echo "$present") || true
+              echo "Schema SQL is generated upstream; don't add or remove files here."
               exit 1
             fi
-            missing=$(echo "$ddl" | grep -v "ON CLUSTER '{cluster}'" || true)
-            if [ -n "$missing" ]; then
-              echo "DDL without ON CLUSTER '{cluster}':"
-              echo "$missing"
-              fail=1
-            fi
-            if grep -En 'ENGINE = ' charts/ao-data-platform/sql/*.sql | grep -v 'ENGINE = Replicated'; then
-              echo "Non-Replicated engine in schema SQL (lines above)."
-              fail=1
-            fi
-            if grep -n '/clickhouse/' charts/ao-data-platform/sql/*.sql; then
-              echo "Explicit replication path in schema SQL (lines above) — engines must stay path-less (default_replica_path owns the layout)."
-              fail=1
-            fi
-            # One live MODIFY QUERY writer per view. schema-job.yaml re-runs
-            # every /sql/*.sql on install AND upgrade with no ledger, so a
-            # superseded (non-comment) ALTER ... MODIFY QUERY re-installs its
-            # older SELECT until the newer file re-applies — and the MVs are
-            # insert-triggered and forward-only, so spans ingested in that
-            # window keep the older rendering permanently. When a new file
-            # supersedes a view's SELECT, the predecessor's statement must be
-            # emptied, keeping the file comment-only (see the 0021 header).
-            # MODIFY SQL SECURITY (0014) is deliberately not counted — it does
-            # not rewrite the SELECT.
-            writers=$(awk 'FNR == 1 { tbl = "" } /^[[:space:]]*--/ { next } /ALTER TABLE/ { tbl = $3 } /MODIFY QUERY/ { print FILENAME ": " tbl }' charts/ao-data-platform/sql/*.sql)
-            if [ -z "$writers" ]; then
-              echo "Sanity check failed: no live MODIFY QUERY found in charts/ao-data-platform/sql/ — either the awk pattern has drifted or the trailing spans_normalized_mv ALTER was emptied without a successor."
+            if ! grep -v '^#' MANIFEST.sha256 | sha256sum --check --quiet; then
+              echo "SQL files changed since they were generated (above). Schema changes are made upstream."
               exit 1
             fi
-            dups=$(echo "$writers" | awk -F': ' '{ print $2 }' | sort | uniq -d)
-            if [ -n "$dups" ]; then
-              echo "More than one live MODIFY QUERY writer per view:"
-              echo "$writers"
-              echo "Exactly one file may carry a view's current SELECT — empty the superseded predecessor's statement (keep the file comment-only; see the 0021 header)."
-              fail=1
-            fi
-            [ "$fail" -eq 0 ] && echo "Schema SQL is clustered-only: ON CLUSTER DDL, path-less Replicated engines, one live MODIFY QUERY writer per view."
-            exit $fail
+            echo "Schema SQL matches MANIFEST.sha256 ($(echo "$present" | wc -l | tr -d ' ') files)."
       - run:
           name: llm-worker foundry provider renders Foundry env, no AWS env
           # provider=foundry emits LLM_PROVIDER=foundry + ANTHROPIC_FOUNDRY_RESOURCE

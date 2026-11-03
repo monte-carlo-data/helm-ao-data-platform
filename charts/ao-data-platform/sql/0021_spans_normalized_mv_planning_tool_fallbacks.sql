@@ -13,8 +13,7 @@
 -- permanently. Measured on a two-replica cluster when 0020 superseded 0019.
 --
 -- The file is retained (not deleted) to hold the numbering, so this ordinal
--- is never reused, the relative order of files mirrored from the source
--- schema set is preserved, and the chart's history stays readable.
+-- is never reused and the chart's history stays readable.
 -- Retaining it costs nothing: the schema Job pipes a comment-only file to
 -- clickhouse-client, which is a no-op.
 --
