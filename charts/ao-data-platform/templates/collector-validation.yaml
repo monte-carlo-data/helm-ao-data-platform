@@ -1,0 +1,64 @@
+{{/* Validate the same rendered config used by the collector subchart. Do not
+rewrite endpoints: their host, TLS settings, and other options belong to the user. */}}
+{{- $collector := index .Subcharts "opentelemetry-collector" -}}
+{{- $values := $collector.Values -}}
+{{- $required := "The collector ClickHouse connection must set input_format_try_infer_dates=0 and input_format_try_infer_datetimes=0 in endpoint query parameters or connection_params. connection_params overrides endpoint values and must use the quoted string \"0\" (or Helm --set-string); endpoint parameters must each be a single 0. Preserve these settings when changing the host, port, or TLS options." -}}
+{{- if or (not $values.configMap.create) $values.configMap.existingName -}}
+  {{- $verified := .Values.collectorEndpointValidation.externalConfigVerified -}}
+  {{- if not (and (kindIs "bool" $verified) $verified) -}}
+    {{- fail (printf "Helm cannot inspect an externally managed collector ConfigMap. %s Verify its active configuration and restart its collector pods, then set collectorEndpointValidation.externalConfigVerified=true." $required) -}}
+  {{- end -}}
+{{- else -}}
+  {{- $template := "opentelemetry-collector.deploymentConfig" -}}
+  {{- if eq $values.mode "daemonset" -}}
+    {{- $template = "opentelemetry-collector.daemonsetConfig" -}}
+  {{- end -}}
+  {{- $config := include $template $collector | fromYaml -}}
+  {{- range $pipeline := $config.service.pipelines -}}
+    {{- range $name := $pipeline.exporters -}}
+      {{- if or (eq $name "clickhouse") (hasPrefix "clickhouse/" $name) -}}
+        {{- $exporter := index $config.exporters $name | default dict -}}
+        {{- $endpoint := $exporter.endpoint | default "" -}}
+        {{- $withoutFragment := splitList "#" $endpoint | first -}}
+        {{- $query := index (splitn "?" 2 $withoutFragment) "_1" | default "" -}}
+        {{- $settings := dict -}}
+        {{- if contains ";" $query -}}
+          {{- fail $required -}}
+        {{- end -}}
+        {{- range $pair := splitList "&" $query -}}
+          {{- $key := splitList "=" $pair | first -}}
+          {{/* Encoded keys could hide a duplicate setting from this check. */}}
+          {{- if contains "%" $key -}}
+            {{- fail (printf "%s Use unescaped query parameter names." $required) -}}
+          {{- end -}}
+          {{- if or (eq $key "input_format_try_infer_dates") (eq $key "input_format_try_infer_datetimes") -}}
+            {{- $value := index (splitn "=" 2 $pair) "_1" | default "" -}}
+            {{- $_ := set $settings $key (append (get $settings $key | default list) $value) -}}
+          {{- end -}}
+        {{- end -}}
+        {{/* The exporter applies connection_params with url.Values.Set, replacing
+        every endpoint value for the same key before opening the connection. */}}
+        {{- $params := $exporter.connection_params | default dict -}}
+        {{- if not (kindIs "map" $params) -}}
+          {{- fail $required -}}
+        {{- end -}}
+        {{- range $key := list "input_format_try_infer_dates" "input_format_try_infer_datetimes" -}}
+          {{- if hasKey $params $key -}}
+            {{- $value := get $params $key -}}
+            {{- if not (kindIs "string" $value) -}}
+              {{- fail $required -}}
+            {{- end -}}
+            {{- $_ := set $settings $key (list $value) -}}
+          {{- end -}}
+          {{- $values := get $settings $key | default list -}}
+          {{- if ne (len $values) 1 -}}
+            {{- fail $required -}}
+          {{- end -}}
+          {{- if ne (first $values) "0" -}}
+            {{- fail $required -}}
+          {{- end -}}
+        {{- end -}}
+      {{- end -}}
+    {{- end -}}
+  {{- end -}}
+{{- end -}}
