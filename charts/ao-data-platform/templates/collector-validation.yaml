@@ -2,7 +2,7 @@
 rewrite endpoints: their host, TLS settings, and other options belong to the user. */}}
 {{- $collector := index .Subcharts "opentelemetry-collector" -}}
 {{- $values := $collector.Values -}}
-{{- $required := "The collector ClickHouse connection must set input_format_try_infer_dates=0 and input_format_try_infer_datetimes=0 in endpoint query parameters or connection_params. connection_params overrides endpoint values; each effective setting must be a single literal 0. Preserve these settings when changing the host, port, or TLS options." -}}
+{{- $required := "The collector ClickHouse connection must set input_format_try_infer_dates=0 and input_format_try_infer_datetimes=0 in endpoint query parameters or connection_params. connection_params overrides endpoint values and must use the quoted string \"0\" (or Helm --set-string); endpoint parameters must each be a single 0. Preserve these settings when changing the host, port, or TLS options." -}}
 {{- if or (not $values.configMap.create) $values.configMap.existingName -}}
   {{- $verified := .Values.collectorEndpointValidation.externalConfigVerified -}}
   {{- if not (and (kindIs "bool" $verified) $verified) -}}
@@ -44,7 +44,11 @@ rewrite endpoints: their host, TLS settings, and other options belong to the use
         {{- end -}}
         {{- range $key := list "input_format_try_infer_dates" "input_format_try_infer_datetimes" -}}
           {{- if hasKey $params $key -}}
-            {{- $_ := set $settings $key (list (toString (get $params $key))) -}}
+            {{- $value := get $params $key -}}
+            {{- if not (kindIs "string" $value) -}}
+              {{- fail $required -}}
+            {{- end -}}
+            {{- $_ := set $settings $key (list $value) -}}
           {{- end -}}
           {{- $values := get $settings $key | default list -}}
           {{- if ne (len $values) 1 -}}

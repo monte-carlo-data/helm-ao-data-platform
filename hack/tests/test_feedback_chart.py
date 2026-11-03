@@ -101,6 +101,36 @@ class FeedbackChartTests(unittest.TestCase):
                         },
                     )
 
+    def test_connection_params_require_string_values_for_zero(self):
+        for key in COLLECTOR_JSON_SETTINGS:
+            for value in (0, 0.0, False):
+                with (
+                    self.subTest(key=key, value=value),
+                    self.assertRaisesRegex(AssertionError, "quoted string"),
+                ):
+                    render(
+                        backup=False,
+                        values={
+                            "opentelemetry-collector": {
+                                "config": {
+                                    "exporters": {
+                                        "clickhouse": {
+                                            "connection_params": {key: value}
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                    )
+
+    def test_helm_set_numeric_zero_is_rejected_before_install(self):
+        with self.assertRaisesRegex(AssertionError, "quoted string"):
+            render(
+                "opentelemetry-collector.config.exporters.clickhouse.connection_params.input_format_try_infer_dates=0",
+                "opentelemetry-collector.config.exporters.clickhouse.connection_params.input_format_try_infer_datetimes=0",
+                backup=False,
+            )
+
     def test_otel_profile_preserves_ids_without_changing_other_user_profiles(self):
         for readonly in (False, True):
             with self.subTest(readonly=readonly):

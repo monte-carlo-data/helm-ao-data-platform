@@ -22,7 +22,7 @@ The ClickHouse instance ships with production hardening: a capped memory ceiling
 
 > **Chart-version bumps no longer recreate ClickHouse:** the ClickHouse operator propagates only a fixed allowlist of stable labels onto the resources it generates. A chart-version bump changes the volatile `helm.sh/chart` label, but that label is no longer stamped onto the StatefulSet's immutable `volumeClaimTemplates`, so the bump no longer forces a delete/recreate of the ClickHouse StatefulSet.
 
-> **Upgrading to 6.0.0:** adds code-agent feedback ingestion and the compact `code_agent_run_links` table. Follow [Upgrading to 6.0.0](#upgrading-to-600) before sending feedback spans. Both collector date-inference settings are required, including for custom endpoints and installs without TLS. Use trace IDs for runs that started before the schema job and collector rollout both completed; their run links may be incomplete. Feedback is retained separately and excluded from normalized traces, conversations, and trace time bounds. The schema job extends existing feedback tables without changing existing writers. Retention follows `clickhouse.ttlDays`. Feedback extraction runs during raw trace inserts, so a backlog of unmerged data in the shared `agent_feedback` table can also reject ordinary spans, including batches with no feedback. This dependency starts on install and remains after rollback because the feedback view is kept. Before rolling back below 6.0.0, stop sending feedback: an older chart can restore normalization that treats feedback as ordinary spans. A rollback retains the new tables, views, and rows. It restores older `spans_normalized_mv` behavior, while the trace-time view continues excluding feedback and the feedback views keep writing. Rolling back to a version without the feedback grants, such as 5.8.0, also revokes `monte_carlo` INSERT on `agent_feedback` and `agent_turn_links`; the 5.9.0 prerequisite retains those grants.
+> **Upgrading to 6.0.0:** adds code-agent feedback ingestion and the compact `code_agent_run_links` table. Follow [Upgrading to 6.0.0](#upgrading-to-600) before sending feedback spans. Queries using the new feedback columns or `code_agent_run_links` require 6.0.0 or later and a completed schema job; they fail on missing columns or tables in older installs. Before upgrading, rename ordinary application spans named `user_feedback`, which becomes reserved in this release. Both collector date-inference settings are required, including for custom endpoints and installs without TLS. Use trace IDs for runs that started before the schema job and collector rollout both completed; their run links may be incomplete. Feedback is retained separately and excluded from normalized traces, conversations, and trace time bounds. The schema job extends existing feedback tables without changing existing writers. Retention follows `clickhouse.ttlDays`. Feedback extraction runs during raw trace inserts, so a backlog of unmerged data in the shared `agent_feedback` table can also reject ordinary spans, including batches with no feedback. This dependency starts on install and remains after rollback because the feedback view is kept. Before rolling back below 6.0.0, stop sending feedback: an older chart can restore normalization that treats feedback as ordinary spans. A rollback retains the new tables, views, and rows. It restores older `spans_normalized_mv` behavior, while the trace-time view continues excluding feedback and the feedback views keep writing. Rolling back to a version without the feedback grants, such as 5.8.0, also revokes `monte_carlo` INSERT on `agent_feedback` and `agent_turn_links`; the 5.9.0 prerequisite retains those grants.
 
 > **Upgrading to 5.9.0:** adds the `agent_feedback` and `agent_turn_links` tables, which hold end-user feedback on agent responses and map each rated turn to its trace, and grants the `monte_carlo` user INSERT on both. Both follow `clickhouse.ttlDays`. The upgrade does not restart ClickHouse or Keeper pods. A `helm rollback` below 5.9.0 revokes the INSERT grants while the tables and their rows remain. Monte Carlo checks the grants hourly, so within an hour it stops writing and reading feedback here, and the rows expire with `clickhouse.ttlDays`.
 
@@ -1146,11 +1146,23 @@ This is a breaking major release: custom collector endpoints that worked on
 the earlier port-9000 example. Externally managed ConfigMaps also require the
 verification value below. Update those values before running the upgrade.
 
-1. Check every active collector ClickHouse exporter's `endpoint` and
+Queries that use the feedback columns `source`, `target_kind`, `target_id`, or
+the `code_agent_run_links` table require chart 6.0.0 or later. Complete the
+schema job on the store before enabling those readers. Running those queries
+against 5.9.0 or an older chart fails on missing columns or tables.
+
+1. Check application instrumentation and recent spans for ordinary spans named
+   `user_feedback`, and rename them before upgrading. The name becomes reserved
+   in 6.0.0. After the upgrade, newly ingested spans with that name stay raw and
+   are excluded from normal traces, conversations, trace time bounds, and run
+   links. They produce feedback only when their feedback attributes are valid.
+2. Check every active collector ClickHouse exporter's `endpoint` and
    `connection_params` before upgrading. Keep both settings shown below,
    including on port 9000 when TLS is disabled. `connection_params` replaces
-   values for the same key in the endpoint; each resulting setting must be a
-   single `0`. The chart rejects missing, enabled, or repeated effective settings. This includes
+   values for the same key in the endpoint. Its values must be the quoted string
+   `"0"` in YAML; use `--set-string` rather than `--set` on the Helm command line.
+   Endpoint query parameters must each be a single `0`. The chart rejects
+   missing, enabled, repeated, or incorrectly typed effective settings. This includes
    `alternateConfig` and templated endpoints; other endpoint options are left
    unchanged. Query parameter names must be written without percent escapes.
    For an externally managed ConfigMap, Helm cannot inspect its contents:
@@ -1161,12 +1173,12 @@ verification value below. Update those values before running the upgrade.
    `collectorEndpointValidation.externalConfigVerified=true` to confirm that
    check and restart. Setting this value does not change or verify the external
    ConfigMap; repeat the check and restart after later changes to it.
-2. Upgrade the chart, then wait for the schema job and every collector pod to
+3. Upgrade the chart, then wait for the schema job and every collector pod to
    finish updating. Helm does not order those two operations. Old collector
    pods can still change date-looking run IDs while the rollout is in progress.
    Both run links and run-targeted feedback accept only IDs stored as strings;
    inferred dates and times stay raw rather than rating a different run.
-3. Enable feedback after both operations finish. Use trace IDs for any run that
+4. Enable feedback after both operations finish. Use trace IDs for any run that
    started before they both finished, including a run that spans the upgrade.
    Those runs may have missing links; a later span does not recover links for
    their earlier traces. Runs started afterward can use their original run IDs.
@@ -1249,7 +1261,9 @@ newest event before applying rating filters. Direct trace targets do not need a
 run link. Resolve the account's own store and match the exact agent service name
 on every read; these tables are not a boundary between untrusted tenants.
 
-Use `source` to distinguish the feedback writers. For `source = 'code'`,
+The columns and run-link table below require chart 6.0.0 or later, with its schema
+job completed. Queries using them fail on missing columns or tables in older
+installs. Use `source` to distinguish the feedback writers. For `source = 'code'`,
 `target_kind` specifies a trace or run ID. Cortex rows have `source = 'cortex'`;
 their `request_id` identifies a turn and resolves through `agent_turn_links`.
 Do not interpret a Cortex row's default `target_kind` as a code-agent run.
