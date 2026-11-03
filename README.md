@@ -22,7 +22,7 @@ The ClickHouse instance ships with production hardening: a capped memory ceiling
 
 > **Chart-version bumps no longer recreate ClickHouse:** the ClickHouse operator propagates only a fixed allowlist of stable labels onto the resources it generates. A chart-version bump changes the volatile `helm.sh/chart` label, but that label is no longer stamped onto the StatefulSet's immutable `volumeClaimTemplates`, so the bump no longer forces a delete/recreate of the ClickHouse StatefulSet.
 
-> **Upgrading to 6.0.0:** adds code-agent feedback ingestion and the compact `code_agent_run_links` table. Follow [Upgrading to 6.0.0](#upgrading-to-600) before sending feedback spans. Queries using the new feedback columns or `code_agent_run_links` require 6.0.0 or later and a completed schema job; they fail on missing columns or tables in older installs. Before upgrading, rename ordinary application spans named `user_feedback`, which becomes reserved in this release. Both collector date-inference settings are required, including for custom endpoints and installs without TLS. Use trace IDs for runs that started before the schema job and collector rollout both completed; their run links may be incomplete. Feedback is retained separately and excluded from normalized traces, conversations, and trace time bounds. The schema job extends existing feedback tables without changing existing writers. Retention follows `clickhouse.ttlDays`. Feedback extraction runs during raw trace inserts, so a backlog of unmerged data in the shared `agent_feedback` table can also reject ordinary spans, including batches with no feedback. This dependency starts on install and remains after rollback because the feedback view is kept. Before rolling back below 6.0.0, stop sending feedback: an older chart can restore normalization that treats feedback as ordinary spans. A rollback retains the new tables, views, and rows. It restores older `spans_normalized_mv` behavior, while the trace-time view continues excluding feedback and the feedback views keep writing. Rolling back to a version without the feedback grants, such as 5.8.0, also revokes `monte_carlo` INSERT on `agent_feedback` and `agent_turn_links`; the 5.9.0 prerequisite retains those grants.
+> **Upgrading to 6.0.0:** adds code-agent feedback ingestion and the compact `code_agent_run_links` table. Follow [Upgrading to 6.0.0](#upgrading-to-600) before sending feedback spans. Queries using the new feedback columns or `code_agent_run_links` require 6.0.0 or later and a completed schema job; they fail on missing columns or tables in older installs. Before upgrading, check ordinary application spans for the name `user_feedback` or `gen_ai.evaluation.name = user_feedback`; both become reserved in this release. Rename ordinary spans using that name and remove or change that attribute value. Both collector date-inference settings are required, including for custom endpoints and installs without TLS. Use trace IDs for runs that started before the schema job and collector rollout both completed; their run links may be incomplete. Feedback is retained separately and excluded from normalized traces, conversations, and trace time bounds. The schema job extends existing feedback tables without changing existing writers. Retention follows `clickhouse.ttlDays`. Feedback extraction runs during raw trace inserts, so a backlog of unmerged data in the shared `agent_feedback` table can also reject ordinary spans, including batches with no feedback. This dependency starts on install and remains after rollback because the feedback view is kept. Before rolling back below 6.0.0, stop sending feedback: an older chart can restore normalization that treats feedback as ordinary spans. A rollback retains the new tables, views, and rows. It restores older `spans_normalized_mv` behavior, while the trace-time view continues excluding feedback and the feedback views keep writing. Rolling back to a version without the feedback grants, such as 5.8.0, also revokes `monte_carlo` INSERT on `agent_feedback` and `agent_turn_links`; the 5.9.0 prerequisite retains those grants.
 
 > **Upgrading to 5.9.0:** adds the `agent_feedback` and `agent_turn_links` tables, which hold end-user feedback on agent responses and map each rated turn to its trace, and grants the `monte_carlo` user INSERT on both. Both follow `clickhouse.ttlDays`. The upgrade does not restart ClickHouse or Keeper pods. A `helm rollback` below 5.9.0 revokes the INSERT grants while the tables and their rows remain. Monte Carlo checks the grants hourly, so within an hour it stops writing and reading feedback here, and the rows expire with `clickhouse.ttlDays`.
 
@@ -1152,10 +1152,16 @@ schema job on the store before enabling those readers. Running those queries
 against 5.9.0 or an older chart fails on missing columns or tables.
 
 1. Check application instrumentation and recent spans for ordinary spans named
-   `user_feedback`, and rename them before upgrading. The name becomes reserved
-   in 6.0.0. After the upgrade, newly ingested spans with that name stay raw and
-   are excluded from normal traces, conversations, trace time bounds, and run
-   links. They produce feedback only when their feedback attributes are valid.
+   `user_feedback` or carrying `gen_ai.evaluation.name = user_feedback`. Both
+   become reserved in 6.0.0. Before upgrading, rename ordinary spans using that
+   name and remove or change that attribute value. Newly ingested spans with
+   either value stay raw and are excluded from normal traces, conversations,
+   trace time bounds, and run links. A child span carrying the attribute with no
+   explicit feedback target can also record feedback for its own trace, even
+   without a rating label. If its timestamp is later, it can replace earlier
+   feedback for the same agent and trace.
+   Feedback is extracted only from spans with `gen_ai.evaluation.name = user_feedback`
+   and a valid target; a span with only the reserved name never produces feedback.
 2. Check every active collector ClickHouse exporter's `endpoint` and
    `connection_params` before upgrading. Keep both settings shown below,
    including on port 9000 when TLS is disabled. `connection_params` replaces
@@ -1252,7 +1258,7 @@ be accurate.
 The span name `user_feedback` is reserved. A span with that name, or with
 `gen_ai.evaluation.name = user_feedback`, is excluded from normal traces,
 conversations, trace time bounds, and run links, even when its feedback attributes
-are missing or invalid. Choose another name for an ordinary application span.
+are missing or invalid. Avoid both reserved values for ordinary application spans.
 
 `agent_feedback` stores rating metadata and the exact raw-span location. Comment
 text, user identity, and optional numeric scores stay in the raw span. Feedback
