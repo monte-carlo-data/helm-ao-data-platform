@@ -589,8 +589,9 @@ llmWorker:
       memory: 1Gi
 
 # Helm cannot read a collector ConfigMap supplied outside this chart. Set true
-# only after verifying that every active ClickHouse exporter endpoint contains
-# input_format_try_infer_dates=0 and input_format_try_infer_datetimes=0.
+# only after verifying every active ClickHouse exporter's effective endpoint /
+# connection_params sets both date-inference settings to 0, and explicitly
+# restarting the collector pods to load that external configuration.
 collectorEndpointValidation:
   externalConfigVerified: false
 
@@ -600,7 +601,8 @@ collectorEndpointValidation:
 # remove TLS receiver config, change the exporter endpoint to
 # tcp://clickhouse-otel.{{ .Release.Namespace }}.svc.cluster.local:9000?input_format_try_infer_dates=0&input_format_try_infer_datetimes=0,
 # and remove the extraVolumes/extraVolumeMounts for TLS secrets. Keep both query
-# parameters; rendering fails if either is missing from the active endpoint.
+# parameters (or both settings in connection_params); rendering checks the
+# effective settings after connection_params overrides endpoint parameters.
 opentelemetry-collector:
   fullnameOverride: opentelemetry-collector
   mode: deployment

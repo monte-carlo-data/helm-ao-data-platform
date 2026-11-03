@@ -256,6 +256,64 @@ class FeedbackStorageTests(unittest.TestCase):
             f"SELECT {columns} FROM otel_traces.{table} WHERE service_name = '{self.service}' {suffix}"
         )
 
+    def test_rendered_ingest_profile_preserves_ids_until_client_overrides_it(self):
+        # Check the profile rendered by the chart against the actual server.
+        from hack.tests.test_backup_chart import render
+
+        documents = render(backup=False)
+        chi = next(doc for doc in documents if doc["kind"] == "ClickHouseInstallation")
+        settings = {
+            key.removeprefix("otel_ingest/"): value
+            for key, value in chi["spec"]["configuration"]["profiles"].items()
+            if key.startswith("otel_ingest/")
+        }
+        setting_sql = ", ".join(f"{key} = {value}" for key, value in settings.items())
+        profile, user = "profile_" + uuid.uuid4().hex, "user_" + uuid.uuid4().hex
+        table = "otel_traces.profile_probe_" + uuid.uuid4().hex
+        self.execute(
+            f"CREATE SETTINGS PROFILE {profile} SETTINGS {setting_sql}; CREATE USER {user} SETTINGS PROFILE {profile}; CREATE TABLE {table} (attrs JSON) ENGINE = Memory; GRANT INSERT ON {table} TO {user}"
+        )
+        try:
+            for overrides, expected in (
+                ([], "String"),
+                (
+                    [
+                        "--input_format_try_infer_dates=1",
+                        "--input_format_try_infer_datetimes=1",
+                    ],
+                    "Date",
+                ),
+            ):
+                result = subprocess.run(
+                    [
+                        "docker",
+                        "exec",
+                        "-i",
+                        self.container,
+                        "clickhouse-client",
+                        "--user",
+                        user,
+                        *overrides,
+                    ],
+                    input=f"INSERT INTO {table.replace('otel_traces.', self.database + '.')} FORMAT JSONEachRow\n"
+                    + '{"attrs":{"run_id":"2026-1-5"}}',
+                    text=True,
+                    capture_output=True,
+                    timeout=15,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    self.execute(
+                        f"SELECT dynamicType(attrs.run_id) AS kind FROM {table}"
+                    ),
+                    [{"kind": expected}],
+                )
+                self.execute(f"TRUNCATE TABLE {table}")
+        finally:
+            self.execute(
+                f"DROP TABLE {table}; DROP USER {user}; DROP SETTINGS PROFILE {profile}"
+            )
+
     def test_rating_comment_clear_and_raw_locator(self):
         row = self.feedback(
             **{
@@ -1024,6 +1082,87 @@ GROUP BY service_name, run_id, trace_id;
                     f"WHERE f.service_name = '{self.service}' AND f.target_id = '{rewritten}'"
                 )
                 self.assertEqual(matched, [{"trace_id": new_trace}])
+
+    def test_inferred_feedback_run_id_cannot_rate_a_different_string_run(self):
+        for original, rewritten in (
+            ("2026-1-5", "2026-01-05"),
+            ("2026-02-30", "2026-03-02"),
+            ("2026-10-29 12:00:00.123456", "2026-10-29 12:00:00.123456000"),
+        ):
+            with self.subTest(original=original):
+                trace = uuid.uuid4().hex
+                self.insert(
+                    [
+                        self.span(
+                            {"montecarlo.association_properties.run_id": rewritten},
+                            TraceId=trace,
+                        )
+                    ]
+                )
+                feedback = self.feedback(**{"montecarlo.feedback.run_id": original})
+                self.insert([feedback], legacy_inference=True)
+                raw = self.execute(
+                    "SELECT dynamicType(SpanAttributes.montecarlo.feedback.run_id) AS kind "
+                    f"FROM otel_traces.otel_traces WHERE SpanId = '{feedback['SpanId']}'"
+                )
+                self.assertTrue(raw[0]["kind"].startswith("Date"), raw)
+                self.assertEqual(
+                    self.select(
+                        "agent_feedback",
+                        "target_id",
+                        f"AND feedback_span_id = '{feedback['SpanId']}'",
+                    ),
+                    [],
+                )
+                valid = self.feedback(**{"montecarlo.feedback.run_id": rewritten})
+                self.insert([valid])
+                matched = self.execute(
+                    "SELECT DISTINCT l.trace_id FROM otel_traces.agent_feedback AS f "
+                    "INNER JOIN otel_traces.code_agent_run_links AS l "
+                    "ON f.service_name = l.service_name AND f.target_id = l.run_id "
+                    f"WHERE f.feedback_span_id = '{valid['SpanId']}'"
+                )
+                self.assertEqual(matched, [{"trace_id": trace}])
+
+    def test_upgrade_stops_extracting_inferred_feedback_run_ids(self):
+        current = (
+            SQL_DIR / "0036_code_agent_feedback_collector_categories.sql"
+        ).read_text()
+        previous = current.replace(
+            "ifNull(dynamicElement(SpanAttributes.montecarlo.feedback.run_id, 'String'), '') AS rated_run_id",
+            "JSONExtractString(attrs, 'montecarlo', 'feedback', 'run_id') AS rated_run_id",
+        )
+        self.execute(previous.replace(" ON CLUSTER '{cluster}'", ""))
+        try:
+            before = self.feedback(**{"montecarlo.feedback.run_id": "2026-1-5"})
+            self.insert([before], legacy_inference=True)
+            self.assertEqual(
+                self.select("agent_feedback", "target_id"),
+                [{"target_id": "2026-01-05"}],
+            )
+            self.apply([SQL_DIR / "0036_code_agent_feedback_collector_categories.sql"])
+            after = self.feedback(**{"montecarlo.feedback.run_id": "2026-1-5"})
+            self.insert([after], legacy_inference=True)
+            self.assertEqual(
+                self.select(
+                    "agent_feedback",
+                    "target_id",
+                    f"AND feedback_span_id = '{after['SpanId']}'",
+                ),
+                [],
+            )
+            valid = self.feedback(**{"montecarlo.feedback.run_id": "2026-1-5"})
+            self.insert([valid])
+            self.assertEqual(
+                self.select(
+                    "agent_feedback",
+                    "target_id",
+                    f"AND feedback_span_id = '{valid['SpanId']}'",
+                ),
+                [{"target_id": "2026-1-5"}],
+            )
+        finally:
+            self.apply([SQL_DIR / "0036_code_agent_feedback_collector_categories.sql"])
 
     def test_feedback_table_backlog_rejects_insert_and_recovers(self):
         self.execute("SYSTEM STOP MERGES otel_traces.agent_feedback")

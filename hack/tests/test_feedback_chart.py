@@ -1,6 +1,7 @@
 """Check the collector's JSON settings and rollout in the rendered chart."""
 
 import unittest
+import xml.etree.ElementTree as ET
 from urllib.parse import parse_qs, urlsplit
 
 import yaml
@@ -29,6 +30,7 @@ class FeedbackChartTests(unittest.TestCase):
             "input_format_try_infer_dates=1&input_format_try_infer_dates=0&input_format_try_infer_datetimes=0",
             "input_format_try_infer_dates=0&input_format_try_infer_datetimes=0&input_format_try_infer_datetimes=0",
             "secure=true#input_format_try_infer_dates=0&input_format_try_infer_datetimes=0",
+            "secure=true#&input_format_try_infer_dates=0&input_format_try_infer_datetimes=0",
             "%69nput_format_try_infer_dates=1&input_format_try_infer_dates=0&input_format_try_infer_datetimes=0",
         ):
             with (
@@ -42,6 +44,90 @@ class FeedbackChartTests(unittest.TestCase):
                     + query,
                     backup=False,
                 )
+
+    def test_connection_params_override_endpoint_settings_without_rewriting_them(self):
+        endpoints = (
+            "tcp://custom-clickhouse:9000",
+            "tcp://custom-clickhouse:9440?secure=true&input_format_try_infer_dates=1&input_format_try_infer_dates=1&input_format_try_infer_datetimes=1",
+        )
+        params = {**COLLECTOR_JSON_SETTINGS, "dial_timeout": "10s"}
+        for endpoint in endpoints:
+            with self.subTest(endpoint=endpoint):
+                documents = render(
+                    backup=False,
+                    values={
+                        "opentelemetry-collector": {
+                            "config": {
+                                "exporters": {
+                                    "clickhouse": {
+                                        "endpoint": endpoint,
+                                        "connection_params": params,
+                                    }
+                                }
+                            }
+                        }
+                    },
+                )
+                config_map = next(
+                    doc for doc in documents if "relay" in (doc.get("data") or {})
+                )
+                exporter = yaml.safe_load(config_map["data"]["relay"])["exporters"][
+                    "clickhouse"
+                ]
+                self.assertEqual(exporter["endpoint"], endpoint)
+                self.assertEqual(exporter["connection_params"], params)
+
+    def test_connection_params_cannot_enable_inference_over_a_safe_endpoint(self):
+        for key in COLLECTOR_JSON_SETTINGS:
+            for value in ("1", "", "false", True):
+                with (
+                    self.subTest(key=key, value=value),
+                    self.assertRaisesRegex(
+                        AssertionError, "input_format_try_infer_dates=0"
+                    ),
+                ):
+                    render(
+                        backup=False,
+                        values={
+                            "opentelemetry-collector": {
+                                "config": {
+                                    "exporters": {
+                                        "clickhouse": {
+                                            "connection_params": {key: value}
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                    )
+
+    def test_otel_profile_preserves_ids_without_changing_other_user_profiles(self):
+        for readonly in (False, True):
+            with self.subTest(readonly=readonly):
+                documents = render(
+                    "clickhouse.readonlyUser.enabled=" + str(readonly).lower(),
+                    "clickhouse.readonlyUser.externalSecret.secretStoreRef.name=test-store",
+                    "clickhouse.readonlyUser.externalSecret.remoteRef.key=test-key",
+                    backup=False,
+                )
+                chi = next(
+                    doc for doc in documents if doc["kind"] == "ClickHouseInstallation"
+                )
+                configuration = chi["spec"]["configuration"]
+                expected = {
+                    "otel_ingest/" + name: value
+                    for name, value in COLLECTOR_JSON_SETTINGS.items()
+                }
+                if readonly:
+                    expected["readonly_settings/readonly"] = "2"
+                self.assertEqual(configuration["profiles"], expected)
+                users = ET.fromstring(
+                    configuration["files"]["users.d/auth-methods.xml"]
+                ).find("users")
+                self.assertEqual(users.findtext("otel/profile"), "otel_ingest")
+                for user in users:
+                    if user.tag not in ("otel", "readonly_user"):
+                        self.assertIsNone(user.find("profile"))
 
     def test_alternate_config_checks_the_active_endpoint(self):
         with self.assertRaisesRegex(AssertionError, "input_format_try_infer_dates=0"):
@@ -169,6 +255,7 @@ class FeedbackChartTests(unittest.TestCase):
         for endpoint in (
             "tcp://custom-clickhouse:9440?secure=true&skip_verify=false&input_format_try_infer_dates=0&input_format_try_infer_datetimes=0",
             "tcp://custom-clickhouse:9000?input_format_try_infer_dates=0&input_format_try_infer_datetimes=0",
+            "tcp://custom-clickhouse:9440?secure=true&input_format_try_infer_dates=0&input_format_try_infer_datetimes=0#frag",
         ):
             with self.subTest(endpoint=endpoint):
                 documents = render(

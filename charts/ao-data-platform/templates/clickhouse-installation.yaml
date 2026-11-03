@@ -48,13 +48,17 @@ spec:
     # do not affect main users.
     # Adding a ClickHouse user? Also update values.yaml, templates/external-secret.yaml
     # and the authMethodsUsers helper.
-    {{- if .Values.clickhouse.readonlyUser.enabled }}
     profiles:
+      # Preserve identifier text for reconnecting clients that omit these settings.
+      # Explicit client settings still win; collector validation checks those.
+      otel_ingest/input_format_try_infer_dates: "0"
+      otel_ingest/input_format_try_infer_datetimes: "0"
+      {{- if .Values.clickhouse.readonlyUser.enabled }}
       # readonly=2 keeps the user SELECT-only but allows per-session SET; the
       # built-in `readonly` profile is mode 1 and rejects all setting changes,
       # which breaks JDBC clients (DataGrip etc.) on handshake.
       readonly_settings/readonly: "2"
-    {{- end }}
+      {{- end }}
     files:
       # The auth-methods substitution file, mounted as its own secret-backed
       # volume. Unlike the env/from_env path this refreshes in place when the
@@ -88,6 +92,7 @@ spec:
                  otel_traces.otel_traces. The MV cascade runs as schema_owner (the MV
                  DEFINER), so otel needs nothing on the normalized targets. -->
             <otel>
+              <profile>otel_ingest</profile>
               <networks>
                 {{- range $ip := .Values.clickhouse.otel.networksIp }}
                 <ip>{{ $ip }}</ip>

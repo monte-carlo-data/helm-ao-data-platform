@@ -22,7 +22,7 @@ The ClickHouse instance ships with production hardening: a capped memory ceiling
 
 > **Chart-version bumps no longer recreate ClickHouse:** the ClickHouse operator propagates only a fixed allowlist of stable labels onto the resources it generates. A chart-version bump changes the volatile `helm.sh/chart` label, but that label is no longer stamped onto the StatefulSet's immutable `volumeClaimTemplates`, so the bump no longer forces a delete/recreate of the ClickHouse StatefulSet.
 
-> **Upgrading to 5.10.0:** adds code-agent feedback ingestion and the compact `code_agent_run_links` table. Follow [Upgrading to 5.10.0](#upgrading-to-5100) before sending feedback spans. Both collector date-inference settings are required, including for custom endpoints and installs without TLS. Use trace IDs for runs that started before the schema job and collector rollout both completed; their run links may be incomplete. Feedback is retained separately and excluded from normalized traces, conversations, and trace time bounds. The schema job extends existing feedback tables without changing existing writers. Retention follows `clickhouse.ttlDays`. Feedback extraction runs during raw trace inserts, so a backlog of unmerged data in the shared `agent_feedback` table can also reject ordinary spans, including batches with no feedback. This dependency starts on install and remains after rollback because the feedback view is kept. Before rolling back below 5.10.0, stop sending feedback: an older chart can restore normalization that treats feedback as ordinary spans. A rollback retains the new tables, views, and rows. It restores older `spans_normalized_mv` behavior, while the trace-time view continues excluding feedback and the feedback views keep writing. Rolling back to a version without the feedback grants, such as 5.8.0, also revokes `monte_carlo` INSERT on `agent_feedback` and `agent_turn_links`; the 5.9.0 prerequisite retains those grants.
+> **Upgrading to 6.0.0:** adds code-agent feedback ingestion and the compact `code_agent_run_links` table. Follow [Upgrading to 6.0.0](#upgrading-to-600) before sending feedback spans. Both collector date-inference settings are required, including for custom endpoints and installs without TLS. Use trace IDs for runs that started before the schema job and collector rollout both completed; their run links may be incomplete. Feedback is retained separately and excluded from normalized traces, conversations, and trace time bounds. The schema job extends existing feedback tables without changing existing writers. Retention follows `clickhouse.ttlDays`. Feedback extraction runs during raw trace inserts, so a backlog of unmerged data in the shared `agent_feedback` table can also reject ordinary spans, including batches with no feedback. This dependency starts on install and remains after rollback because the feedback view is kept. Before rolling back below 6.0.0, stop sending feedback: an older chart can restore normalization that treats feedback as ordinary spans. A rollback retains the new tables, views, and rows. It restores older `spans_normalized_mv` behavior, while the trace-time view continues excluding feedback and the feedback views keep writing. Rolling back to a version without the feedback grants, such as 5.8.0, also revokes `monte_carlo` INSERT on `agent_feedback` and `agent_turn_links`; the 5.9.0 prerequisite retains those grants.
 
 > **Upgrading to 5.9.0:** adds the `agent_feedback` and `agent_turn_links` tables, which hold end-user feedback on agent responses and map each rated turn to its trace, and grants the `monte_carlo` user INSERT on both. Both follow `clickhouse.ttlDays`. The upgrade does not restart ClickHouse or Keeper pods. A `helm rollback` below 5.9.0 revokes the INSERT grants while the tables and their rows remain. Monte Carlo checks the grants hourly, so within an hour it stops writing and reading feedback here, and the rows expire with `clickhouse.ttlDays`.
 
@@ -1055,6 +1055,7 @@ helm upgrade ao-data-platform oci://registry-1.docker.io/montecarlodata/ao-data-
 | `llmWorker.podLabels` | `{}` | Extra labels merged onto the `llm-worker` pod template (e.g. to opt the pod into an identity/admission webhook). |
 | `opentelemetry-collector.service.type` | `ClusterIP` | OTel Collector Service type (`ClusterIP`, `LoadBalancer`) |
 | `opentelemetry-collector.service.annotations` | `{}` | Annotations on the OTel Collector Service (e.g. AWS NLB, external-dns) |
+| `collectorEndpointValidation.externalConfigVerified` | `false` | Required for an externally managed collector ConfigMap. Set to `true` only after checking both date-inference settings on every active ClickHouse exporter and restarting the collectors to load that configuration. Helm cannot inspect or restart pods for changes to an external ConfigMap. Recheck after every external change. |
 | `tls.enabled` | `true` | Enable TLS between services (requires cert-manager) |
 | `tls.certManager.createCA` | `true` | Create a self-signed CA; set to `false` if you have your own issuer |
 | `tls.certManager.existingIssuerRef` | `{}` | Use an existing issuer instead of the generated CA (e.g. `{name: my-issuer, kind: ClusterIssuer}`) |
@@ -1138,23 +1139,33 @@ opentelemetry-collector:
 
 ## Code-agent feedback
 
-### Upgrading to 5.10.0
+### Upgrading to 6.0.0
 
-1. Check the collector's active ClickHouse endpoint before upgrading. Keep both
-   settings shown below, including on port 9000 when TLS is disabled. The chart
-   rejects a generated configuration that omits either setting, enables either
-   kind of date inference, or repeats either parameter. This includes
+This is a breaking major release: custom collector endpoints that worked on
+5.9.0 now need explicit date-inference settings, including endpoints copied from
+the earlier port-9000 example. Externally managed ConfigMaps also require the
+verification value below. Update those values before running the upgrade.
+
+1. Check every active collector ClickHouse exporter's `endpoint` and
+   `connection_params` before upgrading. Keep both settings shown below,
+   including on port 9000 when TLS is disabled. `connection_params` replaces
+   values for the same key in the endpoint; each resulting setting must be a
+   single `0`. The chart rejects missing, enabled, or repeated effective settings. This includes
    `alternateConfig` and templated endpoints; other endpoint options are left
    unchanged. Query parameter names must be written without percent escapes.
    For an externally managed ConfigMap, Helm cannot inspect its contents:
-   verify every active ClickHouse exporter yourself, then set
+   update and verify every active ClickHouse exporter yourself, explicitly
+   restart its collector Deployment, DaemonSet, or StatefulSet, and wait for
+   every replacement pod to become ready. Editing that ConfigMap or upgrading
+   this chart does not trigger a collector restart. Then set
    `collectorEndpointValidation.externalConfigVerified=true` to confirm that
-   check. Setting this value does not change or verify the external ConfigMap.
+   check and restart. Setting this value does not change or verify the external
+   ConfigMap; repeat the check and restart after later changes to it.
 2. Upgrade the chart, then wait for the schema job and every collector pod to
    finish updating. Helm does not order those two operations. Old collector
    pods can still change date-looking run IDs while the rollout is in progress.
-   The run-link view accepts only values stored as strings; it leaves out
-   inferred dates and times rather than linking the rewritten ID to another run.
+   Both run links and run-targeted feedback accept only IDs stored as strings;
+   inferred dates and times stay raw rather than rating a different run.
 3. Enable feedback after both operations finish. Use trace IDs for any run that
    started before they both finished, including a run that spans the upgrade.
    Those runs may have missing links; a later span does not recover links for
@@ -1162,7 +1173,7 @@ opentelemetry-collector:
 
 To reduce the number of affected runs, first add both endpoint settings to the
 currently installed chart and finish that collector rollout, then upgrade to
-5.10.0. This is optional; it does not rebuild historical links. These checks
+6.0.0. This is optional; it does not rebuild historical links. These checks
 prevent new incorrect links, but do not change or remove links already stored.
 
 The collector's ClickHouse endpoint sets `input_format_try_infer_dates=0` and
@@ -1170,10 +1181,19 @@ The collector's ClickHouse endpoint sets `input_format_try_infer_dates=0` and
 Both settings are required to preserve the original text of date-looking run IDs,
 including when one batch contains spans from different agents. Feedback sent in a
 later batch can then match traces using the original ID. Keep both query parameters
-when overriding `opentelemetry-collector.config.exporters.clickhouse.endpoint`. Changing the
-collector configuration restarts its pods, so the settings apply to new
-connections. Complete that rollout before sending feedback. Changing only a
-ClickHouse user profile does not update already-open collector connections.
+when overriding `opentelemetry-collector.config.exporters.clickhouse.endpoint`,
+or provide both as `"0"` in that exporter's `connection_params`. Changing the
+chart-managed collector configuration restarts its pods, so the settings apply
+to new connections. External ConfigMaps require the explicit restart described
+above. Complete that rollout before sending feedback.
+
+The chart also assigns the `otel` ClickHouse user a profile with both settings
+at `0`. This protects new connections that leave the settings out, including
+external collectors using that user. It does not update already-open collector
+connections and does not override an explicit client value of `1`, so the
+collector checks and restarts above are still required. The profile changes the
+ClickHouse installation configuration; allow the operator to finish applying
+that update before enabling feedback. Other database users keep their profiles.
 
 For example, a custom TLS endpoint keeps
 `?secure=true&input_format_try_infer_dates=0&input_format_try_infer_datetimes=0`.
@@ -1184,8 +1204,10 @@ This preserves the original text of date-looking strings in all new span,
 resource, event, and link attributes. Numeric attributes and the declared
 timestamp and duration columns keep their types. Existing stored values are
 not rewritten; an ID already changed by date inference cannot be recovered
-from its stored value alone. Rollback removes these settings and restores the
-older inference behavior, so stop sending feedback before rolling back.
+from its stored value alone. Rollback removes the chart-supplied profile defaults
+and can restore the older inference behavior; explicit settings in retained
+collector values or external ConfigMaps still apply. Stop sending feedback
+before rolling back.
 
 ### Feedback spans
 
@@ -1240,7 +1262,7 @@ Links require a native string run ID and a span ingested after the run-link view
 exists. Inferred dates and times are omitted because their original text cannot
 be recovered reliably. No historical links are built. Use trace IDs for runs
 that started before the schema job and collector rollout both completed, as
-described in [Upgrading to 5.10.0](#upgrading-to-5100).
+described in [Upgrading to 6.0.0](#upgrading-to-600).
 Readers group by `(service_name, run_id, trace_id)` and read `min(first_seen)` and
 `max(last_seen)` so results remain correct before background merges. Feedback
 spans never extend these times. For string agent names, the name matches

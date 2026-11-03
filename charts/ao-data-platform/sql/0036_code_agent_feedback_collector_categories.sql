@@ -11,7 +11,8 @@ WITH
     JSONExtractString(attrs, 'gen_ai', 'evaluation', 'score', 'label') AS label,
     JSONHas(attrs, 'gen_ai', 'evaluation', 'score', 'label') AS has_label,
     JSONExtractString(attrs, 'montecarlo', 'feedback', 'trace_id') AS rated_trace_id,
-    JSONExtractString(attrs, 'montecarlo', 'feedback', 'run_id') AS rated_run_id,
+    -- Inferred dates cannot recover the caller's original run ID.
+    ifNull(dynamicElement(SpanAttributes.montecarlo.feedback.run_id, 'String'), '') AS rated_run_id,
     JSONHas(attrs, 'montecarlo', 'feedback', 'trace_id') AS has_trace_target,
     JSONHas(attrs, 'montecarlo', 'feedback', 'run_id') AS has_run_target,
     if(has_trace_target, rated_trace_id, TraceId) AS target_trace_id,
