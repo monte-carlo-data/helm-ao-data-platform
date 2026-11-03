@@ -23,7 +23,7 @@ import xml.etree.ElementTree as ET
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from test_backup_chart import CHART, one, pod, render, render_secret_template
+from test_backup_chart import CHART, one, render, render_secret_template
 
 CH_IMAGE = os.environ.get("CLICKHOUSE_TEST_IMAGE", "clickhouse/clickhouse-server:26.4.3")
 BACKUP_IMAGE = os.environ.get("BACKUP_TEST_IMAGE", "altinity/clickhouse-backup:2.8.2@sha256:bc32794f2bd95d780bf6a0fea093d0ee463ec8e7dc486ccb845ce47b3406fad5")
@@ -136,7 +136,8 @@ class Database:
         self.auth_volumes = {kind: self.name + "-" + kind for kind in ("user", "probe")}
         self.documents = documents
         root.mkdir(parents=True)
-        files = one(documents, "ClickHouseInstallation")["spec"]["configuration"]["files"]
+        configuration = one(documents, "ClickHouseInstallation")["spec"]["configuration"]
+        files = configuration["files"]
         # Keep every rendered config file, including the real S3 disk. Filtering
         # only the auth-store file would hide database startup failures in S3.
         config = {name.removeprefix("config.d/"): value for name, value in files.items()
@@ -159,8 +160,19 @@ class Database:
             disk.find("storage_configuration/disks/backups_s3/endpoint").text = "http://127.0.0.1:9001/runtime-backups/test/native/"
             config["backup.xml"] = ET.tostring(disk, encoding="unicode")
         project(root / "config", config)
-        project(root / "users", {name.removeprefix("users.d/"): value for name, value in files.items()
-                                  if name.startswith("users.d/")})
+        users = {name.removeprefix("users.d/"): value for name, value in files.items()
+                 if name.startswith("users.d/")}
+        # The operator turns configuration.profiles into users.d XML in a real install.
+        profiles = ET.Element("clickhouse")
+        profile_root = ET.SubElement(profiles, "profiles")
+        for path, value in configuration.get("profiles", {}).items():
+            node = profile_root
+            for part in path.split("/"):
+                child = node.find(part)
+                node = ET.SubElement(node, part) if child is None else child
+            node.text = str(value)
+        users["operator-profiles.xml"] = ET.tostring(profiles, encoding="unicode")
+        project(root / "users", users)
         shared = one(documents, "ExternalSecret", "ao-clickhouse-auth-methods")["spec"]["target"]["template"]["data"]["auth.xml"]
         values = {name + "_password": password for name, password in passwords.items()}
         values.update({item["secretKey"]: "-" for item in one(documents, "ExternalSecret", "ao-clickhouse-auth-methods")["spec"]["data"]
@@ -372,6 +384,16 @@ class BackupRuntimeTests(BackupRuntimeHelpers, unittest.TestCase):
     def ordinary_users_work(self, database):
         for user in ("otel", "schema_owner", "llm_worker", "monte_carlo"):
             self.assertEqual(database.query(user=user).returncode, 0, "Ordinary user login failed: " + user)
+        result = database.query(
+            "SELECT name, value FROM system.settings WHERE name IN "
+            "('input_format_try_infer_dates', 'input_format_try_infer_datetimes') FORMAT JSONEachRow",
+            user="otel",
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(
+            {row["name"]: row["value"] for row in map(json.loads, result.stdout.splitlines())},
+            {"input_format_try_infer_dates": "0", "input_format_try_infer_datetimes": "0"},
+        )
         self.assertTrue(database.running())
 
     def test_missing_optional_credentials_preserve_ordinary_users_on_start_and_restart(self):
