@@ -966,8 +966,8 @@ jobs:
           # The marker's (cloud, provider) VALUES come from llmWorker.provider via the
           # llmWorkerCloud helper (bedrock->aws, vertex->gcp, foundry->azure). A swapped branch
           # would render clean and mis-seed llm_worker_info; assert the exact seeded line per
-          # provider so the mapping is pinned at render time. The line also pins the guard that
-          # seeds only when no row exists, so an upgrade can't replace the worker's row.
+          # provider so the mapping is pinned at render time. The line also pins the 1970 date,
+          # which keeps the seed from replacing a row the worker wrote.
           command: |
             assert_marker() {  # provider cloud [extra helm --set args...]
               provider="$1"; cloud="$2"; shift 2
@@ -975,8 +975,8 @@ jobs:
                 -f charts/ao-data-platform/ci/lint-values.yaml \
                 --set llmWorker.provider="$provider" "$@" \
                 --show-only templates/schema-job.yaml > marker.yaml
-              if ! grep -qF "INSERT INTO otel_traces.llm_worker_info (cloud, provider) SELECT '${cloud}', '${provider}' WHERE (SELECT count() FROM otel_traces.llm_worker_info WHERE cloud = '${cloud}' AND provider = '${provider}') = 0" marker.yaml; then
-                echo "provider=${provider} did not seed the expected guarded marker ('${cloud}', '${provider}')."
+              if ! grep -qF "INSERT INTO otel_traces.llm_worker_info (cloud, provider, updated_at) VALUES ('${cloud}', '${provider}', toDateTime(0))" marker.yaml; then
+                echo "provider=${provider} did not seed the expected marker VALUES ('${cloud}', '${provider}', toDateTime(0))."
                 grep -n 'llm_worker_info' marker.yaml || echo "(no llm_worker_info INSERT found)"
                 exit 1
               fi
