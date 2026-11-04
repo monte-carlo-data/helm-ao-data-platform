@@ -4,7 +4,7 @@ description: Monte Carlo data platform — ClickHouse, OTel collector, and schem
 # 6.0.0 adds code-agent feedback ingestion and requires explicit collector settings.
 # Existing custom endpoints and external ConfigMaps need changes before upgrade.
 # See README "Upgrading to 6.0.0".
-version: 6.0.0
+version: 6.1.0
 type: application
 # minDomains on the ClickHouse/Keeper zone topologySpreadConstraints is GA in
 # Kubernetes 1.30. Declare the floor so a render/install against an older API
