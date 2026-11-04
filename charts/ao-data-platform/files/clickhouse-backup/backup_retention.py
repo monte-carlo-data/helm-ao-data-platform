@@ -22,6 +22,10 @@ class RetentionTimeLimit(BackupError):
     """The time budget ended before another request was sent."""
 
 
+class RemoteDeletionPending(BackupError):
+    """A saved remote deletion continues on its server after the bounded wait."""
+
+
 def chain(entries, name):
     result = []
     while name:
@@ -109,7 +113,7 @@ def validated_rows(rows, location, remote=None):
 
 
 class RemoteCleaner:
-    def __init__(self, apis, daily_days=7, history_days=30, timeout=1800, clock=time.monotonic):
+    def __init__(self, apis, daily_days=7, history_days=30, timeout=1800, clock=time.monotonic, tracker=None):
         if (not apis or type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0):
             raise BackupError("Cleanup requires copies and a positive time limit.")
         if (type(daily_days) is not int or daily_days < 1
@@ -126,6 +130,7 @@ class RemoteCleaner:
         self.execute = False
         self.allowed = set()
         self.attempted = set()
+        self.tracker = tracker
 
     def request(self, index, method, path):
         remaining = self.deadline - self.clock()
@@ -140,12 +145,7 @@ class RemoteCleaner:
                 or self.pending != (index, pieces[3], pieces[4])
                 or self.pending in self.attempted):
             raise BackupError("Cleanup refused an unexpected API request.")
-        # Reserve a full deletion request, all five follow-up reads per copy,
-        # and one spare read allowance before sending a mutation. Include the
-        # password revision lookups which each API performs before its request.
-        guard_seconds = (getattr(self.apis[index], "guard_timeout_seconds", 0)
-                         + 5 * sum(getattr(api, "guard_timeout_seconds", 0) for api in self.apis))
-        required = 300 + (5 * len(self.apis) + 1) * REQUEST_TIMEOUT_SECONDS + guard_seconds
+        required = self.deletion_reserve(index, pieces[3])
         if remaining <= required:
             raise RetentionTimeLimit("Cleanup time limit reached; no further deletion was sent.")
         self.attempted.add(self.pending)
@@ -155,11 +155,23 @@ class RemoteCleaner:
         try:
             rows = self.apis[index].request(method, path, request_timeout=300)
         except (RequestNotSent, RevisionError, RevisionCheckUnavailable):
+            if pieces[3] == "remote" and self.tracker is not None:
+                self.tracker.not_sent()
             print("Backup cleanup: " + json.dumps(
                 {"event": "delete_not_sent", **event}, sort_keys=True), flush=True)
             raise
         except BackupError:
             self.unverified = {**event, "response_status": "unknown"}
+            if pieces[3] == "remote" and self.tracker is not None:
+                state = self.tracker.observe()
+                if state == "success":
+                    # A successful server action can outlive the HTTP response.
+                    # remove() still checks the catalogs before recording success.
+                    return [{"status": "success", "operation": "delete",
+                             "backup_name": pieces[4], "location": "remote"}]
+                if state == "in progress":
+                    raise RemoteDeletionPending("S3 deletion is still running; its record is saved for the next run. "
+                                                "No retry or further deletion was sent.") from None
             raise BackupError("Deletion was not confirmed and may still be running; "
                               "no retry or further deletion was sent.") from None
         except Exception:
@@ -168,6 +180,23 @@ class RemoteCleaner:
             raise
         self.unverified = {**event, "response_status": "unknown"}
         return rows
+
+    def deletion_reserve(self, index, location):
+        # Reserve a full deletion request, all five follow-up reads per copy,
+        # and one spare read allowance before sending a mutation. Include the
+        # password revision lookups which each API performs before its request.
+        guard_seconds = (getattr(self.apis[index], "guard_timeout_seconds", 0)
+                         + 5 * sum(getattr(api, "guard_timeout_seconds", 0) for api in self.apis))
+        required = 300 + (5 * len(self.apis) + 1) * REQUEST_TIMEOUT_SECONDS + guard_seconds
+        required += getattr(self.apis[index], "mutation_guard_timeout_seconds", 0)
+        if location == "remote" and self.tracker is not None:
+            # A lost HTTP reply adds a state read, identity read, action read
+            # (including its password guard), and optional state read/write.
+            required += 70 + getattr(self.apis[index], "guard_timeout_seconds", 0)
+            # Confirm the server identity (10s) and clear the saved record with
+            # one state read and one conditional write (10s each).
+            required += 30
+        return required
 
     def idle(self):
         for index in range(len(self.apis)):
@@ -205,9 +234,24 @@ class RemoteCleaner:
         if location == "remote" and any(name in entries[0] for entries in local):
             raise BackupError("Cleanup refused S3 deletion while local records remain.")
         self.unchanged(remote, local)
+        if location == "remote" and self.tracker is not None:
+            preparation = 90 + getattr(self.apis[index], "guard_timeout_seconds", 0)
+            if self.deadline - self.clock() <= preparation + self.deletion_reserve(index, location):
+                raise RetentionTimeLimit("Not enough time remains to save and verify an S3 deletion; no request was sent.")
+            self.tracker.prepare(index, name, remote, local, self.allowed)
+            try:
+                self.tracker.before_send(index, name)
+            except BackupError:
+                self.tracker.not_sent()
+                raise
         self.pending = (index, location, name)
         event = {"copy": index, "location": location, "name": name}
-        rows = self.request(index, "POST", "/backup/delete/" + location + "/" + name)
+        try:
+            rows = self.request(index, "POST", "/backup/delete/" + location + "/" + name)
+        except RetentionTimeLimit:
+            if location == "remote" and self.tracker is not None:
+                self.tracker.not_sent()
+            raise
         if rows != [{"status": "success", "operation": "delete", "backup_name": name, "location": location}]:
             raise BackupError("Deletion response was not confirmed; no retry or further deletion was sent.")
         self.unverified["response_status"] = "success"
@@ -216,6 +260,8 @@ class RemoteCleaner:
         del target[1][name]
         self.unchanged(remote, local)
         if location == "remote":
+            if self.tracker is not None:
+                self.tracker.complete_verified()
             result["deleted"].append(name)
         self.unverified = None
         print("Backup cleanup: " + json.dumps({"event": "delete_verified", **event}, sort_keys=True), flush=True)
@@ -247,7 +293,7 @@ class RemoteCleaner:
             if isinstance(error, RetentionTimeLimit) and self.unverified is None:
                 result["stop_reason"] = "time_limit"
                 return result
-            result["stop_reason"] = "error"
+            result["stop_reason"] = "pending" if isinstance(error, RemoteDeletionPending) else "error"
             if self.unverified is not None:
                 result["unverified_deletions"].append(dict(self.unverified))
             if isinstance(error, RetentionTimeLimit):

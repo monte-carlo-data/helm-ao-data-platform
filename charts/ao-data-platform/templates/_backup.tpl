@@ -151,7 +151,9 @@ s3:
 api:
   listen: 0.0.0.0:7171
   create_integration_tables: false
-  allow_parallel: false
+  # The scheduler records one old deletion and excludes its backups from new
+  # backup bases. Its shared run ownership prevents overlapping scheduler Jobs.
+  allow_parallel: {{ .Values.clickhouse.backup.cleanup.enabled }}
   complete_resumable_after_restart: false
 {{- end -}}
 
@@ -162,6 +164,10 @@ api:
   env:
     - name: API_USERNAME
       value: backup
+    # This also changes the Pod template so the server adopts the setting when
+    # cleanup is installed; its credential/configuration snapshot is immutable.
+    - name: API_ALLOW_PARALLEL
+      value: {{ .Values.clickhouse.backup.cleanup.enabled | quote }}
     - name: GOMEMLIMIT
       value: {{ .Values.clickhouse.backup.sidecar.goMemoryLimit | quote }}
     - name: BACKUP_PASSWORD_REVISION

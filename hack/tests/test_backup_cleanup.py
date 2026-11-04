@@ -615,6 +615,7 @@ class CleanupChartTests(unittest.TestCase):
         env = {item["name"]: item.get("value") for item in job["template"]["spec"]["containers"][0]["env"]}
         self.assertEqual({key: value for key, value in env.items()
                           if key.startswith(("BACKUP_CLEANUP_", "BACKUP_KEEP_"))}, {
+            "BACKUP_CLEANUP_STATE_NAME": "otel-backup-state",
             "BACKUP_CLEANUP_ENABLED": "true", "BACKUP_CLEANUP_DRY_RUN": "true",
             "BACKUP_KEEP_LAST": "3", "BACKUP_KEEP_DAYS": "7", "BACKUP_CLEANUP_TIMEOUT_SECONDS": "900"})
         self.assertEqual(job["activeDeadlineSeconds"], 10800 + 900 + 60)

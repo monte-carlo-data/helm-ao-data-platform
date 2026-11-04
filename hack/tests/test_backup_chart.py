@@ -115,6 +115,25 @@ class BackupChartTests(unittest.TestCase):
             key = (document["kind"], document["metadata"]["name"])
             self.assertEqual(document, enabled_by_key[key], key)
 
+    def test_cleanup_state_survives_settings_changes_and_is_not_helm_owned_data(self):
+        for enabled in (False, True):
+            docs = render(f"clickhouse.backup.cleanup.enabled={str(enabled).lower()}")
+            state = one(docs, "ConfigMap", self.name + "-backup-state")
+            self.assertNotIn("data", state)
+            self.assertEqual(state["metadata"]["annotations"]["helm.sh/resource-policy"], "keep")
+            job = one(docs, "CronJob")["spec"]["jobTemplate"]["spec"]
+            env = {item["name"]: item for item in job["template"]["spec"]["containers"][0]["env"]}
+            self.assertEqual(int(env["BACKUP_JOB_TIMEOUT_SECONDS"]["value"]), job["activeDeadlineSeconds"])
+            self.assertEqual(env["POD_UID"]["valueFrom"]["fieldRef"]["fieldPath"], "metadata.uid")
+            self.assertEqual(env["BACKUP_CLEANUP_STATE_NAME"]["value"], self.name + "-backup-state")
+            scripts = one(docs, "ConfigMap", self.name + "-backup-job")["data"]
+            for name in ("pending_cleanup.py", "cleanup_store.py", "backup_retention.py", "cleanup_backups.py"):
+                self.assertEqual(scripts[name].rstrip(), (CHART / "files/clickhouse-backup" / name).read_text().rstrip())
+            sidecar = next(container for container in pod(one(docs, "ClickHouseInstallation"))["containers"]
+                           if container["name"] == "clickhouse-backup")
+            flags = {item["name"]: item["value"] for item in sidecar["env"]}
+            self.assertEqual(flags["API_ALLOW_PARALLEL"], str(enabled).lower())
+
     def test_clickhouse_keeps_existing_users_and_backup_cannot_restore(self):
         files = self.chi["spec"]["configuration"]["files"]
         disabled_files = one(self.disabled, "ClickHouseInstallation")["spec"]["configuration"]["files"]
@@ -259,7 +278,7 @@ class BackupChartTests(unittest.TestCase):
                                              f"Conflicting projected paths in {volume['name']}: {previous}, {path}")
                         paths.append(path)
 
-    def test_api_revision_rolls_pods_and_job_can_only_read_pods(self):
+    def test_api_revision_rolls_pods_and_job_has_narrow_state_access(self):
         documents = render("clickhouse.backup.api.passwordRevision=revision-2")
         chi = one(documents, "ClickHouseInstallation")
         annotations = chi["spec"]["templates"]["podTemplates"][0]["metadata"]["annotations"]
@@ -270,8 +289,10 @@ class BackupChartTests(unittest.TestCase):
         self.assertEqual(env["BACKUP_PASSWORD_REVISION_FILE"], "/credentials/revision")
         self.assertEqual(env["BACKUP_PROBE_PASSWORD_FILE"], "/probe-credentials/password")
         role = one(documents, "Role", self.name + "-backup-job")
-        self.assertEqual(role["rules"], [{"apiGroups": [""], "resources": ["pods"], "verbs": ["get"],
-                                           "resourceNames": json.loads(env["BACKUP_POD_NAMES"])}])
+        self.assertEqual(role["rules"], [
+            {"apiGroups": [""], "resources": ["pods"], "verbs": ["get"]},
+            {"apiGroups": [""], "resources": ["configmaps"], "verbs": ["get", "update"],
+             "resourceNames": [self.name + "-backup-state"]}])
         account = one(documents, "ServiceAccount", spec["serviceAccountName"])
         self.assertNotIn("annotations", account["metadata"])
         binding = one(documents, "RoleBinding", self.name + "-backup-job")
@@ -399,7 +420,8 @@ class BackupChartTests(unittest.TestCase):
                 pod_names = json.loads(env["BACKUP_POD_NAMES"])
                 self.assertEqual(pod_names, [f"chi-{chi['metadata']['name']}-{cluster['name']}-0-{i}-0" for i in range(count)])
                 role = one(docs, "Role", chi["metadata"]["name"] + "-backup-job")
-                self.assertEqual(role["rules"], [{"apiGroups": [""], "resources": ["pods"], "verbs": ["get"], "resourceNames": pod_names}])
+                self.assertEqual(role["rules"][0], {"apiGroups": [""], "resources": ["pods"], "verbs": ["get"]})
+                self.assertEqual(role["rules"][1]["resourceNames"], [chi["metadata"]["name"] + "-backup-state"])
                 self.assertEqual(len(endpoints), count)
                 self.assertEqual(len(services), count)
                 self.assertEqual(endpoints, [f"http://{chi['metadata']['name']}-backup-{i}:7171" for i in range(count)])

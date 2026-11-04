@@ -94,7 +94,8 @@ For each expired backup, dependent incrementals come before their full backup:
    intact for recovery and the next cleanup run. Removing S3 first would
    instead leave local-only records that keep their base set and need manual
    cleanup. This is why the local-first order is intentional.
-4. Check the lists again before attempting another removal. Never force a
+4. Save the exact S3 deletion before sending it. Check the lists again before
+   attempting another removal. Never force a
    dependency check or retry a request whose result is uncertain.
 
 This is a deliberate retirement of a whole S3 backup set. It can remove local
@@ -107,6 +108,51 @@ local cleanup fails or does not finish, actual S3 deletion is skipped. A preview
 may still run. Do not run separate manual backup, restore or deletion commands
 at the same time: the APIs have no shared lock across copies. Pause the schedule
 and wait for all active operations before recovery or manual maintenance.
+
+## Deletions that take longer than one request or backup interval
+
+The caller waits up to five minutes for each deletion. The stock backup server
+can continue after that wait ends. The scheduler saves the exact deletion in
+`<ClickHouse-name>-backup-state` before sending it and never sends it again.
+On later runs it checks that same operation and the saved server identity.
+
+While that old deletion is running, the next scheduled backup can use a separate
+current-day full backup. Every backup selected for retirement is excluded from
+base selection. Both local and S3 cleanup wait until the outstanding deletion
+is verified; only one remote deletion can be unfinished at a time. A new backup
+does not restart, cancel, or take over the deletion.
+
+Verification requires success from the same backup container, absence of the
+deleted backup on every copy, and unchanged existing backup records. New backup
+records are allowed. If the backup container restarted, its history disappeared,
+or it reports a failed or cancelled deletion, further cleanup stays blocked.
+Catalog absence alone is not proof that all native data was removed. Inspect the
+saved record, server logs, and affected S3 objects before changing that record.
+Do not clear it just to let cleanup proceed.
+
+The ConfigMap also prevents two scheduler Jobs, including manually started Jobs,
+from sending work together. A replacement Job takes over only after Kubernetes
+confirms the previous Pod finished or no longer exists. Elapsed time alone does
+not permit takeover. The Job can read Pods in its namespace and update only its
+named state ConfigMap; it cannot change Pods or read Secrets through this role.
+Do not force-delete a running scheduler Pod to release ownership: after a network
+partition the process may still be running even though its Pod record is gone.
+Wait for termination or stop the process on its node before allowing takeover.
+
+Installing cleanup enables the stock server's parallel-operation setting and
+changes the backup container environment, causing a rolling Pod update. Pause
+the schedule and wait for active operations before this upgrade. Direct manual
+API commands do not participate in the scheduler's ownership check and must
+still be run separately. Do not change the backup server configuration or image
+while a deletion is running. Turning cleanup off does not cancel an existing
+delete. The saved record is checked even when cleanup is disabled or in preview.
+Helm preserves the state across upgrades and retains it when backups are removed.
+
+`cleanup.timeoutSeconds` remains the budget for one Job's cleanup work. It is
+not an overall deadline for a remote delete. A large backlog can need several
+runs; an operation completed between runs is checked at the next scheduled run,
+so there can be up to one backup interval between long deletions. Watch actual
+verified removals and storage growth to confirm cleanup keeps up.
 
 ## Reading the result
 
@@ -165,7 +211,9 @@ When an attempted deletion has not been verified, the report also includes
   not mean the S3 backup was removed. `location: remote` concerns an attempted
   S3 removal.
 
-These entries need investigation and never increase `deleted_count`. Use
+A registered remote deletion still running reports `stop_reason: pending` and
+is checked on later runs. Other unverified outcomes need investigation. Neither
+increases `deleted_count`. Use
 `location` and `copy` to inspect the affected records and remote backup before
 more manual work. Cleanup sends no further deletion after an unverified result
 and never retries that request within the run.
@@ -191,8 +239,8 @@ Before each local or S3 deletion under `daily-weekly`, cleanup reserves a fixed
 30 seconds for processing. These requests need
 `300 + (5 * copies + 1) * 30` seconds, plus time for the password revision checks
 that run before each request. With two copies, those checks add 220 seconds to
-the 630-second request allowance, so more than 850 seconds must remain before
-starting a deletion. Earlier checks also use the cleanup budget, so configure
+the 630-second request allowance, so the original API checks need more than 850 seconds. The saved-operation
+checks add the allowances described below. Earlier checks also use the budget, so configure
 more time than this reserve; the default is 1800 seconds.
 
 | ClickHouse copies | Seconds that must remain before each deletion |
@@ -203,7 +251,15 @@ more time than this reserve; the default is 1800 seconds.
 | 4 | more than 1770 |
 | 5 | more than 2380 |
 
-The formula including password checks is `300 + (5*N + 1)*30 + (5*N + 1)*10*N`,
+The table above describes the API and password checks. The shared ownership
+check adds 10 seconds for each mutation. Tracked remote deletion also reserves
+`100 + 10*N` seconds for checking a lost response and saving the confirmed
+result. For two copies the final request reserve is therefore more than 980 seconds.
+Before saving a new deletion, another `90 + 10*N` seconds must remain for
+recording its intent and confirming its server identity; for two copies this
+means more than 1090 seconds before that preparation starts.
+
+The base formula including password checks is `300 + (5*N + 1)*30 + (5*N + 1)*10*N`,
 where `N` is the copy count. With four copies, 1800 seconds leaves little time
 for the earlier checks; with five or more it cannot start any deletion. Increase
 `cleanup.timeoutSeconds` above the reserve plus the time observed for those
@@ -215,8 +271,8 @@ backlog can take several runs, but repeated runs with zero verified removals
 need a longer budget, not just more waiting. The first daily-weekly preview
 read needs more than `30 + 10*N` seconds; a 60-second budget is usable only with
 one or two copies and is not enough to guarantee a full preview. No deletion
-is attempted in a preview. A request timeout or unfinished checks after deletion
-still need investigation. If initial reads fail before a plan exists, only the
+is attempted in a preview. A running registered remote deletion is checked on
+later runs; failed, missing, or changed operation history still needs investigation. If initial reads fail before a plan exists, only the
 stop message is available and no deletion has been sent.
 
 The Job deadline is `schedule.timeoutSeconds + cleanup.timeoutSeconds + 60`,
