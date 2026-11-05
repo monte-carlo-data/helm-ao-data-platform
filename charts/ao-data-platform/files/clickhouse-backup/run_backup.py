@@ -64,7 +64,7 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 class API:
     def __init__(self, endpoint, username, password, guard=None, ca_file=None, backup_api=True,
-                 guard_timeout_seconds=0):
+                 guard_timeout_seconds=0, mutation_guard=None, mutation_guard_timeout_seconds=0):
         parsed = urllib.parse.urlsplit(endpoint)
         if (parsed.scheme not in ("http", "https") or not parsed.hostname
                 or parsed.username or parsed.password or parsed.query
@@ -82,6 +82,8 @@ class API:
         self.guard = guard
         self.guard_timeout_seconds = guard_timeout_seconds
         self.backup_api = backup_api
+        self.mutation_guard = mutation_guard
+        self.mutation_guard_timeout_seconds = mutation_guard_timeout_seconds
 
     def request(self, method, path, query=None, *, request_timeout=None):
         timeout = REQUEST_TIMEOUT_SECONDS if request_timeout is None else request_timeout
@@ -97,6 +99,10 @@ class API:
             url, method=method, data=b"" if method == "POST" else None,
             headers={"Authorization": self.authorization, "Accept": "application/json"},
         )
+        # Password checks can take time. Check run ownership after those reads
+        # and immediately before sending any request that changes backups.
+        if method == "POST" and self.mutation_guard:
+            self.mutation_guard()
         try:
             with self.opener.open(request, timeout=timeout) as response:
                 payload = response.read(32 * 1024 * 1024 + 1)
@@ -308,7 +314,8 @@ def full_base(catalog, now):
 
 class Scheduler:
     def __init__(self, apis, probes, timeout=10800, poll_seconds=10,
-                 clock=time.monotonic, sleep=time.sleep, max_replica_delay=5, freshness_retry_seconds=30):
+                 clock=time.monotonic, sleep=time.sleep, max_replica_delay=5, freshness_retry_seconds=30,
+                 pending_cleanup=None):
         if len(apis) != len(probes) or not apis:
             raise BackupError("Each backup copy requires its own database freshness check.")
         self.apis = apis
@@ -319,6 +326,7 @@ class Scheduler:
         self.deadline = clock() + timeout
         self.max_replica_delay = max_replica_delay
         self.freshness_retry_seconds = freshness_retry_seconds
+        self.pending_cleanup = pending_cleanup
 
     def check_deadline(self):
         if self.clock() >= self.deadline:
@@ -358,11 +366,13 @@ class Scheduler:
                 rows = api.request("GET", "/backup/actions")
             except RequestNotSent:
                 continue
-            if any(row.get("status") == "in progress" for row in rows):
-                raise BackupError("A backup command is already running; no new backup was started.")
-            if any(row.get("status") not in ("success", "error", "cancel")
-                   or not isinstance(row.get("command"), str) or not row["command"].strip() for row in rows):
-                raise BackupError("Backup API returned an unexpected action history; could not confirm it is idle, so no new backup was started.")
+            for row in rows:
+                if row.get("status") == "in progress":
+                    if self.pending_cleanup is None or not self.pending_cleanup.allows_action(index, row):
+                        raise BackupError("A backup command is already running; no new backup was started.")
+                elif (row.get("status") not in ("success", "error", "cancel")
+                      or not isinstance(row.get("command"), str) or not row["command"].strip()):
+                    raise BackupError("Backup API returned an unexpected action history; could not confirm it is idle, so no new backup was started.")
             reachable.append((index, api))
         healthy, reasons = [], []
         for index, api in reachable:
@@ -387,8 +397,10 @@ class Scheduler:
             raise BackupError("No ClickHouse copy is caught up and able to list the trace tables and remote backups." + detail)
         # Every copy uses the same remote storage. Choose the newest complete
         # full reported there, then inspect local pointers before sending work.
-        base = full_base([row for _, _, catalog in healthy for row in catalog],
-                         now or datetime.now(timezone.utc))
+        catalog = [row for _, _, rows in healthy for row in rows]
+        if self.pending_cleanup is not None:
+            catalog = self.pending_cleanup.backup_catalog(catalog)
+        base = full_base(catalog, now or datetime.now(timezone.utc))
         if not base:
             index, api, _ = healthy[0]
             return index, api, None
@@ -573,23 +585,107 @@ def report_local_cleanup(result):
     report_cleanup_result(result, "Backup local cleanup", ("mode", "keep_full_backup_days"))
 
 
-def main():
+def configured_cleanup_lease():
+    state_name = os.environ.get("BACKUP_CLEANUP_STATE_NAME")
+    if state_name is None:
+        return None
+    from cleanup_store import CleanupRunLease, KubernetesCleanupStore
+    pod_name, pod_uid = os.environ["POD_NAME"], os.environ["POD_UID"]
+    if not pod_name or not pod_uid:
+        raise BackupError("Cleanup run ownership requires the current Pod name and UID.")
+    store = KubernetesCleanupStore(os.environ["POD_NAMESPACE"], state_name)
+    duration = int(os.environ["BACKUP_JOB_TIMEOUT_SECONDS"])
+    owner = json.dumps({"pod": pod_name, "uid": pod_uid}, sort_keys=True)
+    return CleanupRunLease(store, owner, duration=duration,
+                           owner_finished=lambda previous: cleanup_owner_finished(store, previous))
+
+
+def cleanup_owner_finished(store, owner):
+    """An expired clock alone never permits another Job to send mutations."""
     try:
-        timeout = int(os.environ.get("BACKUP_TIMEOUT_SECONDS", "10800"))
-        poll_seconds = int(os.environ.get("BACKUP_POLL_SECONDS", "10"))
-        if timeout <= 0 or poll_seconds <= 0:
-            raise BackupError("Backup timeout and polling interval must be positive seconds.")
-        options = configured_options()
-        remote_options = remote_cleanup_options(validate_numbers=False)
-        local_options = local_cleanup_options()
-        apis, probes = configured_clients()
-        name = Scheduler(apis, probes, timeout, poll_seconds, **options).run()
-    except (KeyError, ValueError, OSError):
-        print("Backup failed: check scheduler settings and the mounted password file.", file=sys.stderr)
-        return 1
-    except BackupError as error:
-        print(f"Backup failed: {error}", file=sys.stderr)
-        return 1
+        previous = json.loads(owner)
+        if (not isinstance(previous, dict) or set(previous) != {"pod", "uid"}
+                or any(not isinstance(previous[key], str) or not previous[key] for key in previous)):
+            raise ValueError()
+    except (TypeError, ValueError):
+        raise BackupError("The previous cleanup run's Pod identity is unreadable.") from None
+    pod = store.get_pod(previous["pod"])
+    if pod is None:
+        return True
+    if not isinstance(pod, dict):
+        raise BackupError("Could not confirm that the previous cleanup run's Pod finished.")
+    metadata, status = pod.get("metadata"), pod.get("status")
+    if (not isinstance(metadata, dict) or metadata.get("name") != previous["pod"]
+            or not isinstance(metadata.get("uid"), str) or not metadata["uid"]):
+        raise BackupError("Could not confirm that the previous cleanup run's Pod finished.")
+    if metadata["uid"] != previous["uid"]:
+        return True
+    if not isinstance(status, dict):
+        raise BackupError("Could not confirm that the previous cleanup run's Pod finished.")
+    return status.get("phase") in ("Failed", "Succeeded")
+
+
+def cleanup_server_identity(store, index):
+    """Read the running backup container identity afresh for every comparison."""
+    try:
+        names = json.loads(os.environ["BACKUP_POD_NAMES"])
+        revision = os.environ["BACKUP_PASSWORD_REVISION"]
+        if (not isinstance(names, list) or not names
+                or any(not isinstance(name, str) or not name for name in names)
+                or len(set(names)) != len(names) or not revision
+                or type(index) is not int or not 0 <= index < len(names)):
+            raise ValueError()
+        pod = store.get_pod(names[index])
+        metadata, status = pod["metadata"], pod["status"]
+        containers = [entry for entry in status["containerStatuses"]
+                      if entry.get("name") == "clickhouse-backup"]
+        if (metadata.get("name") != names[index]
+                or not isinstance(metadata.get("uid"), str) or not metadata["uid"]
+                or metadata.get("deletionTimestamp") is not None
+                or metadata.get("annotations", {}).get(REVISION_ANNOTATION) != revision
+                or status.get("phase") != "Running" or len(containers) != 1):
+            raise ValueError()
+        container = containers[0]
+        if (container.get("ready") is not True
+                or not isinstance(container.get("state", {}).get("running"), dict)
+                or not isinstance(container.get("containerID"), str) or not container["containerID"]
+                or type(container.get("restartCount")) is not int or container["restartCount"] < 0):
+            raise ValueError()
+        return {"pod": names[index], "uid": metadata["uid"],
+                "container_id": container["containerID"], "restart_count": container["restartCount"],
+                "password_revision": revision}
+    except (KeyError, TypeError, ValueError, AttributeError):
+        raise BackupError("Could not confirm the running backup server identity; cleanup remains pending.") from None
+
+
+def reconcile_pending_cleanup(pending):
+    try:
+        status = pending.observe()
+        if status == "success" and pending.confirm():
+            return
+    except Exception:
+        # An unfinished cleanup must not hide the next backup. The scheduler
+        # still rejects every active action except the registered deletion.
+        status = "unavailable"
+    if status == "none":
+        return
+    if status not in ("in progress", "success", "error", "cancel", "unknown", "server_changed"):
+        status = "unavailable"
+    print("Backup cleanup: " + json.dumps({"event": "pending_remote_delete", "status": status},
+                                         sort_keys=True), flush=True)
+
+
+def run_cleanup(apis, name, remote_options, local_options, pending=None):
+    if pending is not None:
+        try:
+            waiting = pending.refresh() is not None
+        except Exception:
+            waiting = True
+        if waiting:
+            print("Backup cleanup: " + json.dumps({"event": "cleanup_skipped",
+                                                  "reason": "pending_remote_delete",
+                                                  "local": True, "remote": True}, sort_keys=True), flush=True)
+            return 0
 
     local_complete = local_options is None
     if local_options is not None:
@@ -627,6 +723,8 @@ def main():
             if not execute:
                 remote_options = remote_cleanup_options()
                 remote_options.pop("execute")
+            if pending is not None:
+                remote_options["tracker"] = pending
             cleaner = Cleaner(apis, **remote_options)
             result = cleaner.run(latest_backup=name, execute=execute)
             report_cleanup(result)
@@ -649,6 +747,47 @@ def main():
             print(f"{label} stopped: unexpected {type(error).__name__}; "
                   "the backup already completed.", file=sys.stderr)
     return 0
+
+
+def main():
+    lease = None
+    try:
+        try:
+            timeout = int(os.environ.get("BACKUP_TIMEOUT_SECONDS", "10800"))
+            poll_seconds = int(os.environ.get("BACKUP_POLL_SECONDS", "10"))
+            if timeout <= 0 or poll_seconds <= 0:
+                raise BackupError("Backup timeout and polling interval must be positive seconds.")
+            options = configured_options()
+            remote_options = remote_cleanup_options(validate_numbers=False)
+            local_options = local_cleanup_options()
+            apis, probes = configured_clients()
+            lease = configured_cleanup_lease()
+            pending = None
+            if lease is not None:
+                from pending_cleanup import PendingRemoteDelete
+                lease.acquire()
+                for api in apis:
+                    api.mutation_guard = lease.assert_owned
+                    api.mutation_guard_timeout_seconds = 10
+                pending = PendingRemoteDelete(lease, apis,
+                                              lambda index: cleanup_server_identity(lease.store, index))
+                reconcile_pending_cleanup(pending)
+                options["pending_cleanup"] = pending
+            name = Scheduler(apis, probes, timeout, poll_seconds, **options).run()
+        except (KeyError, ValueError, OSError):
+            print("Backup failed: check scheduler settings and the mounted password file.", file=sys.stderr)
+            return 1
+        except BackupError as error:
+            print(f"Backup failed: {error}", file=sys.stderr)
+            return 1
+        return run_cleanup(apis, name, remote_options, local_options, pending)
+    finally:
+        if lease is not None:
+            try:
+                lease.release()
+            except Exception:
+                print("Backup cleanup run ownership could not be released; a later run must confirm "
+                      "that this Pod finished before taking ownership.", file=sys.stderr)
 
 
 if __name__ == "__main__":

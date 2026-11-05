@@ -102,6 +102,9 @@ clickhouse:
       # sets per older Monday-Sunday week, within historyDays including today.
       dailyDays: 7
       historyDays: 30
+      # Budget for this Job's cleanup checks, not a deadline for an S3 deletion.
+      # A slow deletion is saved and checked by later scheduled runs while new
+      # backups continue. Only one S3 deletion can be outstanding.
       timeoutSeconds: 1800
     localCleanup:
       # Remove older local records only when their completed S3 backups exist.

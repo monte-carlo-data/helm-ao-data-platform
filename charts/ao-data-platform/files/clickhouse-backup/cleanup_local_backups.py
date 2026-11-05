@@ -143,6 +143,7 @@ class LocalCleaner:
         guard_seconds = (getattr(self.apis[index], "guard_timeout_seconds", 0)
                          + 4 * sum(getattr(api, "guard_timeout_seconds", 0) for api in self.apis))
         required = DELETE_TIMEOUT_SECONDS + (4 * len(self.apis) + 1) * REQUEST_TIMEOUT_SECONDS + guard_seconds
+        required += getattr(self.apis[index], "mutation_guard_timeout_seconds", 0)
         if remaining <= required:
             raise LocalCleanupTimeLimit("Not enough cleanup time remains for a deletion and its checks; "
                                         "no further deletion was sent.")

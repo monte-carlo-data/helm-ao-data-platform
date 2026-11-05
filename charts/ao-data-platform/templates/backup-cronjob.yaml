@@ -12,18 +12,31 @@ data:
     {{- .Files.Get "files/clickhouse-backup/backup_common.py" | nindent 4 }}
   run_backup.py: |
     {{- .Files.Get "files/clickhouse-backup/run_backup.py" | nindent 4 }}
-  {{- if or $b.cleanup.enabled $b.localCleanup.enabled }}
+  cleanup_store.py: |
+    {{- .Files.Get "files/clickhouse-backup/cleanup_store.py" | nindent 4 }}
+  pending_cleanup.py: |
+    {{- .Files.Get "files/clickhouse-backup/pending_cleanup.py" | nindent 4 }}
+  # Always include verification code: changing cleanup settings must not forget
+  # a deletion that was already submitted by an earlier Job.
   cleanup_backups.py: |
     {{- .Files.Get "files/clickhouse-backup/cleanup_backups.py" | nindent 4 }}
-  {{- end }}
-  {{- if $b.cleanup.enabled }}
   backup_retention.py: |
     {{- .Files.Get "files/clickhouse-backup/backup_retention.py" | nindent 4 }}
-  {{- end }}
   {{- if $b.localCleanup.enabled }}
   cleanup_local_backups.py: |
     {{- .Files.Get "files/clickhouse-backup/cleanup_local_backups.py" | nindent 4 }}
   {{- end }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ao-data-platform.chiName" . }}-backup-state
+  annotations:
+    # Keep unfinished operations across disabling backups or uninstalling.
+    helm.sh/resource-policy: keep
+  labels:
+    {{- include "ao-data-platform.labels" . | nindent 4 }}
+# The scheduler owns data.state.json. Helm never supplies or resets that field.
 ---
 apiVersion: batch/v1
 kind: CronJob
@@ -80,6 +93,18 @@ spec:
                   valueFrom:
                     fieldRef:
                       fieldPath: metadata.namespace
+                - name: POD_NAME
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.name
+                - name: POD_UID
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.uid
+                - name: BACKUP_CLEANUP_STATE_NAME
+                  value: {{ printf "%s-backup-state" (include "ao-data-platform.chiName" .) | quote }}
+                - name: BACKUP_JOB_TIMEOUT_SECONDS
+                  value: {{ add (int $b.schedule.timeoutSeconds) (ternary (int $b.cleanup.timeoutSeconds) 0 $b.cleanup.enabled) (ternary (int $b.localCleanup.timeoutSeconds) 0 $b.localCleanup.enabled) 60 | quote }}
                 - name: BACKUP_POD_NAMES
                   value: {{ include "ao-data-platform.backupPodNames" . | quote }}
                 {{- if .Values.tls.enabled }}
