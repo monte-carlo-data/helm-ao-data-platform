@@ -145,8 +145,8 @@ spec:
               <auth_methods incl="schema_owner_auth_methods"/>
             </schema_owner>
             <!-- llm_worker — the llm-worker Deployment. Reads the queue, appends results, and
-                 writes its (cloud, provider) marker to llm_worker_info on startup (for monolith
-                 cloud identification). -->
+                 writes its (cloud, provider) marker and capabilities to llm_worker_info on
+                 startup and every 10 minutes (for monolith cloud and model selection). -->
             <llm_worker>
               <networks>
                 {{- range $ip := .Values.clickhouse.llmWorker.networksIp }}
