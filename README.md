@@ -328,6 +328,13 @@ The chart does not ship a default `llmWorker.image` — supply your own (`llmWor
 k3d cluster create ao-playground
 ```
 
+ClickHouse and Keeper spread across zones and require a zone label on every node, even at
+one replica. k3d nodes have none, so label them, or both pods stay `Pending`:
+
+```bash
+kubectl label nodes --all topology.kubernetes.io/zone=local-a
+```
+
 ### 2. Install cert-manager
 
 Internal TLS (collector↔ClickHouse) is always enabled and requires cert-manager:
