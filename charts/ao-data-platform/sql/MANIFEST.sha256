@@ -1,5 +1,5 @@
 # Generated upstream. Do not edit the SQL files in this directory; schema changes are made upstream and copied here.
-# Schema version: 0037
+# Schema version: 0038
 8d7aee556aefa223495a868c01a48079ef474f4bc7e9294537725cf1538191fc  0001_database.sql
 c7bc93afbd5ff9a70174e85bbaf02a1d308189d83daf4160ed593fd5dc2b4d5e  0002_traces.sql
 035b24b40c9b66d32d194e208f01e0245eb94e0c2d4617f1933b7adead6dbb04  0003_trace_id_ts.sql
@@ -37,3 +37,4 @@ a2e505c2c343cc706a741d5e4d86a973da4ba89567bfde66fcea9c15b51a60d0  0032_code_agen
 0b0cce677fa3b751e6efc695b007202da6ba1c764d064987206c2872410df6f2  0035_code_agent_run_links_trace_projection.sql
 835def8ed651b10d0f956a74b07b0fdaef87d3587448cfae0a9eb56729e071f1  0036_code_agent_feedback_collector_categories.sql
 2ba85c5b1e4ae4872ddd8aa87a5ad7b094c960074fc81aa2adbd39d93aaa7d71  0037_code_agent_run_links_native_filters.sql
+daaa6cd9e5539a197b28f3e19d7d656bf02eea93cfa0ee8d6db813abd72fbe26  0038_llm_worker_info_capabilities.sql
