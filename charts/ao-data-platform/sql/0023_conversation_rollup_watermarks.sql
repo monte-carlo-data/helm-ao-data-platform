@@ -72,11 +72,7 @@
 -- as an operator fact in the README's note on operating this table.
 --
 -- The writer runs as `monte_carlo`; the INSERT grant ships in this release
--- (templates/clickhouse-installation.yaml). Files correspond to the
--- monolith's test-fixture mirror of this chart's SQL by basename, not
--- ordinal (0019's note); its version of this table is a
--- plain ReplacingMergeTree with no ON CLUSTER — intentional, it runs on a
--- single-node test container.
+-- (templates/clickhouse-installation.yaml).
 CREATE TABLE IF NOT EXISTS otel_traces.conversation_rollup_watermarks ON CLUSTER '{cluster}'
 (
     `service_name` LowCardinality(String),

@@ -824,7 +824,31 @@ jobs:
             fi
             echo "Dev shape rendered correctly with plain-HTTP readiness."
       - run:
+          name: Schema SQL matches its manifest
+          # The SQL files are generated upstream and copied here with
+          # MANIFEST.sha256. This step catches a file edited, added or removed
+          # here without regenerating the manifest. It does not check content:
+          # an edit that also rewrites the manifest passes. The next step
+          # covers that.
+          command: |
+            cd charts/ao-data-platform/sql
+            listed=$(grep -v '^#' MANIFEST.sha256 | awk '{ print $2 }' | sort)
+            present=$(ls *.sql | sort)
+            if [ "$listed" != "$present" ]; then
+              echo "SQL files differ from MANIFEST.sha256 (< listed, > present):"
+              diff <(echo "$listed") <(echo "$present") || true
+              echo "Schema SQL is generated upstream; don't add or remove files here. See the README's Schema SQL section."
+              exit 1
+            fi
+            if ! grep -v '^#' MANIFEST.sha256 | sha256sum --check --quiet; then
+              echo "SQL files changed since they were generated (above). Schema changes are made upstream. See the README's Schema SQL section."
+              exit 1
+            fi
+            echo "Schema SQL matches MANIFEST.sha256 ($(echo "$present" | wc -l | tr -d ' ') files)."
+      - run:
           name: Schema SQL is clustered-only
+          # These rules are also enforced upstream. This re-checks the files the
+          # chart ships, whichever way a change arrives.
           # Every table the chart creates must be a path-less Replicated* engine
           # and every DDL statement must run ON CLUSTER — a plain-MergeTree or
           # non-cluster statement installs fine on one replica, then surfaces as
@@ -858,7 +882,7 @@ jobs:
             # insert-triggered and forward-only, so spans ingested in that
             # window keep the older rendering permanently. When a new file
             # supersedes a view's SELECT, the predecessor's statement must be
-            # emptied, keeping the file comment-only (see the 0021 header).
+            # emptied, keeping the file comment-only (as 0019-0021 are).
             # MODIFY SQL SECURITY (0014) is deliberately not counted — it does
             # not rewrite the SELECT.
             writers=$(awk 'FNR == 1 { tbl = "" } /^[[:space:]]*--/ { next } /ALTER TABLE/ { tbl = $3 } /MODIFY QUERY/ { print FILENAME ": " tbl }' charts/ao-data-platform/sql/*.sql)
@@ -870,7 +894,7 @@ jobs:
             if [ -n "$dups" ]; then
               echo "More than one live MODIFY QUERY writer per view:"
               echo "$writers"
-              echo "Exactly one file may carry a view's current SELECT — empty the superseded predecessor's statement (keep the file comment-only; see the 0021 header)."
+              echo "Exactly one file may carry a view's current SELECT — empty the superseded predecessor's statement (keep the file comment-only, as 0019-0021 are)."
               fail=1
             fi
             [ "$fail" -eq 0 ] && echo "Schema SQL is clustered-only: ON CLUSTER DDL, path-less Replicated engines, one live MODIFY QUERY writer per view."

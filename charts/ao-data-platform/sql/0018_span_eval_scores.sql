@@ -1,5 +1,5 @@
 -- Durable per-span eval scores — the span-grain sibling of
--- conversation_eval_scores (0013), AO-856. Written as a Q4-sibling INSERT in
+-- conversation_eval_scores (0013). Written as a sibling INSERT in
 -- the same LLM batch_group as monitor execution (no separate write service).
 -- monitor_uuid distinguishes N monitors scoring the same span. The read path
 -- returns the latest row per (service_name, trace_id, span_id, monitor_uuid,

@@ -1,10 +1,7 @@
 -- Gate conversations_normalized admission on extracted content, not entity-key
--- presence. Mirror of the monolith test fixture's
--- 0017_conversations_normalized_mv_format_gate.sql (AO-1156); files correspond
--- to that fixture by basename, not ordinal (this chart carries migrations the
--- fixture lacks, so ordinals drift).
+-- presence.
 --
--- #15242 widened the Databricks SDK export's entity stamps: an SDK agent_turn
+-- The Databricks SDK export widened its entity stamps: an SDK agent_turn
 -- root now carries traceloop.entity.input = {"question": ...} and
 -- traceloop.entity.output = a bare JSON string, plus a conversation_id via
 -- montecarlo.association_properties.thread_id. 0012's gate admits a root on
@@ -45,12 +42,12 @@
 -- and a chart rollback does not revert the gate -- 0012's CREATE is a no-op
 -- on an existing cluster, so the gate persists until superseded. Rows
 -- admitted before this migration stay; the read core's non-empty-side gate
--- in conversation_core.sql filters them.
+-- filters them.
 --
 -- One consequence for whoever enables a Traceloop-shaped service in
 -- conversation_rollup_writer.enabled_services (empty in every shipped
 -- config): a root this gate keeps out of the MV is no longer excluded by the
--- AO-1108 rollup writer's anti-join, so that writer emits it as a
+-- rollup writer's anti-join, so that writer emits it as a
 -- content-free row the read core drops. Storage only; nothing reads it.
 ALTER TABLE otel_traces.conversations_normalized_mv ON CLUSTER '{cluster}'
 MODIFY QUERY
