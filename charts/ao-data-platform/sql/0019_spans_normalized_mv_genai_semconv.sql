@@ -27,7 +27,6 @@
 -- no-op. Verified by execution: with this file inert, the resulting view is
 -- byte-identical to the previous file set on a fresh install AND on an upgrade
 -- from the previously released chart, with the DEFINER pinned by 0014 preserved.
--- Only the redundant statement is gone.
 --
 -- What that superseded SELECT added, kept here as the record of why the change
 -- was made (all of it now carried forward through 0020, 0021 and 0026 into 0027):

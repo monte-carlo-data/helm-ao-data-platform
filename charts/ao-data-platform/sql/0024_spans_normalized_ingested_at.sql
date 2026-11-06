@@ -1,11 +1,11 @@
 -- Arrival stamp for the conversation rollup writer's completeness gate. The
 -- writer may advance a service's watermark past event time T only once every
--- span with start_time < T has
--- arrived, and spans_normalized carries only event-time columns (start_time,
--- end_time, duration_ns) — so the arrival signal has to be added here. One
--- MATERIALIZED expression answers all three gate inputs per row and per
--- service: completeness (max stamp over an event-time window), incident
--- pause (stamps stop advancing), and single-agent gap (per-service stamps).
+-- span with start_time < T has arrived, and spans_normalized carries only
+-- event-time columns (start_time, end_time, duration_ns) — so the arrival
+-- signal has to be added here. One MATERIALIZED expression answers all three
+-- gate inputs per row and per service: completeness (max stamp over an
+-- event-time window), incident pause (stamps stop advancing), and single-agent
+-- gap (per-service stamps).
 --
 -- MATERIALIZED, not DEFAULT: the value is stamped by the server at insert
 -- and cannot be forged by a writer — an INSERT naming the column fails with
