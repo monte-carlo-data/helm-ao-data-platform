@@ -825,26 +825,26 @@ jobs:
             echo "Dev shape rendered correctly with plain-HTTP readiness."
       - run:
           name: Schema SQL matches its manifest
-          # The SQL files are generated upstream and copied here with
-          # MANIFEST.sha256. This step catches a file edited, added or removed
-          # here without regenerating the manifest. It does not check content:
-          # an edit that also rewrites the manifest passes. The next step
-          # covers that.
+          # The SQL files and grants.yaml are generated upstream and copied here
+          # with MANIFEST.sha256. This step catches a file edited, added or
+          # removed here without regenerating the manifest. It does not check
+          # content: an edit that also rewrites the manifest passes. The next
+          # step covers that.
           command: |
             cd charts/ao-data-platform/sql
             listed=$(grep -v '^#' MANIFEST.sha256 | awk '{ print $2 }' | sort)
-            present=$(ls *.sql | sort)
+            present=$(ls | grep -v '^MANIFEST.sha256$' | sort)
             if [ "$listed" != "$present" ]; then
-              echo "SQL files differ from MANIFEST.sha256 (< listed, > present):"
+              echo "Files differ from MANIFEST.sha256 (< listed, > present):"
               diff <(echo "$listed") <(echo "$present") || true
               echo "Schema SQL is generated upstream; don't add or remove files here. See the README's Schema SQL section."
               exit 1
             fi
             if ! grep -v '^#' MANIFEST.sha256 | sha256sum --check --quiet; then
-              echo "SQL files changed since they were generated (above). Schema changes are made upstream. See the README's Schema SQL section."
+              echo "Files changed since they were generated (above). Schema and grant changes are made upstream. See the README's Schema SQL section."
               exit 1
             fi
-            echo "Schema SQL matches MANIFEST.sha256 ($(echo "$present" | wc -l | tr -d ' ') files)."
+            echo "Schema files match MANIFEST.sha256 ($(echo "$present" | wc -l | tr -d ' ') files)."
       - run:
           name: Schema SQL is clustered-only
           # These rules are also enforced upstream. This re-checks the files the

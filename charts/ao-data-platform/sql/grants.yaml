@@ -1,0 +1,33 @@
+# Per-table grants on the otel_traces database, by role. The Helm chart renders them for its users.
+# Database-wide and server grants (reads of the whole database, system tables, CLUSTER,
+# READ ON REMOTE, DDL) are not listed here; they stay in the chart's user config.
+#
+# Format: role -> table -> privileges. Privileges are SELECT, INSERT and SYSTEM SYNC REPLICA.
+
+# The LLM worker: reads the eval queue, appends results, and records its capabilities.
+llm_worker:
+  llm_batches: [SELECT, INSERT]
+  llm_inputs: [SELECT]
+  llm_results: [SELECT, INSERT]
+  llm_worker_info: [SELECT, INSERT]
+
+# Monte Carlo's connection: reads the whole database through its database-wide grant, and
+# writes the queue, scores and derived tables its jobs maintain.
+# The rollup writes through the same connection as Monte Carlo's reads, so it shares this user.
+monte_carlo:
+  llm_inputs: [INSERT]
+  llm_batches: [INSERT]
+  conversation_eval_scores: [INSERT]
+  span_eval_scores: [INSERT]
+  trajectory_trigger_ledger: [INSERT]
+  conversation_cluster_assignments: [INSERT]
+  agent_feedback: [INSERT]
+  agent_turn_links: [INSERT]
+  # The conversation rollup writes turns and its watermark. Its exact read syncs the turns table
+  # first, and without SYSTEM SYNC REPLICA that read fails on every call.
+  conversations_normalized: [INSERT, SYSTEM SYNC REPLICA]
+  conversation_rollup_watermarks: [INSERT]
+
+# The OpenTelemetry collector writes raw spans only.
+ingest:
+  otel_traces: [INSERT]
