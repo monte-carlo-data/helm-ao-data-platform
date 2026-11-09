@@ -681,11 +681,13 @@ CircleCI runs on every push:
 
 ### Schema SQL
 
-Monte Carlo maintains the schema outside this repository. The files in `charts/ao-data-platform/sql/` are a generated copy. Don't edit, add or remove them here. To propose a schema change, open an issue that describes it instead of a PR that edits these files.
+Monte Carlo maintains the schema and its per-table grants outside this repository. The files in `charts/ao-data-platform/sql/` are a generated copy: the SQL files and `grants.yaml`. Don't edit, add or remove them here. To propose a change, open an issue that describes it instead of a PR that edits these files.
+
+A shipped statement is never edited. A schema change arrives as a new file, because the schema job re-runs every file on each upgrade and skips any object that already exists, so an edit would reach fresh installs only.
 
 `sql/MANIFEST.sha256` records each file's checksum, and the lint job fails when a file differs from it, is missing, or isn't listed. A second lint step re-checks the schema rules on the shipped files: every DDL statement runs `ON CLUSTER '{cluster}'`, every table uses a path-less `Replicated*` engine, and each view has one live `MODIFY QUERY`.
 
-Reads are granted database-wide. When a release adds a table that a service user writes to directly (`monte_carlo` or `llm_worker`), or that `llm_worker` reads, also add that user's grant in `templates/clickhouse-installation.yaml`. Without it the service fails with `ACCESS_DENIED`.
+`sql/grants.yaml` lists the per-table grants of the `llm_worker` and `monte_carlo` users, and of `otel` when `clickhouse.otel.restrictGrants` is set. `templates/clickhouse-installation.yaml` renders them from the file, and the render fails if the file or a role is missing. Database-wide reads and server grants stay in the template.
 
 ### Versioning
 

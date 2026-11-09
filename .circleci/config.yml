@@ -284,6 +284,24 @@ jobs:
               echo "readonly_user enabled but the bundle has no readonly_user element — the incl would not resolve"; exit 1; }
             echo "CHI auth-methods wiring rendered correctly."
       - run:
+          name: Per-table grants render from sql/grants.yaml
+          # The llm_worker, monte_carlo and (with restrictGrants) otel users take their
+          # per-table grants from the generated sql/grants.yaml. A render that loses the file or
+          # a role must fail or show up here, not install a user without its grants.
+          command: |
+            helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml --kube-version 1.30.0 \
+              --set clickhouse.otel.restrictGrants=true \
+              --show-only templates/clickhouse-installation.yaml > chi-grants.yaml
+            for grant in \
+              'GRANT SELECT, INSERT ON otel_traces.llm_batches' \
+              'GRANT INSERT, SYSTEM SYNC REPLICA ON otel_traces.conversations_normalized' \
+              'GRANT INSERT ON otel_traces.otel_traces'; do
+              grep -qF "<query>$grant</query>" chi-grants.yaml || {
+                echo "Missing rendered grant: $grant"; exit 1; }
+            done
+            echo "Per-table grants rendered from sql/grants.yaml."
+      - run:
           name: Gateway disabled renders no gateway resources
           # The default posture is gateway.enabled=false. Assert none of the
           # gateway-only kinds leak into a non-gateway render.

@@ -251,6 +251,34 @@ users.d/auth-methods.xml fragment (templates/clickhouse-installation.yaml), wher
 is now defined (YET-2680). Must be called with `| nindent 16` to align with that fragment's
 grants indent. Call with the root context (`.`).
 */}}
+{{/*
+Per-table grants for one role, read from sql/grants.yaml: one <query> per table, tables in
+name order. The file is generated upstream with the schema SQL and checked against
+sql/MANIFEST.sha256 in CI. The render fails if the file, the role, a table name or a
+privilege is not what the users config can safely carry.
+Usage: include "ao-data-platform.tableGrants" (dict "root" . "role" "llm_worker")
+*/}}
+{{- define "ao-data-platform.tableGrants" -}}
+{{- $grants := .root.Files.Get "sql/grants.yaml" | fromYaml -}}
+{{- if or (not $grants) (hasKey $grants "Error") -}}
+{{- fail "sql/grants.yaml is missing or is not valid YAML" -}}
+{{- end -}}
+{{- if not (hasKey $grants .role) -}}
+{{- fail (printf "sql/grants.yaml has no %s role" .role) -}}
+{{- end -}}
+{{- range $table, $privileges := get $grants .role }}
+{{- if not (regexMatch "^[a-z][a-z0-9_]*$" $table) -}}
+{{- fail (printf "sql/grants.yaml: invalid table name %q" $table) -}}
+{{- end -}}
+{{- range $privileges -}}
+{{- if not (has . (list "SELECT" "INSERT" "SYSTEM SYNC REPLICA")) -}}
+{{- fail (printf "sql/grants.yaml: %s: unknown privilege %q" $table .) -}}
+{{- end -}}
+{{- end }}
+<query>GRANT {{ join ", " $privileges }} ON otel_traces.{{ $table }}</query>
+{{- end -}}
+{{- end }}
+
 {{- define "ao-data-platform.readerGrants" -}}
 <query>GRANT SELECT ON otel_traces.*</query>
 <query>GRANT SELECT ON system.tables</query>
