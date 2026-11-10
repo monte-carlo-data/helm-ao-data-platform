@@ -99,7 +99,7 @@ spec:
                 {{- end }}
               </networks>
               {{- if .Values.clickhouse.otel.restrictGrants }}
-              <!-- Restricted to INSERT on otel_traces.otel_traces. Gated so otel can stay
+              <!-- Restricted to the `ingest` role's grants in sql/grants.yaml. Gated so otel can stay
                    broad (no <grants> element at all = implicit full access) until external
                    readers have moved to monte_carlo, then be flipped on. -->
               <grants>
@@ -172,7 +172,8 @@ spec:
                 {{- include "ao-data-platform.readerGrants" . | nindent 16 }}
                 <!-- The per-table writes Monte Carlo's jobs make: the eval queue, scores, the
                      conversation turn rollup and its watermark. Generated upstream in
-                     sql/grants.yaml, which explains each one. -->
+                     sql/grants.yaml; see sql/0022 and the README's watermark note for the
+                     rollup writer. -->
                 {{- include "ao-data-platform.tableGrants" (dict "root" . "role" "monte_carlo") | trim | nindent 16 }}
                 <!-- The rollup writer's correctness-bearing reads (ledger anti-join, cursor read,
                      duplicate assertion) go through clusterAllReplicas, which is gated by READ

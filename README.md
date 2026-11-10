@@ -683,11 +683,11 @@ CircleCI runs on every push:
 
 Monte Carlo maintains the schema and its per-table grants outside this repository. The files in `charts/ao-data-platform/sql/` are a generated copy: the SQL files and `grants.yaml`. Don't edit, add or remove them here. To propose a change, open an issue that describes it instead of a PR that edits these files.
 
-A shipped statement is never edited. A schema change arrives as a new file, because the schema job re-runs every file on each upgrade and skips any object that already exists, so an edit would reach fresh installs only.
+A schema change arrives as a new file. The schema job re-runs every file on each install and upgrade. `CREATE … IF NOT EXISTS` skips objects that already exist, so editing one would only change fresh installs. When a new file replaces a view's `SELECT`, the earlier file's statement is emptied and its comments are kept.
 
 `sql/MANIFEST.sha256` records each file's checksum, and the lint job fails when a file differs from it, is missing, or isn't listed. A second lint step re-checks the schema rules on the shipped files: every DDL statement runs `ON CLUSTER '{cluster}'`, every table uses a path-less `Replicated*` engine, and each view has one live `MODIFY QUERY`.
 
-`sql/grants.yaml` lists the per-table grants of the `llm_worker` and `monte_carlo` users, and of `otel` when `clickhouse.otel.restrictGrants` is set. `templates/clickhouse-installation.yaml` renders them from the file, and the render fails if the file or a role is missing. Database-wide reads and server grants stay in the template.
+`sql/grants.yaml` lists the per-table grants of the `llm_worker` and `monte_carlo` users, and of `otel` (role `ingest`) when `clickhouse.otel.restrictGrants` is set. `templates/clickhouse-installation.yaml` renders them from the file, and the render fails if the file is missing, if it has a role other than `ingest`, `llm_worker` or `monte_carlo`, or if a role is missing or empty or a table has no privileges. Database-wide reads and server grants stay in the template.
 
 ### Versioning
 

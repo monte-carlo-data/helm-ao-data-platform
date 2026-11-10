@@ -248,37 +248,9 @@ telemetry DB plus the metadata reads DataGrip/MCP and Monte Carlo data-source mo
 this as the single source of truth — adding a read target means editing it here once.
 Emits `<query>GRANT …</query>` elements for inclusion under a `<grants>` element in the
 users.d/auth-methods.xml fragment (templates/clickhouse-installation.yaml), where every SQL user
-is now defined (YET-2680). Must be called with `| nindent 16` to align with that fragment's
+is defined. Must be called with `| nindent 16` to align with that fragment's
 grants indent. Call with the root context (`.`).
 */}}
-{{/*
-Per-table grants for one role, read from sql/grants.yaml: one <query> per table, tables in
-name order. The file is generated upstream with the schema SQL and checked against
-sql/MANIFEST.sha256 in CI. The render fails if the file, the role, a table name or a
-privilege is not what the users config can safely carry.
-Usage: include "ao-data-platform.tableGrants" (dict "root" . "role" "llm_worker")
-*/}}
-{{- define "ao-data-platform.tableGrants" -}}
-{{- $grants := .root.Files.Get "sql/grants.yaml" | fromYaml -}}
-{{- if or (not $grants) (hasKey $grants "Error") -}}
-{{- fail "sql/grants.yaml is missing or is not valid YAML" -}}
-{{- end -}}
-{{- if not (hasKey $grants .role) -}}
-{{- fail (printf "sql/grants.yaml has no %s role" .role) -}}
-{{- end -}}
-{{- range $table, $privileges := get $grants .role }}
-{{- if not (regexMatch "^[a-z][a-z0-9_]*$" $table) -}}
-{{- fail (printf "sql/grants.yaml: invalid table name %q" $table) -}}
-{{- end -}}
-{{- range $privileges -}}
-{{- if not (has . (list "SELECT" "INSERT" "SYSTEM SYNC REPLICA")) -}}
-{{- fail (printf "sql/grants.yaml: %s: unknown privilege %q" $table .) -}}
-{{- end -}}
-{{- end }}
-<query>GRANT {{ join ", " $privileges }} ON otel_traces.{{ $table }}</query>
-{{- end -}}
-{{- end }}
-
 {{- define "ao-data-platform.readerGrants" -}}
 <query>GRANT SELECT ON otel_traces.*</query>
 <query>GRANT SELECT ON system.tables</query>
@@ -288,6 +260,46 @@ Usage: include "ao-data-platform.tableGrants" (dict "root" . "role" "llm_worker"
      getTraceTimeSeries time series), not a metadata read — but reader clients need it. -->
 <query>GRANT SELECT ON system.numbers</query>
 <query>GRANT SELECT ON information_schema.*</query>
+{{- end }}
+
+{{/*
+Per-table grants for one role, read from sql/grants.yaml: one <query> per table, tables in
+name order. The file is generated upstream with the schema SQL and checked against
+sql/MANIFEST.sha256 in CI. The render fails if the file is missing or invalid, a role is
+missing, empty or unknown, a table has no privileges, a table name isn't `[a-z][a-z0-9_]*`, or a
+privilege isn't SELECT, INSERT or SYSTEM SYNC REPLICA.
+Usage: include "ao-data-platform.tableGrants" (dict "root" . "role" "llm_worker")
+*/}}
+{{- define "ao-data-platform.tableGrants" -}}
+{{- $grants := .root.Files.Get "sql/grants.yaml" | fromYaml -}}
+{{- if or (not $grants) (hasKey $grants "Error") -}}
+{{- fail "sql/grants.yaml is missing or is not valid YAML" -}}
+{{- end -}}
+{{- range $name, $_ := $grants -}}
+{{- if not (has $name (list "ingest" "llm_worker" "monte_carlo")) -}}
+{{- fail (printf "sql/grants.yaml: unknown role %q" $name) -}}
+{{- end -}}
+{{- end -}}
+{{- if not (hasKey $grants .role) -}}
+{{- fail (printf "sql/grants.yaml has no %s role" .role) -}}
+{{- end -}}
+{{- if not (get $grants .role) -}}
+{{- fail (printf "sql/grants.yaml: the %s role has no tables" .role) -}}
+{{- end -}}
+{{- range $table, $privileges := get $grants .role }}
+{{- if not (regexMatch "^[a-z][a-z0-9_]*$" $table) -}}
+{{- fail (printf "sql/grants.yaml: invalid table name %q" $table) -}}
+{{- end -}}
+{{- if not $privileges -}}
+{{- fail (printf "sql/grants.yaml: %s: no privileges" $table) -}}
+{{- end -}}
+{{- range $privileges -}}
+{{- if not (has . (list "SELECT" "INSERT" "SYSTEM SYNC REPLICA")) -}}
+{{- fail (printf "sql/grants.yaml: %s: unknown privilege %q" $table .) -}}
+{{- end -}}
+{{- end }}
+<query>GRANT {{ join ", " $privileges }} ON otel_traces.{{ $table }}</query>
+{{- end -}}
 {{- end }}
 
 {{/*

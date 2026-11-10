@@ -288,6 +288,8 @@ jobs:
           # The llm_worker, monte_carlo and (with restrictGrants) otel users take their
           # per-table grants from the generated sql/grants.yaml. A render that loses the file or
           # a role must fail or show up here, not install a user without its grants.
+          # The render fails on a top-level role other than the three, so helm template catches it.
+          # This checks one rendered grant per user; hack/tests has the full per-user comparison.
           command: |
             helm template charts/ao-data-platform \
               -f charts/ao-data-platform/ci/lint-values.yaml --kube-version 1.30.0 \
@@ -300,7 +302,7 @@ jobs:
               grep -qF "<query>$grant</query>" chi-grants.yaml || {
                 echo "Missing rendered grant: $grant"; exit 1; }
             done
-            echo "Per-table grants rendered from sql/grants.yaml."
+            echo "One rendered grant per user found for sql/grants.yaml."
       - run:
           name: Gateway disabled renders no gateway resources
           # The default posture is gateway.enabled=false. Assert none of the
@@ -847,15 +849,16 @@ jobs:
           # with MANIFEST.sha256. This step catches a file edited, added or
           # removed here without regenerating the manifest. It does not check
           # content: an edit that also rewrites the manifest passes. The next
-          # step covers that.
+          # step re-checks the schema rules on the SQL files; grants.yaml content
+          # is trusted from upstream.
           command: |
             cd charts/ao-data-platform/sql
             listed=$(grep -v '^#' MANIFEST.sha256 | awk '{ print $2 }' | sort)
-            present=$(ls | grep -v '^MANIFEST.sha256$' | sort)
+            present=$(ls -A | grep -v '^MANIFEST.sha256$' | sort)
             if [ "$listed" != "$present" ]; then
               echo "Files differ from MANIFEST.sha256 (< listed, > present):"
               diff <(echo "$listed") <(echo "$present") || true
-              echo "Schema SQL is generated upstream; don't add or remove files here. See the README's Schema SQL section."
+              echo "Schema and grant files are generated upstream; don't add or remove files here. See the README's Schema SQL section."
               exit 1
             fi
             if ! grep -v '^#' MANIFEST.sha256 | sha256sum --check --quiet; then
