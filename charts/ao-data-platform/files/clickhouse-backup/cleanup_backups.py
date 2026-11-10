@@ -12,7 +12,7 @@ policy delegates to backup_retention, which requires stock 2.8.2 for deletion.
 from datetime import datetime, timedelta, timezone
 import time
 
-from backup_common import (BackupError, DELETION_UNAVAILABLE, NAME_PREFIX,
+from backup_common import (BackupError, DELETION_UNAVAILABLE, NAME_PREFIX, REMOTE_EMBEDDED_DESCRIPTIONS,
                            REQUEST_TIMEOUT_SECONDS, SCHEDULED_NAME, broken_local_entry)
 
 
@@ -43,10 +43,12 @@ def catalog(rows, location, remote=None):
     for row in rows:
         name, required = row.get("name"), row.get("required")
         description = row.get("desc")
+        healthy = (description in REMOTE_EMBEDDED_DESCRIPTIONS if location == "remote"
+                   else description == "embedded")
         broken = broken_local_entry(row)
         if (not isinstance(name, str) or not name or name in result
                 or not isinstance(required, str) or row.get("location") != location
-                or (description != ("directory, embedded" if location == "remote" else "embedded")
+                or (not healthy
                     and not (location == "local" and broken and remote is not None
                              and (name in remote or SCHEDULED_NAME.fullmatch(name))))):
             raise BackupError("Cleanup stopped: backup metadata is broken, duplicated, or unsupported.")

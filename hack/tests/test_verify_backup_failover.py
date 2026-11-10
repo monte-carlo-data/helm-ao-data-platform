@@ -60,6 +60,7 @@ class CopyAPI:
         self.calls = []
         self.unavailable = unavailable
         self.fail_post = False
+        self.created_desc = "directory, embedded"
 
     def request(self, method, path, query=None):
         self.calls.append((method, path, query))
@@ -74,7 +75,7 @@ class CopyAPI:
             required = "" if operation == "download" else FULL
             self.local[name] = metadata(name, "local", required)
             if operation == "create_remote":
-                self.remote[name] = metadata(name, "remote", required)
+                self.remote[name] = dict(metadata(name, "remote", required), desc=self.created_desc)
             identifier = "operation-" + str(len(self.posts))
             self.history.append({"operation_id":identifier, "command":operation + " " + name, "status":"success"})
             return [{"status":"acknowledged", "operation":operation, "backup_name":name, "operation_id":identifier}]
@@ -173,6 +174,18 @@ class PodTests(unittest.TestCase):
         self.assertEqual(result["required"], FULL)
         self.assertEqual(self.copies[0].posts, [])
         self.assertEqual([p[0] for p in self.copies[1].posts], ["/backup/download/" + FULL, "/backup/create_remote"])
+
+    def test_bundled_incremental_can_use_existing_directory_or_tar_full(self):
+        for description in ("directory, embedded", "tar, embedded"):
+            with self.subTest(description=description):
+                self.setUp()
+                self.remote[FULL]["desc"] = description
+                self.copies[1].created_desc = "tar, embedded"
+                result = self.run_pod()
+                self.assertEqual(result["status"], "passed")
+                self.assertEqual(result["required"], FULL)
+                self.assertEqual(self.copies[0].posts, [])
+                self.assertEqual(len(self.copies[1].posts), 2)
 
     def test_completed_deletions_without_ids_on_both_copies_allow_verification(self):
         for location, kind, identifier in product(("local", "remote"), ("full", "incremental"),

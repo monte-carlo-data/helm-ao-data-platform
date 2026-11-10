@@ -27,7 +27,8 @@ import urllib.parse
 import urllib.request
 
 
-from backup_common import (BackupError, CleanupStopped, DELETION_UNAVAILABLE, REQUEST_TIMEOUT_SECONDS,
+from backup_common import (BackupError, CleanupStopped, DELETION_UNAVAILABLE, REMOTE_EMBEDDED_DESCRIPTIONS,
+                           REQUEST_TIMEOUT_SECONDS,
                            RequestNotSent, RevisionError, RevisionCheckUnavailable,
                            SCHEDULED_NAME, broken_local_entry, scheduled_name)
 
@@ -285,9 +286,8 @@ def full_base(catalog, now):
     """Only use this schedule's complete embedded full backups from today.
 
     The API puts broken-backup errors in `desc`, replacing the format. Requiring
-    the exact healthy value excludes those entries. Its "directory" format
-    depends on s3.compression_format: none in templates/_backup.tpl; keep that
-    setting and this check (including the completed-backup check below) in sync.
+    an exact healthy value excludes those entries. Keep accepting existing
+    directory backups when new backups bundle their catalog files in tar.
     A full backup must also have no `required` dependency.
     """
     candidates = []
@@ -295,7 +295,7 @@ def full_base(catalog, now):
         name = row.get("name", "")
         match = SCHEDULED_NAME.fullmatch(name) if isinstance(name, str) else None
         if (not match or match[1] != "full" or row.get("location") != "remote"
-                or row.get("desc") != "directory, embedded" or row.get("required") != ""):
+                or row.get("desc") not in REMOTE_EMBEDDED_DESCRIPTIONS or row.get("required") != ""):
             continue
         try:
             created = datetime.strptime(match[2], "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
@@ -491,7 +491,7 @@ class Scheduler:
         self.operation(api, "create_remote", name, "/backup/create_remote", query)
         rows = self.read(api, "/backup/list/remote")
         if not any(row.get("name") == name and row.get("location") == "remote"
-                   and row.get("desc") == "directory, embedded"
+                   and row.get("desc") in REMOTE_EMBEDDED_DESCRIPTIONS
                    and row.get("required") == (base or "") for row in rows):
             raise BackupError("The backup operation finished, but its completed entry was not found in S3.")
         print(f"Verified completed {kind} backup {name} in S3.", flush=True)

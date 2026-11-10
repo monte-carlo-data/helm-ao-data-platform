@@ -370,7 +370,7 @@ described above, but it does not remove the files.
 To remove a specific incomplete entry manually, first pause scheduled work and
 verify that no backup, restore, or cleanup is running on any copy. Check that
 the local entry has one of those two descriptions and that the same name has a
-healthy completed remote entry (`directory, embedded`) in the shared catalog.
+healthy completed remote entry (`directory, embedded` or `tar, embedded`) in the shared catalog.
 On the affected copy, use the configured tool's `delete local <name>` for that
 exact entry. If the tool refuses because another backup depends on it, stop and
 inspect that dependency; do not force deletion. Do not use this procedure for a

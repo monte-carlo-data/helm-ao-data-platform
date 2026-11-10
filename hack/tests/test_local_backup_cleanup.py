@@ -195,6 +195,17 @@ class FakeAPI:
 
 
 class OperationTests(unittest.TestCase):
+    def test_mixed_remote_formats_do_not_change_local_retention_or_remote_files(self):
+        world = World()
+        for index in range(2):
+            for backup in (AI, B, CI):
+                world.row_overrides[index, "remote", backup] = {"desc": "tar, embedded"}
+        result = world.run(execute=True)
+        self.assertEqual(result["deleted"], result["delete"])
+        self.assertEqual(world.remote, GROUPS)
+        self.assertEqual(world.local, [{B: "", BI: B, C: "", CI: C}] * 2)
+        self.assertTrue(all(call[2].startswith(cleanup.DELETE_PREFIX) for call in world.writes()))
+
     def test_preview_reads_only_and_does_not_change_either_copy_or_remote(self):
         world = World()
         result = world.run()

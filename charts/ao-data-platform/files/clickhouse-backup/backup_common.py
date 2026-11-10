@@ -5,6 +5,7 @@ import uuid
 
 
 REQUEST_TIMEOUT_SECONDS = 30
+REMOTE_EMBEDDED_DESCRIPTIONS = ("directory, embedded", "tar, embedded")
 NAME_PREFIX = "ao-otel-"
 SCHEDULED_NAME = re.compile(re.escape(NAME_PREFIX) + r"(full|incremental)-(\d{8}T\d{6}Z)-[0-9a-f]{8}\Z")
 DELETION_UNAVAILABLE = "S3 deletion requires daily-weekly retention; count-and-age supports preview only."

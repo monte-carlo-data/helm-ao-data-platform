@@ -146,7 +146,7 @@ s3:
   bucket: {{ .Values.clickhouse.backup.aws.bucket | quote }}
   region: {{ .Values.clickhouse.backup.aws.region | quote }}
   path: {{ printf "%s/catalog" .Values.clickhouse.backup.aws.path | quote }}
-  compression_format: none
+  compression_format: tar
   acl: ""
 api:
   listen: 0.0.0.0:7171

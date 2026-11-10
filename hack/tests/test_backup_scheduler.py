@@ -61,13 +61,15 @@ class Clock:
 
 
 class FakeAPI:
-    def __init__(self, catalog=None, local=None, history=None, created_required=""):
+    def __init__(self, catalog=None, local=None, history=None, created_required="",
+                 created_desc="directory, embedded"):
         self.catalog = list(catalog or [])
         self.local = list(local or [])
         self.history = list(history or [])
         # The server's completed dependency is independent of the submitted
         # diff-from-remote value, so verification must compare the two.
         self.created_required = created_required
+        self.created_desc = created_desc
         self.calls = []
         self.unavailable = False
         self.table_failure = False
@@ -115,7 +117,7 @@ class FakeAPI:
                 if operation == "download":
                     self.local.append(dict(name=name, location="local", desc="embedded", required=""))
                 elif self.publish_remote:
-                    self.catalog.append(remote(name, self.created_required))
+                    self.catalog.append(dict(remote(name, self.created_required), desc=self.created_desc))
             for row in self.history:
                 if row.get("operation_id") == self.operation_id:
                     row["status"] = status
@@ -364,6 +366,38 @@ class SchedulerTests(unittest.TestCase):
     def test_latest_completed_full_of_today_wins(self):
         latest = "ao-otel-full-20260929T040000Z-abcdef12"
         self.assertEqual(backup.full_base([remote(), remote(latest)], NOW), latest)
+
+    def test_latest_full_wins_across_directory_and_tar_catalogs(self):
+        latest = "ao-otel-full-20260929T040000Z-abcdef12"
+        for older, newer in (("directory, embedded", "tar, embedded"),
+                             ("tar, embedded", "directory, embedded")):
+            with self.subTest(older=older, newer=newer):
+                rows = [dict(remote(), desc=older), dict(remote(latest), desc=newer)]
+                self.assertEqual(backup.full_base(rows, NOW), latest)
+
+    def test_tar_full_and_incremental_complete_with_either_base_format(self):
+        first = FakeAPI(created_desc="tar, embedded")
+        name = self.run_scheduler(first)
+        self.assertIn("-full-", name)
+        self.assertEqual(first.catalog[-1]["desc"], "tar, embedded")
+        for desc in ("directory, embedded", "tar, embedded"):
+            with self.subTest(base_format=desc):
+                first, second = FakeAPI(), FakeAPI([dict(remote(), desc=desc)],
+                                                   created_required=FULL, created_desc="tar, embedded")
+                first.unavailable = True
+                name = self.run_scheduler(first, second)
+                self.assertIn("-incremental-", name)
+                self.assertEqual(second.posts[0], ("POST", "/backup/download/" + FULL, None))
+                self.assertEqual(second.posts[1][2]["diff-from-remote"], FULL)
+                self.assertEqual(second.local[0]["desc"], "embedded")
+
+    def test_unknown_or_broken_formats_cannot_be_bases_or_verified_completions(self):
+        for desc in ("embedded", "tar", "tar, embedded, broken", "gzip, embedded", None, []):
+            with self.subTest(desc=desc):
+                self.assertIsNone(backup.full_base([dict(remote(), desc=desc)], NOW))
+                first = FakeAPI(created_desc=desc)
+                with self.assertRaisesRegex(backup.BackupError, "completed entry was not found"):
+                    self.run_scheduler(first)
 
     def test_fallback_downloads_full_metadata_from_shared_remote_catalog(self):
         first, second = FakeAPI(), FakeAPI([remote()], created_required=FULL)

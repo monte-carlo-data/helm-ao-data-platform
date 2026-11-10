@@ -194,6 +194,38 @@ class API:
 
 
 class ExecutionTests(unittest.TestCase):
+    def test_mixed_directory_and_tar_families_keep_same_backups_and_delete_in_dependency_order(self):
+        for full_desc, incremental_desc in (("directory, embedded", "tar, embedded"),
+                                            ("tar, embedded", "directory, embedded")):
+            with self.subTest(full=full_desc, incremental=incremental_desc):
+                world = World()
+                for copy in range(2):
+                    for backup, required in BASE.items():
+                        world.row_overrides[copy, "remote", backup] = {
+                            "desc": incremental_desc if required else full_desc}
+                preview = world.run(execute=False)
+                self.assertEqual(preview["delete"], [OLD_I, OLD])
+                self.assertEqual(set(preview["kept"]), {NEW, NEW_I})
+                self.assertEqual(world.writes(), [])
+                result = world.run()
+                self.assertEqual(result["deleted"], [OLD_I, OLD])
+                self.assertEqual(world.remote, group(0))
+                self.assertEqual(world.local, [group(0), group(0)])
+
+    def test_unknown_remote_formats_and_tar_local_format_stop_before_deletion(self):
+        cases = [("remote", desc) for desc in
+                 ("embedded", "tar", "tar, embedded, broken", "gzip, embedded", None, [])]
+        cases.append(("local", "tar, embedded"))
+        for location, description in cases:
+            with self.subTest(location=location, description=description):
+                world = World()
+                world.row_overrides[1, location, OLD_I] = {"desc": description}
+                with self.assertRaisesRegex(legacy.BackupError, "metadata is broken, duplicated, or unsupported"):
+                    world.run()
+                self.assertEqual(world.writes(), [])
+                self.assertEqual(world.remote, BASE)
+                self.assertEqual(world.local, [BASE, BASE])
+
     def test_preview_preserves_all_files_and_does_not_require_new_version(self):
         world = World()
         world.versions = [[{"version": "2.8.1"}], [{"version": "2.8.1"}]]

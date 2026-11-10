@@ -194,7 +194,7 @@ class BackupChartTests(unittest.TestCase):
         self.assertFalse(config["general"]["rbac_backup_always"])
         self.assertFalse(config["api"]["allow_parallel"])
         self.assertFalse(config["api"]["create_integration_tables"])
-        self.assertEqual(config["s3"]["compression_format"], "none")
+        self.assertEqual(config["s3"]["compression_format"], "tar")
         self.assertEqual(config["s3"]["acl"], "")
         self.assertNotIn("password", config["api"])
 
