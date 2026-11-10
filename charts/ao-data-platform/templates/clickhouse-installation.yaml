@@ -39,13 +39,12 @@ spec:
       nodes:
         - host: {{ include "ao-data-platform.keeperServiceName" . }}
           port: 2181
-    # No SQL users in the operator spec (YET-2680, Spike Finding 7): the operator
-    # renders a password hash for any password-less users: entry, which cannot
-    # coexist with the <auth_methods> the rotation mechanism needs — ClickHouse
-    # rejects the whole users config. Main users are defined in the
-    # users.d/auth-methods.xml fragment below. Optional backup/probe users have
-    # separate XML stores in backup-external-secret.yaml so missing backup Secrets
-    # do not affect main users.
+    # No SQL users in the operator spec: the operator renders a password hash for
+    # any password-less users: entry, which cannot coexist with the <auth_methods>
+    # the rotation mechanism needs — ClickHouse rejects the whole users config.
+    # Main users are defined in the users.d/auth-methods.xml fragment below.
+    # Optional backup/probe users have separate XML stores in
+    # backup-external-secret.yaml so missing backup Secrets do not affect main users.
     # Adding a ClickHouse user? Also update values.yaml, templates/external-secret.yaml
     # and the authMethodsUsers helper.
     profiles:
@@ -146,7 +145,7 @@ spec:
             </schema_owner>
             <!-- llm_worker — the llm-worker Deployment. Reads the queue, appends results, and
                  writes its (cloud, provider) marker and capabilities to llm_worker_info on
-                 startup and every 10 minutes (for monolith cloud and model selection). -->
+                 startup and every 10 minutes (for the backend's cloud and model selection). -->
             <llm_worker>
               <networks>
                 {{- range $ip := .Values.clickhouse.llmWorker.networksIp }}

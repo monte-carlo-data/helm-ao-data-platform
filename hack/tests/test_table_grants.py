@@ -47,12 +47,17 @@ class TableGrantsTests(unittest.TestCase):
                 expected = {f"GRANT {', '.join(privileges)} ON otel_traces.{table}"
                             for table, privileges in grants[role].items()}
                 queries = [n.text for n in users.findall(f"users/{username}/grants/query")]
-                rendered = {q for q in queries if NAMED_TABLE_GRANT.match(q)}
                 self.assertTrue(expected)
-                self.assertEqual(rendered, expected)
                 if username == "monte_carlo":
+                    # monte_carlo also holds the reader bundle, so compare its table grants only.
+                    rendered = {q for q in queries if NAMED_TABLE_GRANT.match(q)}
+                    self.assertEqual(rendered, expected)
                     self.assertIn("GRANT SELECT ON otel_traces.*", queries)
                     self.assertTrue(any(q.startswith("GRANT READ ON REMOTE") for q in queries), queries)
+                else:
+                    # Every grant these users hold comes from grants.yaml. A database-wide
+                    # grant here would hide the table grants on its privilege.
+                    self.assertEqual(sorted(queries), sorted(expected))
 
     def test_invalid_grants_file_fails_rendering(self):
         real = yaml.safe_load((CHART / GRANTS_FILE).read_text())

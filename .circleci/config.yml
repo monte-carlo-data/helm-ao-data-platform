@@ -142,7 +142,7 @@ jobs:
       - run:
           name: Auth-methods bundle renders both template branches
           # The bundle is what gives the ClickHouse server two valid passwords
-          # during a rotation (YET-2680). Two things can silently break it: a
+          # during a rotation. Two things can silently break it: a
           # user present in the CHI's incl fragment but missing from the bundle
           # (ClickHouse rejects an empty <auth_methods>), and a lost ESO-side
           # `if` around the previous method (the steady-state sentinel "-" would
@@ -210,9 +210,9 @@ jobs:
           name: CHI users live wholly in the fragment, one incl per enabled user
           # Three invariants: (1) none of the six users may keep ANY key in the
           # operator users: spec — the operator injects a password hash for a
-          # password-less entry, which ClickHouse rejects alongside <auth_methods>
-          # (Spike Finding 7); (2) every incl name must have a matching element in
-          # the bundle — an unresolved incl leaves an empty <auth_methods>, also
+          # password-less entry, which ClickHouse rejects alongside <auth_methods>;
+          # (2) every incl name must have a matching element in the bundle — an
+          # unresolved incl leaves an empty <auth_methods>, also
           # rejected; (3) the gated users appear in both files or neither.
           command: |
             helm template charts/ao-data-platform \
@@ -903,7 +903,7 @@ jobs:
             # insert-triggered and forward-only, so spans ingested in that
             # window keep the older rendering permanently. When a new file
             # supersedes a view's SELECT, the predecessor's statement must be
-            # emptied, keeping the file comment-only (as 0019-0021 are).
+            # emptied, keeping the file comment-only (as 0019-0021 and 0026 are).
             # MODIFY SQL SECURITY (0014) is deliberately not counted — it does
             # not rewrite the SELECT.
             writers=$(awk 'FNR == 1 { tbl = "" } /^[[:space:]]*--/ { next } /ALTER TABLE/ { tbl = $3 } /MODIFY QUERY/ { print FILENAME ": " tbl }' charts/ao-data-platform/sql/*.sql)

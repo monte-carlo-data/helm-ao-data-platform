@@ -118,7 +118,7 @@ Each provider (bedrock, foundry, vertex) is guarded below; when a new one lands,
 {{/*
 Map llmWorker.provider to its cloud platform, matching what the worker publishes
 to the llm_worker_info marker (bedrock->aws, vertex->gcp, foundry->azure). Used to
-seed the marker at schema-migration time so the monolith can resolve the cloud
+seed the marker at schema-migration time so the backend can resolve the cloud
 before the worker's first startup write.
 */}}
 {{- define "ao-data-platform.llmWorkerCloud" -}}
@@ -354,8 +354,7 @@ The guard around the previous method is ESO-side and load-bearing: the previous
 secret holds the sentinel "-" in steady state (Secrets Manager rejects empty
 strings), and a bare `if` is truthy for it — a rendered sentinel <password>-</password>
 would be a valid, matchable one-character auth method, i.e. a login bypass.
-Helm cannot see the value, so only ESO can gate it. Validated live on dev-us1
-(Spike Finding 10).
+Helm cannot see the value, so only ESO can gate it.
 The whole previous block is additionally gated Helm-side on previousKey, so a
 user without one renders no reference to a `_previous` key ESO was never asked
 to fetch — the steady state stays byte-identical to pre-5.0.0 auth.

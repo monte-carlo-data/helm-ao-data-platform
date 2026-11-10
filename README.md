@@ -687,7 +687,9 @@ A schema change arrives as a new file. The schema job re-runs every file on each
 
 `sql/MANIFEST.sha256` records each file's checksum, and the lint job fails when a file differs from it, is missing, or isn't listed. A second lint step re-checks the schema rules on the shipped files: every DDL statement runs `ON CLUSTER '{cluster}'`, every table uses a path-less `Replicated*` engine, and each view has one live `MODIFY QUERY`.
 
-`sql/grants.yaml` lists the per-table grants of the `llm_worker` and `monte_carlo` users, and of `otel` (role `ingest`) when `clickhouse.otel.restrictGrants` is set. `templates/clickhouse-installation.yaml` renders them from the file, and the render fails if the file is missing, if it has a role other than `ingest`, `llm_worker` or `monte_carlo`, or if a role is missing or empty or a table has no privileges. Database-wide reads and server grants stay in the template.
+`sql/grants.yaml` lists the per-table grants of the `llm_worker` and `monte_carlo` users, and of `otel` (role `ingest`) when `clickhouse.otel.restrictGrants` is set. `templates/clickhouse-installation.yaml` renders them from the file, and the render fails if the file is missing, if it has a role other than `ingest`, `llm_worker` or `monte_carlo`, if a role is missing or empty, if a table name is invalid, or if a table has no privileges or an unknown one. Database-wide reads and server grants stay in the template.
+
+A table and its grant can arrive separately. The schema job never drops a table, but the grants follow the installed release, so `helm rollback` to a release without a grant keeps the table and revokes the grant. A release that adds a grant says so in its upgrade note, with what a rollback below it does, as the 5.5.0 note does.
 
 ### Versioning
 
