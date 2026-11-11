@@ -312,6 +312,67 @@ class ExecutionTests(unittest.TestCase):
                     self.assertEqual(world.local, [BASE, BASE])
                     self.assertNotIn("delete_requested", world.output.getvalue())
 
+    def test_long_remote_wait_keeps_local_deletes_and_reads_at_existing_limits(self):
+        world = World()
+        for api in world.apis:
+            api.guard_timeout_seconds = 20
+        result = world.run(timeout=2351, delete_timeout=1800, clock=lambda: 0)
+        self.assertTrue(result["completed"])
+        self.assertEqual(result["deleted"], [OLD_I, OLD])
+        for _, method, path, options in world.calls:
+            expected = {"request_timeout": 1800 if "/remote/" in path else 300} if method == "POST" else {}
+            self.assertEqual(options, expected)
+
+    def test_long_remote_wait_reserves_verification_and_all_revision_checks(self):
+        for copies in (1, 2, 3):
+            required = 1800 + (5 * copies + 1) * (30 + 10 * copies)
+            for timeout, completed in ((required, False), (required + 1, True)):
+                with self.subTest(copies=copies, timeout=timeout):
+                    world = World(0, copies)
+                    for api in world.apis:
+                        api.guard_timeout_seconds = 10 * copies
+                    result = world.run(timeout=timeout, delete_timeout=1800, clock=lambda: 0)
+                    self.assertEqual(result["completed"], completed)
+                    self.assertEqual(result["deleted"], [OLD_I, OLD] if completed else [])
+                    self.assertEqual(len(world.writes()), 2 if completed else 0)
+
+    def test_slow_remote_delete_is_verified_before_budget_stops_the_next_delete(self):
+        world, clock = World(0), [0]
+        for api in world.apis:
+            api.guard_timeout_seconds = 20
+        # The delete and credential check consume their full allowance. Later
+        # reads consume both the API and credential-check allowance as well.
+        world.after_write = lambda *args: clock.__setitem__(0, clock[0] + 1820)
+        def read_time(index, method, path):
+            if world.writes() and method == "GET":
+                clock[0] += 50
+        world.before_request = read_time
+        result = world.run(timeout=2351, delete_timeout=1800, clock=lambda: clock[0])
+        self.assertFalse(result["completed"])
+        self.assertEqual(result["stop_reason"], "time_limit")
+        self.assertEqual(result["deleted"], [OLD_I])
+        self.assertEqual(result["unverified_deletions"], [])
+        self.assertEqual(len(world.writes()), 1)
+        self.assertEqual(world.output.getvalue().count('"event": "delete_verified"'), 1)
+        self.assertIn(OLD, world.remote)
+
+    def test_long_wait_uncertain_response_is_never_retried(self):
+        world = World(0)
+        world.failure = retention.BackupError("simulated lost response")
+        with self.assertRaises(retention.CleanupStopped) as caught:
+            world.run(timeout=3600, delete_timeout=1800, clock=lambda: 0)
+        self.assertEqual(len(world.writes()), 1)
+        self.assertEqual(caught.exception.result["deleted"], [])
+        self.assertEqual(caught.exception.result["unverified_deletions"], [
+            {"copy": 0, "location": "remote", "name": OLD_I, "response_status": "unknown"}])
+        self.assertIn(OLD, world.remote)
+
+    def test_short_preview_budget_ignores_unused_long_delete_wait(self):
+        world = World()
+        result = world.run(execute=False, timeout=60, delete_timeout=3600, clock=lambda: 0)
+        self.assertTrue(result["completed"])
+        self.assertEqual(world.writes(), [])
+
     def test_time_limit_after_final_predelete_read_logs_no_request(self):
         world, clock = World(), [0]
         def expire(index, method, path):
@@ -614,7 +675,8 @@ class ExecutionTests(unittest.TestCase):
     def test_invalid_options_and_duplicate_copies_are_rejected(self):
         world = World()
         for options in (dict(timeout=0), dict(timeout=float("nan")), dict(timeout=True),
-                        dict(daily_days=0), dict(history_days=6), dict(history_days=True)):
+                        dict(daily_days=0), dict(history_days=6), dict(history_days=True),
+                        *(dict(delete_timeout=value) for value in (0, 299, 3601, True, 300.5, "900"))):
             with self.subTest(options=options), self.assertRaises(retention.BackupError):
                 retention.RemoteCleaner(world.apis, **options)
         with self.assertRaises(retention.BackupError):

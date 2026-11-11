@@ -47,10 +47,19 @@
 {{- end -}}
 {{- if $b.cleanup.enabled -}}
 {{- if not (kindIs "bool" $b.cleanup.dryRun) -}}{{- fail "clickhouse.backup.cleanup.dryRun must be a boolean." -}}{{- end -}}
+{{- if or (not (regexMatch "^[0-9]+$" (toString $b.cleanup.deleteTimeoutSeconds))) (lt (int $b.cleanup.deleteTimeoutSeconds) 300) (gt (int $b.cleanup.deleteTimeoutSeconds) 3600) -}}{{- fail "clickhouse.backup.cleanup.deleteTimeoutSeconds must be an integer from 300 to 3600." -}}{{- end -}}
 {{- if not (has $b.cleanup.retentionPolicy (list "count-and-age" "daily-weekly")) -}}{{- fail "clickhouse.backup.cleanup.retentionPolicy must be count-and-age or daily-weekly." -}}{{- end -}}
 {{- if not $b.cleanup.dryRun -}}
 {{- if ne $b.cleanup.retentionPolicy "daily-weekly" -}}{{- fail "S3 deletion requires cleanup.retentionPolicy=daily-weekly; count-and-age supports preview only." -}}{{- end -}}
 {{- if not $fixedImage -}}{{- fail "S3 deletion requires the verified Altinity 2.8.2 image digest." -}}{{- end -}}
+{{/* Match RemoteCleaner: five reads per copy plus one spare; each request checks
+     all Pod revisions (10 seconds per Pod) before its 30-second API read. */}}
+{{- $copies := int .Values.clickhouse.replicasCount -}}
+{{- $verificationSeconds := mul (add (mul 5 $copies) 1) (add 30 (mul 10 $copies)) -}}
+{{- $requiredSeconds := add (int $b.cleanup.deleteTimeoutSeconds) $verificationSeconds -}}
+{{- if and (gt (int $b.cleanup.deleteTimeoutSeconds) 300) (le (int $b.cleanup.timeoutSeconds) $requiredSeconds) -}}
+{{- fail (printf "clickhouse.backup.cleanup.timeoutSeconds must exceed %d to allow deleteTimeoutSeconds and verification for %d copies; include extra time for earlier checks and local-record removal." $requiredSeconds $copies) -}}
+{{- end -}}
 {{- end -}}
 {{- range $key, $minimum := dict "keepLast" 1 "keepDays" 0 "timeoutSeconds" 60 -}}
 {{- $value := index $b.cleanup $key -}}
@@ -162,6 +171,9 @@ api:
   env:
     - name: API_USERNAME
       value: backup
+    # Keep the format effective even while the external config Secret refreshes.
+    - name: S3_COMPRESSION_FORMAT
+      value: tar
     - name: GOMEMLIMIT
       value: {{ .Values.clickhouse.backup.sidecar.goMemoryLimit | quote }}
     - name: BACKUP_PASSWORD_REVISION

@@ -984,6 +984,30 @@ class APITests(unittest.TestCase):
                     api.request("POST", "/backup/delete/local/example", request_timeout=timeout)
             request.assert_not_called()
 
+    def test_long_wait_is_only_allowed_for_a_scheduled_remote_delete(self):
+        api = backup.API(self.url, "backup", "dummy")
+        target = "/backup/delete/remote/" + FULL
+        with mock.patch.object(api.opener, "open") as request:
+            request.return_value.__enter__.return_value.read.return_value = b'{}\n'
+            for timeout in (900, 1800, 3600):
+                api.request("POST", target, request_timeout=timeout)
+                self.assertEqual(request.call_args.kwargs["timeout"], timeout)
+            request.reset_mock()
+            for method, path in (("GET", target), ("POST", "/backup/delete/local/" + FULL),
+                                 ("POST", "/backup/create_remote"), ("GET", "/backup/actions"),
+                                 ("POST", "/backup/delete/remote/manual"),
+                                 ("POST", target + "/extra"), ("POST", target + "?extra=1")):
+                with self.subTest(method=method, path=path), self.assertRaises(backup.BackupError):
+                    api.request(method, path, request_timeout=1800)
+            for timeout in (3601, float("nan"), float("inf"), True, "1800"):
+                with self.subTest(timeout=timeout), self.assertRaises(backup.BackupError):
+                    api.request("POST", target, request_timeout=timeout)
+            request.assert_not_called()
+        probe = backup.API(self.url, "probe", "dummy", backup_api=False)
+        with mock.patch.object(probe.opener, "open") as request, self.assertRaises(backup.BackupError):
+            probe.request("POST", target, request_timeout=1800)
+        request.assert_not_called()
+
     def test_backup_authentication_errors_name_rotation_without_printing_credentials(self):
         for status in (401, 403):
             with self.subTest(status=status):
@@ -1181,7 +1205,9 @@ class APITests(unittest.TestCase):
     def test_daily_weekly_settings_are_checked_before_starting_backup(self):
         cases = ({"BACKUP_RETENTION_POLICY": "unknown"},
                  {"BACKUP_DAILY_DAYS": "0"}, {"BACKUP_DAILY_DAYS": "1.5"},
-                 {"BACKUP_HISTORY_DAYS": "6"}, {"BACKUP_CLEANUP_DRY_RUN": "invalid"})
+                 {"BACKUP_HISTORY_DAYS": "6"}, {"BACKUP_CLEANUP_DRY_RUN": "invalid"},
+                 *({"BACKUP_CLEANUP_DELETE_TIMEOUT_SECONDS": value}
+                   for value in ("299", "3601", "900.5", "true", "invalid")))
         for override in cases:
             settings = dict(self.settings, BACKUP_CLEANUP_ENABLED="true", BACKUP_RETENTION_POLICY="daily-weekly",
                             BACKUP_CLEANUP_DRY_RUN="false")
@@ -1209,7 +1235,7 @@ class APITests(unittest.TestCase):
                     redirect_stdout(io.StringIO()):
                 self.assertEqual(backup.main(), 0)
             remote.Cleaner.assert_called_once_with(mock.ANY, keep_last=2, keep_days=0, timeout=1800,
-                                                  retention_policy="daily-weekly", daily_days=8, history_days=35)
+                                                  retention_policy="daily-weekly", daily_days=8, history_days=35, delete_timeout=300)
             remote.Cleaner.return_value.run.assert_called_once_with(latest_backup=FULL, execute=False)
 
     def test_daily_weekly_deletion_follows_successful_backup_and_local_cleanup(self):
@@ -1232,8 +1258,25 @@ class APITests(unittest.TestCase):
             self.assertEqual(backup.main(), 0)
         self.assertEqual(events, ["backup", "local", "remote"])
         remote.Cleaner.assert_called_once_with(mock.ANY, keep_last=2, keep_days=0, timeout=1800,
-                                              retention_policy="daily-weekly", daily_days=7, history_days=30)
+                                              retention_policy="daily-weekly", daily_days=7, history_days=30, delete_timeout=300)
         remote.Cleaner.return_value.run.assert_called_once_with(latest_backup=FULL, execute=True)
+
+    def test_remote_delete_wait_from_environment_reaches_cleanup(self):
+        remote = mock.Mock()
+        remote.Cleaner.return_value.run.return_value = {
+            "mode": "delete", "retention_policy": "daily-weekly", "daily_days": 7,
+            "history_days": 30, "kept": [FULL], "delete": [], "deleted": [],
+            "broken_local": [], "local_only": [], "completed": True}
+        settings = dict(self.settings, BACKUP_CLEANUP_ENABLED="true", BACKUP_CLEANUP_DRY_RUN="false",
+                        BACKUP_CLEANUP_TIMEOUT_SECONDS="3600", BACKUP_CLEANUP_DELETE_TIMEOUT_SECONDS="1800")
+        with mock.patch.dict(backup.os.environ, settings, clear=True), \
+                mock.patch.dict("sys.modules", {"cleanup_backups": remote}), \
+                mock.patch.object(backup, "configured_clients", return_value=([mock.Mock()], [mock.Mock()])), \
+                mock.patch.object(backup.Scheduler, "run", return_value=FULL), redirect_stdout(io.StringIO()):
+            self.assertEqual(backup.main(), 0)
+        remote.Cleaner.assert_called_once_with(mock.ANY, keep_last=2, keep_days=0, timeout=3600,
+                                              retention_policy="daily-weekly", daily_days=7,
+                                              history_days=30, delete_timeout=1800)
 
     def test_uncertain_or_incomplete_local_cleanup_prevents_s3_deletion(self):
         settings = dict(self.settings, BACKUP_CLEANUP_ENABLED="true", BACKUP_CLEANUP_DRY_RUN="false",

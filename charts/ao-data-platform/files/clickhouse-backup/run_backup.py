@@ -28,7 +28,7 @@ import urllib.request
 
 
 from backup_common import (BackupError, CleanupStopped, DELETION_UNAVAILABLE, REMOTE_EMBEDDED_DESCRIPTIONS,
-                           REQUEST_TIMEOUT_SECONDS,
+                           REQUEST_TIMEOUT_SECONDS, MAX_REMOTE_DELETE_TIMEOUT_SECONDS, validate_delete_timeout,
                            RequestNotSent, RevisionError, RevisionCheckUnavailable,
                            SCHEDULED_NAME, broken_local_entry, scheduled_name)
 
@@ -86,9 +86,14 @@ class API:
 
     def request(self, method, path, query=None, *, request_timeout=None):
         timeout = REQUEST_TIMEOUT_SECONDS if request_timeout is None else request_timeout
+        pieces = path.split("/")
+        remote_delete = (self.backup_api and method == "POST" and len(pieces) == 5
+                         and pieces[:4] == ["", "backup", "delete", "remote"]
+                         and SCHEDULED_NAME.fullmatch(pieces[4]))
+        maximum = MAX_REMOTE_DELETE_TIMEOUT_SECONDS if remote_delete else 300
         if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
-                or not 0 < timeout <= 300):
-            raise BackupError("Backup API request timeout must be between zero and 300 seconds.")
+                or not 0 < timeout <= maximum):
+            raise BackupError(f"Backup API request timeout must be between zero and {maximum} seconds.")
         if self.guard:
             self.guard()
         url = self.endpoint + path
@@ -545,7 +550,9 @@ def remote_cleanup_options(validate_numbers=True):
     if policy == "daily-weekly":
         if options["timeout"] < 60:
             raise BackupError("S3 cleanup needs a timeout of at least 60 seconds.")
-        options.update(retention_policy=policy,
+        options.update(delete_timeout=validate_delete_timeout(
+                           int(os.environ.get("BACKUP_CLEANUP_DELETE_TIMEOUT_SECONDS", "300"))),
+                       retention_policy=policy,
                        daily_days=int(os.environ.get("BACKUP_DAILY_DAYS", "7")),
                        history_days=int(os.environ.get("BACKUP_HISTORY_DAYS", "30")))
         if options["daily_days"] < 1 or options["history_days"] < options["daily_days"]:

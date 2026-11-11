@@ -186,28 +186,44 @@ has already been verified, the Job still succeeds. Read that line and the
 report separately from backup Job status. Do not rerun a completed backup just
 because its preview failed. This chart does not send preview alerts.
 
-Before each local or S3 deletion under `daily-weekly`, cleanup reserves a fixed
-300-second delete timeout, five 30-second follow-up reads per copy, and another
-30 seconds for processing. These requests need
-`300 + (5 * copies + 1) * 30` seconds, plus time for the password revision checks
-that run before each request. With two copies, those checks add 220 seconds to
-the 630-second request allowance, so more than 850 seconds must remain before
-starting a deletion. Earlier checks also use the cleanup budget, so configure
-more time than this reserve; the default is 1800 seconds.
+## Deletion time limits
 
-| ClickHouse copies | Seconds that must remain before each deletion |
+`cleanup.deleteTimeoutSeconds` sets how long the scheduler waits for one S3
+backup deletion. It accepts whole seconds from 300 to 3600 and defaults to 300,
+so upgrading does not silently increase the wait. Normal reads still use
+30 seconds; removing local records still uses 300 seconds. This setting does
+not change the backup image or make deletion itself faster.
+
+`cleanup.timeoutSeconds` is the total time allowed for S3 cleanup, including
+its checks and any local records that must be removed first. Increase both
+settings together when allowing longer S3 deletions. Before sending a delete,
+cleanup reserves the entire selected wait plus five follow-up reads per copy,
+one spare read allowance, and the password checks for those requests.
+
+For `N` copies, the required time is
+`delete wait + (5*N + 1) * (30 + 10*N)` seconds. More than that amount must remain.
+For local record removal, the delete wait stays 300 seconds. For S3 removal, it
+uses `cleanup.deleteTimeoutSeconds`.
+
+| ClickHouse copies | Required remaining time with the default 300-second wait |
 | --- | ---: |
-| 1 | more than 540 |
-| 2 | more than 850 |
-| 3 | more than 1260 |
-| 4 | more than 1770 |
-| 5 | more than 2380 |
+| 1 | more than 540 seconds |
+| 2 | more than 850 seconds |
+| 3 | more than 1260 seconds |
+| 4 | more than 1770 seconds |
+| 5 | more than 2380 seconds |
 
-The formula including password checks is `300 + (5*N + 1)*30 + (5*N + 1)*10*N`,
-where `N` is the copy count. With four copies, 1800 seconds leaves little time
-for the earlier checks; with five or more it cannot start any deletion. Increase
-`cleanup.timeoutSeconds` above the reserve plus the time observed for those
-checks. Otherwise repeated green Jobs can leave the entire backlog untouched.
+For example, with two copies and an 1800-second S3 wait, more than 2350 seconds
+must remain before starting that deletion. The total cleanup allowance must
+also cover earlier checks and local-record removal. A default 1800-second total
+cannot fit it. When actual deletion is enabled, the chart rejects a longer
+configured wait whose reservation cannot fit the total allowance. Preview
+mode remains available so the proposed removals can be reviewed first.
+
+With four copies, the default 1800-second total leaves little time for earlier
+checks; with five or more it cannot start a default-wait deletion. Use observed
+backup and cleanup durations to choose allowances with room for slower runs.
+Keep the combined Job deadline below the schedule interval as described below.
 
 If too little time remains to start another deletion, cleanup sends no further
 deletion and reports `completed: false` with `stop_reason: time_limit`. A large

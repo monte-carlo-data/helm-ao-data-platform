@@ -67,6 +67,30 @@ permission bits do not match. Allow extra time for that first pod restart on a
 large volume; a single-copy installation is unavailable while its pod restarts.
 The exact behavior depends on the volume driver.
 
+## Tracking-file format and upgrades
+
+From chart 6.2.0, new backups use `s3.compression_format: tar` to group the small
+tracking files that point to the native S3 data. The data stays in its existing
+location. This reduces the number of tracking files that must be read during
+deletion; it does not add data-file batching to the pinned stock image.
+
+The scheduler, both cleanup options, and the copy-switch checker accept healthy
+`directory, embedded` and `tar, embedded` entries. Existing directory backups
+remain valid full-backup bases for new incrementals and are not rewritten.
+Broken entries and other formats still fail the existing checks.
+
+The backup container also sets `S3_COMPRESSION_FORMAT=tar`. This both rolls the
+ClickHouse pods on upgrade and selects the new format even if the generated
+configuration Secret has not refreshed yet. Pause the schedule, wait for active
+operations, upgrade, and verify both copies before resuming backups. A single-copy
+installation is unavailable while its pod restarts.
+
+Pause the schedule before rolling back below 6.2.0. Older chart scripts only
+recognize directory entries: they cannot verify a tar backup and cleanup stops
+when it sees one. The saved data remains readable by the backup tool, but normal
+scheduled operation requires scripts that accept both formats. Do not delete or
+rewrite saved catalogs to make an older chart accept them.
+
 ## AWS prerequisites
 
 Create these before setting `clickhouse.backup.enabled: true`:

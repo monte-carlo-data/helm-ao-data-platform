@@ -1,9 +1,9 @@
 apiVersion: v2
 name: ao-data-platform
 description: Monte Carlo data platform — ClickHouse, OTel collector, and schema management
-# 6.1.0 adds the llm-worker capabilities column to llm_worker_info.
-# See README "Upgrading to 6.1.0".
-version: 6.1.0
+# 6.2.0 bundles backup tracking files and adds a bounded S3 deletion wait.
+# See README "Upgrading to 6.2.0" for the backup restart and rollback notes.
+version: 6.2.0
 type: application
 # minDomains on the ClickHouse/Keeper zone topologySpreadConstraints is GA in
 # Kubernetes 1.30. Declare the floor so a render/install against an older API

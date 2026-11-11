@@ -131,7 +131,7 @@ def local_record_warnings(remote, local):
 
 class Cleaner:
     def __init__(self, apis, keep_last=2, keep_days=0, timeout=1800, clock=time.monotonic,
-                 retention_policy="count-and-age", daily_days=7, history_days=30):
+                 retention_policy="count-and-age", daily_days=7, history_days=30, delete_timeout=300):
         if not apis or timeout <= 0:
             raise BackupError("Cleanup requires at least one ClickHouse copy and a positive timeout.")
         endpoints = [api.endpoint for api in apis if getattr(api, "endpoint", None)]
@@ -144,6 +144,7 @@ class Cleaner:
             raise BackupError("Cleanup retention policy must be count-and-age or daily-weekly.")
         self.retention_policy = retention_policy
         self.daily_days, self.history_days, self.timeout = daily_days, history_days, timeout
+        self.delete_timeout = delete_timeout
         self.clock = clock
         self.deadline = clock() + timeout
 
@@ -198,7 +199,8 @@ class Cleaner:
             raise BackupError("Cleanup execute must be an explicit boolean.")
         if self.retention_policy == "daily-weekly":
             from backup_retention import RemoteCleaner
-            return RemoteCleaner(self.apis, self.daily_days, self.history_days, self.timeout, self.clock).run(
+            return RemoteCleaner(self.apis, self.daily_days, self.history_days, self.timeout, self.clock,
+                                 delete_timeout=self.delete_timeout).run(
                 now, latest_backup, execute)
         if execute:
             raise BackupError(DELETION_UNAVAILABLE)

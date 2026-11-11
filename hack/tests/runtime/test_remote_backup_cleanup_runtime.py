@@ -222,8 +222,26 @@ print(json.dumps(result))
         expired = {name for group in groups[:3] for name in group}
         removed_objects = self.group_objects(before, expired)
         self.assertTrue(removed_objects)
-        self.assertTrue(any(key.endswith("serialization.json") for key in removed_objects),
+        # Bundled catalogs keep native-file pointers inside tar archives, so
+        # checking S3 key names alone no longer finds serialization.json.
+        catalog_files = json.loads(self.s3(storage, credentials, """
+import io, tarfile
+files = []
+for name in json.loads(os.environ['OBJECT_KEYS']):
+    if not name.startswith('test/catalog/'):
+        continue
+    if name.endswith('.tar'):
+        body = signed_s3_request('GET', '/runtime-backups/' + urllib.parse.quote(name, safe='/'), key, secret)
+        with tarfile.open(fileobj=io.BytesIO(body), mode='r:') as archive:
+            files.extend(member.name for member in archive if member.isfile())
+    else:
+        files.append(name)
+print(json.dumps(files))
+""", OBJECT_KEYS=json.dumps(sorted(removed_objects))))
+        self.assertTrue(any(name.endswith("serialization.json") for name in catalog_files),
                         "The fixture must include the native file omitted by the old deletion code")
+        self.assertTrue(any(key.startswith("test/native/") for key in removed_objects),
+                        "The deletion check must cover native data objects, not only catalog files")
         preview = self.remote_cleanup(storage, anchor, groups[-1][-1], execute=False)
         self.assertEqual(set(preview["delete"]), expired)
         self.assertEqual(preview["deleted"], [])
