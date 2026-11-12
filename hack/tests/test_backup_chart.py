@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
@@ -20,6 +21,11 @@ ROOT = Path(__file__).resolve().parents[2]
 CHART = ROOT / "charts/ao-data-platform"
 HELM = os.environ.get("HELM", "helm")
 RELEASE = "ao-backup-test"
+
+sys.path.insert(0, str(CHART / "files/clickhouse-backup"))
+from backup_common import REQUEST_TIMEOUT_SECONDS
+from run_backup import PASSWORD_REVISION_READ_TIMEOUT_SECONDS
+sys.path.pop(0)
 
 
 def render(*overrides, backup=True, values_files=(), values=None):
@@ -520,22 +526,31 @@ class BackupChartTests(unittest.TestCase):
     def test_long_s3_delete_wait_wires_both_limits_without_adding_another_job_budget(self):
         docs = render("clickhouse.backup.cleanup.enabled=true", "clickhouse.backup.cleanup.dryRun=false",
                       "clickhouse.backup.cleanup.deleteTimeoutSeconds=1800",
-                      "clickhouse.backup.cleanup.timeoutSeconds=3600")
+                      "clickhouse.backup.cleanup.timeoutSeconds=3000")
         job = one(docs, "CronJob")["spec"]["jobTemplate"]["spec"]
         settings = {item["name"]: item.get("value") for item in job["template"]["spec"]["containers"][0]["env"]}
         self.assertEqual(settings["BACKUP_CLEANUP_DELETE_TIMEOUT_SECONDS"], "1800")
-        self.assertEqual(settings["BACKUP_CLEANUP_TIMEOUT_SECONDS"], "3600")
-        self.assertEqual(job["activeDeadlineSeconds"], 10800 + 3600 + 60)
+        self.assertEqual(settings["BACKUP_CLEANUP_TIMEOUT_SECONDS"], "3000")
+        self.assertEqual(job["activeDeadlineSeconds"], 10800 + 3000 + 60)
+        self.assertLess(job["activeDeadlineSeconds"], 4 * 3600)
         self.assertEqual(one(docs, "CronJob")["spec"]["concurrencyPolicy"], "Forbid")
 
     def test_long_s3_delete_wait_requires_time_for_verification_on_every_copy(self):
         for copies in (1, 2, 3):
-            required = 1800 + (5 * copies + 1) * (30 + 10 * copies)
-            settings = (f"clickhouse.replicasCount={copies}", "clickhouse.backup.cleanup.enabled=true",
-                        "clickhouse.backup.cleanup.dryRun=false", "clickhouse.backup.cleanup.deleteTimeoutSeconds=1800")
-            with self.subTest(copies=copies), self.assertRaisesRegex(AssertionError, f"must exceed {required}"):
-                render(*settings, f"clickhouse.backup.cleanup.timeoutSeconds={required}")
-            render(*settings, f"clickhouse.backup.cleanup.timeoutSeconds={required + 1}")
+            for wait in (301, 1800, 3600):
+                required = wait + (5 * copies + 1) * (
+                    REQUEST_TIMEOUT_SECONDS + PASSWORD_REVISION_READ_TIMEOUT_SECONDS * copies)
+                settings = (f"clickhouse.replicasCount={copies}", "clickhouse.backup.cleanup.enabled=true",
+                            "clickhouse.backup.cleanup.dryRun=false",
+                            f"clickhouse.backup.cleanup.deleteTimeoutSeconds={wait}")
+                with self.subTest(copies=copies, wait=wait):
+                    with self.assertRaisesRegex(AssertionError, f"must exceed {required}"):
+                        render(*settings, f"clickhouse.backup.cleanup.timeoutSeconds={required}")
+                    render(*settings, f"clickhouse.backup.cleanup.timeoutSeconds={required + 1}")
+        # Existing default-wait installs still render with a small cleanup budget;
+        # the runtime safely stops before a deletion whose reservation cannot fit.
+        render("clickhouse.backup.cleanup.enabled=true", "clickhouse.backup.cleanup.dryRun=false",
+               "clickhouse.backup.cleanup.deleteTimeoutSeconds=300", "clickhouse.backup.cleanup.timeoutSeconds=60")
         # Previews do not need room for a deletion, even when the future wait is longer.
         render("clickhouse.backup.cleanup.enabled=true", "clickhouse.backup.cleanup.timeoutSeconds=60",
                "clickhouse.backup.cleanup.deleteTimeoutSeconds=3600")

@@ -73,6 +73,11 @@ From chart 6.2.0, new backups use `s3.compression_format: tar` to group the smal
 tracking files that point to the native S3 data. The data stays in its existing
 location. This reduces the number of tracking files that must be read during
 deletion; it does not add data-file batching to the pinned stock image.
+That image still deletes each data object separately. This release prepares the
+new tracking-file format and makes the deletion wait configurable; it does not
+establish that a large backup can be deleted within the allowed wait. Use measured
+delete times before enabling cleanup. Existing directory backups keep their
+original read cost until cleanup actually removes them; age alone removes nothing.
 
 The scheduler, both cleanup options, and the copy-switch checker accept healthy
 `directory, embedded` and `tar, embedded` entries. Existing directory backups
@@ -81,15 +86,39 @@ Broken entries and other formats still fail the existing checks.
 
 The backup container also sets `S3_COMPRESSION_FORMAT=tar`. This both rolls the
 ClickHouse pods on upgrade and selects the new format even if the generated
-configuration Secret has not refreshed yet. Pause the schedule, wait for active
-operations, upgrade, and verify both copies before resuming backups. A single-copy
-installation is unavailable while its pod restarts.
+configuration Secret has not refreshed yet. The environment value overrides the
+file value, so change both settings together. To upgrade:
 
-Pause the schedule before rolling back below 6.2.0. Older chart scripts only
-recognize directory entries: they cannot verify a tar backup and cleanup stops
-when it sees one. The saved data remains readable by the backup tool, but normal
-scheduled operation requires scripts that accept both formats. Do not delete or
-rewrite saved catalogs to make an older chart accept them.
+1. Apply `clickhouse.backup.schedule.suspend: true` before upgrading.
+2. Confirm no backup Job is active and every copy's backup API reports no running
+   command. A server-side backup, restore, or deletion can outlive its Job.
+3. Upgrade and wait for all ClickHouse pods to finish rolling and become ready.
+   A single-copy installation is unavailable while its pod restarts.
+4. Apply `clickhouse.backup.schedule.suspend: false`. Confirm the next scheduled
+   backup completes and verifies with a `tar, embedded` remote entry.
+
+### Rolling back below 6.2.0
+
+Removing the environment setting rolls the ClickHouse pods again. Pause and wait
+for idle Jobs and backup APIs as above, then roll back and wait for every copy to
+be ready. Confirm the generated configuration Secret has refreshed to
+`s3.compression_format: none` before resuming the schedule. After resuming, verify
+that the next backup completes with a `directory, embedded` entry. If a backup
+container still writes tar, pause again, wait for all operations to finish, and
+restart that container after the Secret refreshes; then resume and check again.
+
+Backups can resume after rollback, possibly with an extra full backup that day
+because the older scheduler skips a tar full when choosing its base. However,
+**both S3 cleanup and database-disk record cleanup stop on every run while any tar
+backup remains in the remote catalog. The Jobs still report success after a
+verified backup.** This does not clear itself when those backups age: cleanup is
+what removes them. Expect backups without cleanup until upgrading again to scripts
+that accept both formats, and continue watching disk and S3 growth meanwhile.
+
+The saved backups remain readable by the backup tool. Do not edit or remove raw
+catalog files to make an older chart accept them. Deliberately deleting complete
+backups through the backup tool is different: it discards those recovery points
+and is not part of this rollback procedure.
 
 ## AWS prerequisites
 

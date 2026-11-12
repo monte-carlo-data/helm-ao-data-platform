@@ -7,6 +7,9 @@ import uuid
 REQUEST_TIMEOUT_SECONDS = 30
 DELETE_TIMEOUT_SECONDS = 300
 MAX_REMOTE_DELETE_TIMEOUT_SECONDS = 3600
+# Healthy remote desc is "<stored format>, embedded"; compression_format: none
+# appears as directory. Keep tar aligned with the config and environment setting
+# in templates/_backup.tpl, and directory while pre-6.2.0 backups can remain.
 REMOTE_EMBEDDED_DESCRIPTIONS = ("directory, embedded", "tar, embedded")
 NAME_PREFIX = "ao-otel-"
 SCHEDULED_NAME = re.compile(re.escape(NAME_PREFIX) + r"(full|incremental)-(\d{8}T\d{6}Z)-[0-9a-f]{8}\Z")

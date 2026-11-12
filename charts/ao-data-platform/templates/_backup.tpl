@@ -52,8 +52,9 @@
 {{- if not $b.cleanup.dryRun -}}
 {{- if ne $b.cleanup.retentionPolicy "daily-weekly" -}}{{- fail "S3 deletion requires cleanup.retentionPolicy=daily-weekly; count-and-age supports preview only." -}}{{- end -}}
 {{- if not $fixedImage -}}{{- fail "S3 deletion requires the verified Altinity 2.8.2 image digest." -}}{{- end -}}
-{{/* Match RemoteCleaner: five reads per copy plus one spare; each request checks
-     all Pod revisions (10 seconds per Pod) before its 30-second API read. */}}
+{{/* Match backup_retention.RemoteCleaner.request: five reads per copy plus one spare.
+     30 is backup_common.REQUEST_TIMEOUT_SECONDS; 10 is
+     run_backup.PASSWORD_REVISION_READ_TIMEOUT_SECONDS for each Pod revision read. */}}
 {{- $copies := int .Values.clickhouse.replicasCount -}}
 {{- $verificationSeconds := mul (add (mul 5 $copies) 1) (add 30 (mul 10 $copies)) -}}
 {{- $requiredSeconds := add (int $b.cleanup.deleteTimeoutSeconds) $verificationSeconds -}}
@@ -171,7 +172,8 @@ api:
   env:
     - name: API_USERNAME
       value: backup
-    # Keep the format effective even while the external config Secret refreshes.
+    # Overrides s3.compression_format above so an early Pod start still writes tar.
+    # Change both settings together; the config Secret may refresh after startup.
     - name: S3_COMPRESSION_FORMAT
       value: tar
     - name: GOMEMLIMIT

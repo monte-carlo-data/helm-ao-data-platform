@@ -194,6 +194,16 @@ so upgrading does not silently increase the wait. Normal reads still use
 30 seconds; removing local records still uses 300 seconds. This setting does
 not change the backup image or make deletion itself faster.
 
+If this wait is too short, the report can contain an unverified deletion with
+`response_status: unknown`. The backup container may continue deleting after the
+scheduler stops waiting, so the next run may find that copy busy. Check the
+operation before retrying or restarting anything. The backup container logs a
+`duration` for completed remote deletes. Set the wait above the longest observed
+full-backup deletion, with room for growth and slower runs. Grouping new tracking
+files removes many reads, but the stock image still deletes data objects one at
+a time. Old directory backups keep their original deletion cost until removed,
+even after they fall outside `historyDays`; they are not rewritten by the upgrade.
+
 `cleanup.timeoutSeconds` is the total time allowed for S3 cleanup, including
 its checks and any local records that must be removed first. Increase both
 settings together when allowing longer S3 deletions. Before sending a delete,
@@ -224,6 +234,10 @@ With four copies, the default 1800-second total leaves little time for earlier
 checks; with five or more it cannot start a default-wait deletion. Use observed
 backup and cleanup durations to choose allowances with room for slower runs.
 Keep the combined Job deadline below the schedule interval as described below.
+Allow time for several deletions when working through a backlog. An allowance
+only just above the required reserve may leave time for one deletion or none,
+depending on the earlier checks and actual delete durations. Repeated successful
+Jobs can leave the backlog untouched; check the number of verified removals.
 
 If too little time remains to start another deletion, cleanup sends no further
 deletion and reports `completed: false` with `stop_reason: time_limit`. A large
@@ -243,6 +257,23 @@ still start within the configured start deadline (900 seconds, or 15 minutes,
 by default); after that the missed run is skipped. Defaults allow 10800 seconds
 for backup and 1800 for S3 cleanup, with a 60-second allowance, on a four-hour
 schedule.
+
+For two copies on that four-hour interval (14400 seconds), with the default
+10800-second backup allowance:
+
+| Database-disk cleanup | S3 cleanup allowance must be below | S3 delete wait must be below |
+| --- | ---: | ---: |
+| Disabled | 3540 seconds | 2990 seconds |
+| Enabled with its default 1800 seconds | 1740 seconds | 1190 seconds |
+
+These are arithmetic ceilings, not recommended settings: startup, earlier checks,
+local-record removal, and extra deletions need room below them. For example, with
+database-disk cleanup disabled, a 1800-second delete wait and 3000-second S3 cleanup
+allowance give a 13860-second Job deadline, nine minutes below the next run.
+Whether several deletions fit still depends on their measured durations. To allow
+a 3600-second delete wait on this schedule, the backup allowance must be reduced
+enough to fit cleanup and checks. That also gives slow backups less time; do not
+reduce it without measuring backup durations first.
 
 ## Local files in the report
 
