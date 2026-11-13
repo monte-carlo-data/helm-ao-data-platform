@@ -60,6 +60,7 @@ class CopyAPI:
         self.calls = []
         self.unavailable = unavailable
         self.fail_post = False
+        self.created_desc = "directory, embedded"
 
     def request(self, method, path, query=None):
         self.calls.append((method, path, query))
@@ -74,7 +75,7 @@ class CopyAPI:
             required = "" if operation == "download" else FULL
             self.local[name] = metadata(name, "local", required)
             if operation == "create_remote":
-                self.remote[name] = metadata(name, "remote", required)
+                self.remote[name] = dict(metadata(name, "remote", required), desc=self.created_desc)
             identifier = "operation-" + str(len(self.posts))
             self.history.append({"operation_id":identifier, "command":operation + " " + name, "status":"success"})
             return [{"status":"acknowledged", "operation":operation, "backup_name":name, "operation_id":identifier}]
@@ -108,7 +109,8 @@ class PodTests(unittest.TestCase):
         self.probes = [ProbeAPI(), ProbeAPI()]
         self.revision_failure = None
 
-    def run_pod(self, expected=FULL, settings=None, changed_script=None, common_present=True):
+    def run_pod(self, expected=FULL, settings=None, changed_script=None, common_present=True,
+                installed_scheduler=None):
         fake_datetime = types.ModuleType("datetime")
         fake_datetime.__dict__.update(vars(importlib.import_module("datetime")))
         fake_datetime.datetime = FrozenDateTime
@@ -131,7 +133,7 @@ class PodTests(unittest.TestCase):
         if changed_script:
             scripts[changed_script] = b"changed after preparation"
         output = io.StringIO()
-        with mock.patch.dict(sys.modules, {"run_backup":scheduler, "datetime":fake_datetime}), \
+        with mock.patch.dict(sys.modules, {"run_backup":installed_scheduler or scheduler, "datetime":fake_datetime}), \
                 mock.patch.dict(helper.os.environ, environment, clear=True), \
                 mock.patch.object(Path, "read_text", autospec=True,
                                   side_effect=lambda path: passwords[str(path)]) as read, \
@@ -173,6 +175,31 @@ class PodTests(unittest.TestCase):
         self.assertEqual(result["required"], FULL)
         self.assertEqual(self.copies[0].posts, [])
         self.assertEqual([p[0] for p in self.copies[1].posts], ["/backup/download/" + FULL, "/backup/create_remote"])
+
+    def test_bundled_incremental_can_use_existing_directory_or_tar_full(self):
+        for description in ("directory, embedded", "tar, embedded"):
+            with self.subTest(description=description):
+                self.setUp()
+                self.remote[FULL]["desc"] = description
+                self.copies[1].created_desc = "tar, embedded"
+                result = self.run_pod()
+                self.assertEqual(result["status"], "passed")
+                self.assertEqual(result["required"], FULL)
+                self.assertEqual(self.copies[0].posts, [])
+                self.assertEqual(len(self.copies[1].posts), 2)
+
+    def test_older_scheduler_without_format_constant_keeps_directory_only_check(self):
+        class OlderScheduler:
+            def __getattr__(self, name):
+                if name == "REMOTE_EMBEDDED_DESCRIPTIONS":
+                    raise AttributeError(name)
+                return getattr(scheduler, name)
+
+        self.assertEqual(self.run_pod(installed_scheduler=OlderScheduler())["status"], "passed")
+        self.setUp()
+        self.copies[1].created_desc = "tar, embedded"
+        self.assert_inconclusive(self.run_pod(installed_scheduler=OlderScheduler()),
+            "The new backup is not a healthy incremental using the expected full.", requests_sent=2)
 
     def test_completed_deletions_without_ids_on_both_copies_allow_verification(self):
         for location, kind, identifier in product(("local", "remote"), ("full", "incremental"),

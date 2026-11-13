@@ -616,7 +616,8 @@ class CleanupChartTests(unittest.TestCase):
         self.assertEqual({key: value for key, value in env.items()
                           if key.startswith(("BACKUP_CLEANUP_", "BACKUP_KEEP_"))}, {
             "BACKUP_CLEANUP_ENABLED": "true", "BACKUP_CLEANUP_DRY_RUN": "true",
-            "BACKUP_KEEP_LAST": "3", "BACKUP_KEEP_DAYS": "7", "BACKUP_CLEANUP_TIMEOUT_SECONDS": "900"})
+            "BACKUP_KEEP_LAST": "3", "BACKUP_KEEP_DAYS": "7", "BACKUP_CLEANUP_TIMEOUT_SECONDS": "900",
+            "BACKUP_CLEANUP_DELETE_TIMEOUT_SECONDS": "300"})
         self.assertEqual(job["activeDeadlineSeconds"], 10800 + 900 + 60)
         data = one(docs, "ConfigMap", "otel-backup-job")["data"]
         for script in ("run_backup.py", "backup_common.py", "cleanup_backups.py"):

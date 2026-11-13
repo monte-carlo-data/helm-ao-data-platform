@@ -27,7 +27,8 @@ import urllib.parse
 import urllib.request
 
 
-from backup_common import (BackupError, CleanupStopped, DELETION_UNAVAILABLE, REQUEST_TIMEOUT_SECONDS,
+from backup_common import (BackupError, CleanupStopped, DELETION_UNAVAILABLE, REMOTE_EMBEDDED_DESCRIPTIONS,
+                           REQUEST_TIMEOUT_SECONDS, MAX_REMOTE_DELETE_TIMEOUT_SECONDS, validate_delete_timeout,
                            RequestNotSent, RevisionError, RevisionCheckUnavailable,
                            SCHEDULED_NAME, broken_local_entry, scheduled_name)
 
@@ -85,9 +86,14 @@ class API:
 
     def request(self, method, path, query=None, *, request_timeout=None):
         timeout = REQUEST_TIMEOUT_SECONDS if request_timeout is None else request_timeout
+        pieces = path.split("/")
+        remote_delete = (self.backup_api and method == "POST" and len(pieces) == 5
+                         and pieces[:4] == ["", "backup", "delete", "remote"]
+                         and SCHEDULED_NAME.fullmatch(pieces[4]))
+        maximum = MAX_REMOTE_DELETE_TIMEOUT_SECONDS if remote_delete else 300
         if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
-                or not 0 < timeout <= 300):
-            raise BackupError("Backup API request timeout must be between zero and 300 seconds.")
+                or not 0 < timeout <= maximum):
+            raise BackupError(f"Backup API request timeout must be between zero and {maximum} seconds.")
         if self.guard:
             self.guard()
         url = self.endpoint + path
@@ -285,9 +291,8 @@ def full_base(catalog, now):
     """Only use this schedule's complete embedded full backups from today.
 
     The API puts broken-backup errors in `desc`, replacing the format. Requiring
-    the exact healthy value excludes those entries. Its "directory" format
-    depends on s3.compression_format: none in templates/_backup.tpl; keep that
-    setting and this check (including the completed-backup check below) in sync.
+    an exact healthy value excludes those entries. Keep accepting existing
+    directory backups when new backups bundle their catalog files in tar.
     A full backup must also have no `required` dependency.
     """
     candidates = []
@@ -295,7 +300,7 @@ def full_base(catalog, now):
         name = row.get("name", "")
         match = SCHEDULED_NAME.fullmatch(name) if isinstance(name, str) else None
         if (not match or match[1] != "full" or row.get("location") != "remote"
-                or row.get("desc") != "directory, embedded" or row.get("required") != ""):
+                or row.get("desc") not in REMOTE_EMBEDDED_DESCRIPTIONS or row.get("required") != ""):
             continue
         try:
             created = datetime.strptime(match[2], "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
@@ -490,11 +495,13 @@ class Scheduler:
             raise BackupError("The selected ClickHouse copy is no longer caught up; no new backup was started.")
         self.operation(api, "create_remote", name, "/backup/create_remote", query)
         rows = self.read(api, "/backup/list/remote")
-        if not any(row.get("name") == name and row.get("location") == "remote"
-                   and row.get("desc") == "directory, embedded"
-                   and row.get("required") == (base or "") for row in rows):
+        completed = next((row for row in rows
+                          if row.get("name") == name and row.get("location") == "remote"
+                          and row.get("desc") in REMOTE_EMBEDDED_DESCRIPTIONS
+                          and row.get("required") == (base or "")), None)
+        if completed is None:
             raise BackupError("The backup operation finished, but its completed entry was not found in S3.")
-        print(f"Verified completed {kind} backup {name} in S3.", flush=True)
+        print(f"Verified completed {kind} backup {name} in S3. Format: {completed['desc']}.", flush=True)
         return name
 
 
@@ -545,7 +552,9 @@ def remote_cleanup_options(validate_numbers=True):
     if policy == "daily-weekly":
         if options["timeout"] < 60:
             raise BackupError("S3 cleanup needs a timeout of at least 60 seconds.")
-        options.update(retention_policy=policy,
+        options.update(delete_timeout=validate_delete_timeout(
+                           int(os.environ.get("BACKUP_CLEANUP_DELETE_TIMEOUT_SECONDS", "300"))),
+                       retention_policy=policy,
                        daily_days=int(os.environ.get("BACKUP_DAILY_DAYS", "7")),
                        history_days=int(os.environ.get("BACKUP_HISTORY_DAYS", "30")))
         if options["daily_days"] < 1 or options["history_days"] < options["daily_days"]:

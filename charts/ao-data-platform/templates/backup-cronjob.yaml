@@ -123,6 +123,8 @@ spec:
                   value: {{ $b.cleanup.keepDays | quote }}
                 - name: BACKUP_CLEANUP_TIMEOUT_SECONDS
                   value: {{ $b.cleanup.timeoutSeconds | quote }}
+                - name: BACKUP_CLEANUP_DELETE_TIMEOUT_SECONDS
+                  value: {{ $b.cleanup.deleteTimeoutSeconds | quote }}
                 {{- end }}
               volumeMounts:
                 - name: script

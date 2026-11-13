@@ -14,7 +14,10 @@ import inspect
 import json
 import os
 import unittest
+from unittest import mock
 import uuid
+
+import yaml
 
 if __package__:
     from . import test_backup_runtime as runtime
@@ -222,8 +225,29 @@ print(json.dumps(result))
         expired = {name for group in groups[:3] for name in group}
         removed_objects = self.group_objects(before, expired)
         self.assertTrue(removed_objects)
-        self.assertTrue(any(key.endswith("serialization.json") for key in removed_objects),
+        self.assertTrue(any(key.startswith("test/catalog/") and key.endswith(".tar")
+                            for key in removed_objects),
+                        "Expired backups must exercise the tar archive deletion path")
+        # Bundled catalogs keep native-file pointers inside tar archives, so
+        # checking S3 key names alone no longer finds serialization.json.
+        catalog_files = json.loads(self.s3(storage, credentials, """
+import io, tarfile
+files = []
+for name in json.loads(os.environ['OBJECT_KEYS']):
+    if not name.startswith('test/catalog/'):
+        continue
+    if name.endswith('.tar'):
+        body = signed_s3_request('GET', '/runtime-backups/' + urllib.parse.quote(name, safe='/'), key, secret)
+        with tarfile.open(fileobj=io.BytesIO(body), mode='r:') as archive:
+            files.extend(member.name for member in archive if member.isfile())
+    else:
+        files.append(name)
+print(json.dumps(files))
+""", OBJECT_KEYS=json.dumps(sorted(removed_objects))))
+        self.assertTrue(any(name.endswith("serialization.json") for name in catalog_files),
                         "The fixture must include the native file omitted by the old deletion code")
+        self.assertTrue(any(key.startswith("test/native/") for key in removed_objects),
+                        "The deletion check must cover native data objects, not only catalog files")
         preview = self.remote_cleanup(storage, anchor, groups[-1][-1], execute=False)
         self.assertEqual(set(preview["delete"]), expired)
         self.assertEqual(preview["deleted"], [])
@@ -269,6 +293,115 @@ print(json.dumps(result))
         self.assertEqual(self.sql(databases[0], "SELECT count(), sum(id) FROM otel_traces.runtime_sample"), "10\t55")
         print(json.dumps({"expired_sets": 3, "removed_objects": len(removed_objects),
                           "retained_incremental_restored": True, "next_incremental_restored": True}))
+
+    def test_directory_full_with_tar_incrementals_restores_and_cleans_up_after_upgrade(self):
+        storage, credentials = self.start_s3()
+        config_source, start_wrapper = self.config_source, self.start_wrapper
+        sidecars = {}
+
+        def directory_source():
+            source = config_source()
+            config = yaml.safe_load(source["config.yml"])
+            config["s3"]["compression_format"] = "none"
+            source["config.yml"] = yaml.safe_dump(config)
+            return source
+
+        def remember_wrapper(database, root):
+            sidecars[database.name] = start_wrapper(database, root)
+            return sidecars[database.name]
+
+        with mock.patch.object(self, "config_source", side_effect=directory_source), \
+                mock.patch.object(self, "start_wrapper", side_effect=remember_wrapper):
+            databases = self.prepare_databases(storage, credentials)
+        anchor, groups = self.seed_groups(storage, databases, (35, 34, 0), credentials)
+        old_names = {name for group in groups for name in group}
+        original = self.snapshot(storage, credentials)
+        rows = json.loads(self.client(storage, "print(json.dumps(api.request('GET', '/backup/list/remote')))"))
+        self.assertEqual({row["name"]: row["desc"] for row in rows},
+                         {name: "directory, embedded" for name in old_names})
+
+        # Restart only the backup services on the same database copies, using
+        # the new rendered format. Existing objects and local records remain.
+        rendered_format = yaml.safe_load(config_source()["config.yml"])["s3"]["compression_format"]
+        self.assertEqual(rendered_format, "tar")
+        for index, database in enumerate(databases):
+            directory = database.root / "sidecar" / "config"
+            source = {name: (directory / name).read_text() for name in ("config.yml", "password")}
+            config = yaml.safe_load(source["config.yml"])
+            config["s3"]["compression_format"] = rendered_format
+            source["config.yml"] = yaml.safe_dump(config)
+            runtime.project(directory, source)
+            runtime.docker("restart", "--time", "2", sidecars[database.name])
+            self.client(storage, """
+import time
+deadline = time.monotonic() + 60
+while True:
+    try:
+        api.request('GET', '/backup/status')
+        break
+    except backup.BackupError:
+        if time.monotonic() >= deadline:
+            raise
+        time.sleep(0.2)
+print('ready')
+""", copy=index)
+
+        previous = original
+        # Keep one mixed family and expire another. The second copy has to
+        # download the old directory full before making its tar incremental.
+        for value, group_index, age, copy in ((7, 0, 35, 0), (8, 2, 0, 1)):
+            for database in databases:
+                self.sql(database, f"INSERT INTO otel_traces.runtime_sample VALUES ({value}, 'batch {value}')")
+            result = self.scheduler(storage, anchor - timedelta(days=age) + timedelta(hours=8), copy=copy)
+            row = next(row for row in result["remote"] if row["name"] == result["name"])
+            self.assertEqual((row["desc"], row["required"]), ("tar, embedded", groups[group_index][0]))
+            groups[group_index].append(result["name"])
+            current = self.snapshot(storage, credentials)
+            self.assertEqual({key: current.get(key) for key in previous}, previous)
+            created = set(current) - set(previous)
+            self.assertTrue(any(key.startswith("test/catalog/") and key.endswith(".tar") for key in created))
+            self.created_backup_objects[result["name"]] = created
+            previous = current
+
+        names = [name for group in groups for name in group]
+        existing = self.local_names(storage, 1)
+        self.download_records(storage, [name for name in names if name not in existing])
+        latest = groups[-1][-1]
+        expired = {name for group in groups[:2] for name in group}
+        before = self.snapshot(storage, credentials)
+        removed = self.group_objects(before, expired)
+        self.assertTrue(any(key.startswith("test/native/") for key in removed))
+        local_before = {copy: self.local_names(storage, copy) for copy in (0, 1)}
+
+        for stage in ("before", "after"):
+            if stage == "after":
+                preview = self.remote_cleanup(storage, anchor, latest, execute=False)
+                self.assertEqual(set(preview["delete"]), expired)
+                self.assertEqual(self.snapshot(storage, credentials), before)
+                cleaned = self.remote_cleanup(storage, anchor, latest, execute=True)
+                self.assertTrue(cleaned["completed"])
+                self.assertEqual(set(cleaned["deleted"]), expired)
+                for group in groups[:2]:
+                    for incremental in group[1:]:
+                        self.assertLess(cleaned["deleted"].index(incremental), cleaned["deleted"].index(group[0]))
+                self.assertEqual(self.snapshot(storage, credentials),
+                                 {key: value for key, value in before.items() if key not in removed})
+                for copy in (0, 1):
+                    remote = json.loads(self.client(storage, "print(json.dumps(api.request('GET', '/backup/list/remote')))",
+                                                    copy=copy))
+                    self.assertEqual({row["name"] for row in remote}, set(groups[-1]))
+                    self.assertEqual(self.local_names(storage, copy), local_before[copy] - expired)
+
+            destination = "recovered_mixed_" + stage
+            self.sql(databases[1], "CREATE DATABASE " + destination)
+            self.sql(databases[1], "RESTORE TABLE otel_traces.runtime_sample AS " + destination
+                     + ".runtime_sample FROM Disk('backups_s3', '" + latest + "')")
+            self.assertEqual(self.sql(databases[1], "SELECT count(), sum(id) FROM " + destination + ".runtime_sample"),
+                             "8\t36")
+        for database in databases:
+            self.assertEqual(self.sql(database, "SELECT count(), sum(id) FROM otel_traces.runtime_sample"), "8\t36")
+        print(json.dumps({"directory_full_tar_incremental": True, "expired_sets": 2,
+                          "removed_objects": len(removed), "restored_before_and_after_cleanup": True}))
 
     def test_versioned_minio_stops_on_stale_prefix_and_preserves_versions(self):
         # MinIO returns empty prefixes after versioned deletion, unlike AWS S3:

@@ -61,13 +61,15 @@ class Clock:
 
 
 class FakeAPI:
-    def __init__(self, catalog=None, local=None, history=None, created_required=""):
+    def __init__(self, catalog=None, local=None, history=None, created_required="",
+                 created_desc="directory, embedded"):
         self.catalog = list(catalog or [])
         self.local = list(local or [])
         self.history = list(history or [])
         # The server's completed dependency is independent of the submitted
         # diff-from-remote value, so verification must compare the two.
         self.created_required = created_required
+        self.created_desc = created_desc
         self.calls = []
         self.unavailable = False
         self.table_failure = False
@@ -115,7 +117,7 @@ class FakeAPI:
                 if operation == "download":
                     self.local.append(dict(name=name, location="local", desc="embedded", required=""))
                 elif self.publish_remote:
-                    self.catalog.append(remote(name, self.created_required))
+                    self.catalog.append(dict(remote(name, self.created_required), desc=self.created_desc))
             for row in self.history:
                 if row.get("operation_id") == self.operation_id:
                     row["status"] = status
@@ -135,13 +137,13 @@ class FakeAPI:
 
 
 class SchedulerTests(unittest.TestCase):
-    def run_scheduler(self, *apis, timeout=30, probes=None, **options):
+    def run_scheduler(self, *apis, timeout=30, probes=None, output=None, **options):
         clock = Clock()
         probes = probes if probes is not None else [FakeProbe() for _ in apis]
         scheduler = backup.Scheduler(apis, probes, timeout=timeout, poll_seconds=10,
                                      clock=clock.now, sleep=clock.sleep,
                                      **dict({"freshness_retry_seconds": 0}, **options))
-        with redirect_stdout(io.StringIO()):
+        with redirect_stdout(output if output is not None else io.StringIO()):
             return scheduler.run(NOW)
 
     def test_behind_readonly_expired_or_incomplete_copy_is_not_selected(self):
@@ -364,6 +366,53 @@ class SchedulerTests(unittest.TestCase):
     def test_latest_completed_full_of_today_wins(self):
         latest = "ao-otel-full-20260929T040000Z-abcdef12"
         self.assertEqual(backup.full_base([remote(), remote(latest)], NOW), latest)
+
+    def test_latest_full_wins_across_directory_and_tar_catalogs(self):
+        latest = "ao-otel-full-20260929T040000Z-abcdef12"
+        for older, newer in (("directory, embedded", "tar, embedded"),
+                             ("tar, embedded", "directory, embedded")):
+            with self.subTest(older=older, newer=newer):
+                rows = [dict(remote(), desc=older), dict(remote(latest), desc=newer)]
+                self.assertEqual(backup.full_base(rows, NOW), latest)
+
+    def test_tar_full_and_incremental_complete_with_either_base_format(self):
+        first = FakeAPI(created_desc="tar, embedded")
+        name = self.run_scheduler(first)
+        self.assertIn("-full-", name)
+        self.assertEqual(first.catalog[-1]["desc"], "tar, embedded")
+        for desc in ("directory, embedded", "tar, embedded"):
+            with self.subTest(base_format=desc):
+                first, second = FakeAPI(), FakeAPI([dict(remote(), desc=desc)],
+                                                   created_required=FULL, created_desc="tar, embedded")
+                first.unavailable = True
+                name = self.run_scheduler(first, second)
+                self.assertIn("-incremental-", name)
+                self.assertEqual(second.posts[0], ("POST", "/backup/download/" + FULL, None))
+                self.assertEqual(second.posts[1][2]["diff-from-remote"], FULL)
+                self.assertEqual(second.local[0]["desc"], "embedded")
+
+    def test_success_log_identifies_the_verified_full_or_incremental_format(self):
+        for desc in ("directory, embedded", "tar, embedded"):
+            for base in ("", FULL):
+                with self.subTest(desc=desc, base=base):
+                    api = FakeAPI([remote()] if base else [], created_required=base, created_desc=desc)
+                    output = io.StringIO()
+                    name = self.run_scheduler(api, output=output)
+                    kind = "incremental" if base else "full"
+                    self.assertIn(f"Verified completed {kind} backup {name} in S3. Format: {desc}.",
+                                  output.getvalue())
+
+    def test_unknown_or_broken_formats_cannot_be_bases_or_verified_completions(self):
+        for desc in ("embedded", "tar", "tar, embedded, broken", "gzip, embedded", None, [],
+                     "tar, embedded\nprivate server response"):
+            with self.subTest(desc=desc):
+                self.assertIsNone(backup.full_base([dict(remote(), desc=desc)], NOW))
+                first = FakeAPI(created_desc=desc)
+                output = io.StringIO()
+                with self.assertRaisesRegex(backup.BackupError, "completed entry was not found"):
+                    self.run_scheduler(first, output=output)
+                self.assertNotIn("Verified completed", output.getvalue())
+                self.assertNotIn("private server response", output.getvalue())
 
     def test_fallback_downloads_full_metadata_from_shared_remote_catalog(self):
         first, second = FakeAPI(), FakeAPI([remote()], created_required=FULL)
@@ -950,6 +999,30 @@ class APITests(unittest.TestCase):
                     api.request("POST", "/backup/delete/local/example", request_timeout=timeout)
             request.assert_not_called()
 
+    def test_long_wait_is_only_allowed_for_a_scheduled_remote_delete(self):
+        api = backup.API(self.url, "backup", "dummy")
+        target = "/backup/delete/remote/" + FULL
+        with mock.patch.object(api.opener, "open") as request:
+            request.return_value.__enter__.return_value.read.return_value = b'{}\n'
+            for timeout in (900, 1800, 3600):
+                api.request("POST", target, request_timeout=timeout)
+                self.assertEqual(request.call_args.kwargs["timeout"], timeout)
+            request.reset_mock()
+            for method, path in (("GET", target), ("POST", "/backup/delete/local/" + FULL),
+                                 ("POST", "/backup/create_remote"), ("GET", "/backup/actions"),
+                                 ("POST", "/backup/delete/remote/manual"),
+                                 ("POST", target + "/extra"), ("POST", target + "?extra=1")):
+                with self.subTest(method=method, path=path), self.assertRaises(backup.BackupError):
+                    api.request(method, path, request_timeout=1800)
+            for timeout in (3601, float("nan"), float("inf"), True, "1800"):
+                with self.subTest(timeout=timeout), self.assertRaises(backup.BackupError):
+                    api.request("POST", target, request_timeout=timeout)
+            request.assert_not_called()
+        probe = backup.API(self.url, "probe", "dummy", backup_api=False)
+        with mock.patch.object(probe.opener, "open") as request, self.assertRaises(backup.BackupError):
+            probe.request("POST", target, request_timeout=1800)
+        request.assert_not_called()
+
     def test_backup_authentication_errors_name_rotation_without_printing_credentials(self):
         for status in (401, 403):
             with self.subTest(status=status):
@@ -1147,7 +1220,9 @@ class APITests(unittest.TestCase):
     def test_daily_weekly_settings_are_checked_before_starting_backup(self):
         cases = ({"BACKUP_RETENTION_POLICY": "unknown"},
                  {"BACKUP_DAILY_DAYS": "0"}, {"BACKUP_DAILY_DAYS": "1.5"},
-                 {"BACKUP_HISTORY_DAYS": "6"}, {"BACKUP_CLEANUP_DRY_RUN": "invalid"})
+                 {"BACKUP_HISTORY_DAYS": "6"}, {"BACKUP_CLEANUP_DRY_RUN": "invalid"},
+                 *({"BACKUP_CLEANUP_DELETE_TIMEOUT_SECONDS": value}
+                   for value in ("299", "3601", "900.5", "true", "invalid")))
         for override in cases:
             settings = dict(self.settings, BACKUP_CLEANUP_ENABLED="true", BACKUP_RETENTION_POLICY="daily-weekly",
                             BACKUP_CLEANUP_DRY_RUN="false")
@@ -1175,7 +1250,7 @@ class APITests(unittest.TestCase):
                     redirect_stdout(io.StringIO()):
                 self.assertEqual(backup.main(), 0)
             remote.Cleaner.assert_called_once_with(mock.ANY, keep_last=2, keep_days=0, timeout=1800,
-                                                  retention_policy="daily-weekly", daily_days=8, history_days=35)
+                                                  retention_policy="daily-weekly", daily_days=8, history_days=35, delete_timeout=300)
             remote.Cleaner.return_value.run.assert_called_once_with(latest_backup=FULL, execute=False)
 
     def test_daily_weekly_deletion_follows_successful_backup_and_local_cleanup(self):
@@ -1198,8 +1273,25 @@ class APITests(unittest.TestCase):
             self.assertEqual(backup.main(), 0)
         self.assertEqual(events, ["backup", "local", "remote"])
         remote.Cleaner.assert_called_once_with(mock.ANY, keep_last=2, keep_days=0, timeout=1800,
-                                              retention_policy="daily-weekly", daily_days=7, history_days=30)
+                                              retention_policy="daily-weekly", daily_days=7, history_days=30, delete_timeout=300)
         remote.Cleaner.return_value.run.assert_called_once_with(latest_backup=FULL, execute=True)
+
+    def test_remote_delete_wait_from_environment_reaches_cleanup(self):
+        remote = mock.Mock()
+        remote.Cleaner.return_value.run.return_value = {
+            "mode": "delete", "retention_policy": "daily-weekly", "daily_days": 7,
+            "history_days": 30, "kept": [FULL], "delete": [], "deleted": [],
+            "broken_local": [], "local_only": [], "completed": True}
+        settings = dict(self.settings, BACKUP_CLEANUP_ENABLED="true", BACKUP_CLEANUP_DRY_RUN="false",
+                        BACKUP_CLEANUP_TIMEOUT_SECONDS="3600", BACKUP_CLEANUP_DELETE_TIMEOUT_SECONDS="1800")
+        with mock.patch.dict(backup.os.environ, settings, clear=True), \
+                mock.patch.dict("sys.modules", {"cleanup_backups": remote}), \
+                mock.patch.object(backup, "configured_clients", return_value=([mock.Mock()], [mock.Mock()])), \
+                mock.patch.object(backup.Scheduler, "run", return_value=FULL), redirect_stdout(io.StringIO()):
+            self.assertEqual(backup.main(), 0)
+        remote.Cleaner.assert_called_once_with(mock.ANY, keep_last=2, keep_days=0, timeout=3600,
+                                              retention_policy="daily-weekly", daily_days=7,
+                                              history_days=30, delete_timeout=1800)
 
     def test_uncertain_or_incomplete_local_cleanup_prevents_s3_deletion(self):
         settings = dict(self.settings, BACKUP_CLEANUP_ENABLED="true", BACKUP_CLEANUP_DRY_RUN="false",

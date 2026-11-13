@@ -138,10 +138,11 @@ try:
     check(catalog(real[0], "remote") == after, "The copies disagree after the backup.")
     check(set(after) - set(before) == {name} and all(after.get(k) == v for k, v in before.items()),
           "The remote catalog did not gain exactly one backup.")
-    # The exact healthy description excludes broken-backup errors. "directory"
-    # requires s3.compression_format: none in templates/_backup.tpl; keep this
-    # check and run_backup.py's catalog checks in sync with that setting.
-    check(after[name].get("required") == expected and after[name].get("desc") == "directory, embedded"
+    # Use the installed scheduler's formats. Older charts only supported directory
+    # and did not expose this constant; keep the helper usable with those charts.
+    healthy_descriptions = getattr(b, "REMOTE_EMBEDDED_DESCRIPTIONS", ("directory, embedded",))
+    check(after[name].get("required") == expected
+          and after[name].get("desc") in healthy_descriptions
           and after[name].get("location") == "remote" and "-incremental-" in name,
           "The new backup is not a healthy incremental using the expected full.")
     local1 = catalog(real[1], "local")

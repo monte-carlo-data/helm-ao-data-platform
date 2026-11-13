@@ -5,6 +5,12 @@ import uuid
 
 
 REQUEST_TIMEOUT_SECONDS = 30
+DELETE_TIMEOUT_SECONDS = 300
+MAX_REMOTE_DELETE_TIMEOUT_SECONDS = 3600
+# Healthy remote desc is "<stored format>, embedded"; compression_format: none
+# appears as directory. Keep tar aligned with the config and environment setting
+# in templates/_backup.tpl, and directory while pre-6.2.0 backups can remain.
+REMOTE_EMBEDDED_DESCRIPTIONS = ("directory, embedded", "tar, embedded")
 NAME_PREFIX = "ao-otel-"
 SCHEDULED_NAME = re.compile(re.escape(NAME_PREFIX) + r"(full|incremental)-(\d{8}T\d{6}Z)-[0-9a-f]{8}\Z")
 DELETION_UNAVAILABLE = "S3 deletion requires daily-weekly retention; count-and-age supports preview only."
@@ -47,3 +53,9 @@ def broken_local_entry(row):
     return (row.get("location") == "local" and row.get("required") == ""
             and isinstance(desc, str)
             and (desc == "broken metadata.json not found" or desc.startswith("parse metadata.json error: ")))
+
+
+def validate_delete_timeout(seconds):
+    if type(seconds) is not int or not DELETE_TIMEOUT_SECONDS <= seconds <= MAX_REMOTE_DELETE_TIMEOUT_SECONDS:
+        raise BackupError("S3 delete timeout must be an integer from 300 to 3600 seconds.")
+    return seconds

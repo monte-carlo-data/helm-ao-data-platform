@@ -47,10 +47,20 @@
 {{- end -}}
 {{- if $b.cleanup.enabled -}}
 {{- if not (kindIs "bool" $b.cleanup.dryRun) -}}{{- fail "clickhouse.backup.cleanup.dryRun must be a boolean." -}}{{- end -}}
+{{- if or (not (regexMatch "^[0-9]+$" (toString $b.cleanup.deleteTimeoutSeconds))) (lt (int $b.cleanup.deleteTimeoutSeconds) 300) (gt (int $b.cleanup.deleteTimeoutSeconds) 3600) -}}{{- fail "clickhouse.backup.cleanup.deleteTimeoutSeconds must be an integer from 300 to 3600." -}}{{- end -}}
 {{- if not (has $b.cleanup.retentionPolicy (list "count-and-age" "daily-weekly")) -}}{{- fail "clickhouse.backup.cleanup.retentionPolicy must be count-and-age or daily-weekly." -}}{{- end -}}
 {{- if not $b.cleanup.dryRun -}}
 {{- if ne $b.cleanup.retentionPolicy "daily-weekly" -}}{{- fail "S3 deletion requires cleanup.retentionPolicy=daily-weekly; count-and-age supports preview only." -}}{{- end -}}
 {{- if not $fixedImage -}}{{- fail "S3 deletion requires the verified Altinity 2.8.2 image digest." -}}{{- end -}}
+{{/* Match backup_retention.RemoteCleaner.request: five reads per copy plus one spare.
+     30 is backup_common.REQUEST_TIMEOUT_SECONDS; 10 is
+     run_backup.PASSWORD_REVISION_READ_TIMEOUT_SECONDS for each Pod revision read. */}}
+{{- $copies := int .Values.clickhouse.replicasCount -}}
+{{- $verificationSeconds := mul (add (mul 5 $copies) 1) (add 30 (mul 10 $copies)) -}}
+{{- $requiredSeconds := add (int $b.cleanup.deleteTimeoutSeconds) $verificationSeconds -}}
+{{- if and (gt (int $b.cleanup.deleteTimeoutSeconds) 300) (le (int $b.cleanup.timeoutSeconds) $requiredSeconds) -}}
+{{- fail (printf "clickhouse.backup.cleanup.timeoutSeconds must exceed %d to allow deleteTimeoutSeconds and verification for %d copies; include extra time for earlier checks and local-record removal." $requiredSeconds $copies) -}}
+{{- end -}}
 {{- end -}}
 {{- range $key, $minimum := dict "keepLast" 1 "keepDays" 0 "timeoutSeconds" 60 -}}
 {{- $value := index $b.cleanup $key -}}
@@ -146,7 +156,7 @@ s3:
   bucket: {{ .Values.clickhouse.backup.aws.bucket | quote }}
   region: {{ .Values.clickhouse.backup.aws.region | quote }}
   path: {{ printf "%s/catalog" .Values.clickhouse.backup.aws.path | quote }}
-  compression_format: none
+  compression_format: tar
   acl: ""
 api:
   listen: 0.0.0.0:7171
@@ -162,6 +172,11 @@ api:
   env:
     - name: API_USERNAME
       value: backup
+    # Overrides s3.compression_format above so a Pod starting before the config
+    # Secret refreshes still writes tar. Change both settings together and keep
+    # backup_common.REMOTE_EMBEDDED_DESCRIPTIONS in step.
+    - name: S3_COMPRESSION_FORMAT
+      value: tar
     - name: GOMEMLIMIT
       value: {{ .Values.clickhouse.backup.sidecar.goMemoryLimit | quote }}
     - name: BACKUP_PASSWORD_REVISION

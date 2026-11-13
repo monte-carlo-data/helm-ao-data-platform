@@ -76,7 +76,7 @@ for name in json.loads(os.environ['OBJECT_KEYS']):
             runtime.docker("exec", container, "sh", "-c",
                            "rm -f /tmp/.clickhouse-backup-metadata.cache.*")
         row = next(row for row in self.remote_rows(storage) if row["name"] == name)
-        self.assertNotEqual(row["desc"], "directory, embedded")
+        self.assertNotIn(row["desc"], ("directory, embedded", "tar, embedded"))
         self.assertIn(name, self.local_names(storage, 0))
 
     def download_and_restore(self, storage, database, names, destination, expected):
@@ -114,7 +114,7 @@ scheduler.operation(api, 'upload', name, '/backup/upload/' + name, {'resume': 't
 print(json.dumps(api.request('GET', '/backup/list/remote')))
 """, BACKUP_NAME=name)
             rows = {row["name"]: row for row in json.loads(output.splitlines()[-1])}
-            self.assertEqual(rows[name]["desc"], "directory, embedded")
+            self.assertEqual(rows[name]["desc"], "tar, embedded")
             self.assertEqual(rows[name]["required"], required)
             after = self.snapshot(storage, credentials)
             self.assertEqual({key: value for key, value in after.items()
