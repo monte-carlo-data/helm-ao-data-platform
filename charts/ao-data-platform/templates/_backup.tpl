@@ -172,8 +172,9 @@ api:
   env:
     - name: API_USERNAME
       value: backup
-    # Overrides s3.compression_format above so an early Pod start still writes tar.
-    # Change both settings together; the config Secret may refresh after startup.
+    # Overrides s3.compression_format above so a Pod starting before the config
+    # Secret refreshes still writes tar. Change both settings together and keep
+    # backup_common.REMOTE_EMBEDDED_DESCRIPTIONS in step.
     - name: S3_COMPRESSION_FORMAT
       value: tar
     - name: GOMEMLIMIT

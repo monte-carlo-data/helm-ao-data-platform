@@ -75,8 +75,9 @@ location. This reduces the number of tracking files that must be read during
 deletion; it does not add data-file batching to the pinned stock image.
 That image still deletes each data object separately. This release prepares the
 new tracking-file format and makes the deletion wait configurable; it does not
-establish that a large backup can be deleted within the allowed wait. Use measured
-delete times before enabling cleanup. Existing directory backups keep their
+establish that a large backup can be deleted within the allowed wait. Use the
+[first-deletion procedure](backup-cleanup.md#measure-the-first-deletion) when no
+completed-delete measurement exists yet. Existing directory backups keep their
 original read cost until cleanup actually removes them; age alone removes nothing.
 
 The scheduler, both cleanup options, and the copy-switch checker accept healthy
@@ -89,19 +90,33 @@ ClickHouse pods on upgrade and selects the new format even if the generated
 configuration Secret has not refreshed yet. The environment value overrides the
 file value, so change both settings together. To upgrade:
 
-1. Apply `clickhouse.backup.schedule.suspend: true` before upgrading.
+1. Apply `clickhouse.backup.schedule.suspend: true` in a **separate deployment
+   that keeps the current chart version and other settings unchanged**. With Helm,
+   record the resulting paused revision from `helm history <release>`. This is
+   the revision to return to if needed. This pause changes the CronJob without
+   rolling the database pods.
 2. Confirm no backup Job is active and every copy's backup API reports no running
-   command. A server-side backup, restore, or deletion can outlive its Job.
-3. Upgrade and wait for all ClickHouse pods to finish rolling and become ready.
+   command using [the check below](#check-that-backup-work-has-stopped). A server-side
+   backup, restore, or deletion can outlive its Job.
+3. Upgrade with `clickhouse.backup.schedule.suspend: true` still set, and wait for
+   all ClickHouse pods to finish rolling and become ready. Do not combine the
+   initial pause with this version change: that would restart pods before step 2.
    A single-copy installation is unavailable while its pod restarts.
 4. Apply `clickhouse.backup.schedule.suspend: false`. Confirm the next scheduled
-   backup completes and verifies with a `tar, embedded` remote entry.
+   backup completes; its success log includes `Format: tar, embedded.`
 
 ### Rolling back below 6.2.0
 
-Removing the environment setting rolls the ClickHouse pods again. Pause and wait
-for idle Jobs and backup APIs as above, then roll back and wait for every copy to
-be ready. Confirm the generated configuration Secret has refreshed to
+Removing the environment setting rolls the ClickHouse pods again. First pause
+in a separate deployment at the currently installed version, then run
+[the idle check](#check-that-backup-work-has-stopped). With Helm, use
+`helm rollback <release> <paused-old-chart-revision>` with the same context and
+namespace: return to the paused revision recorded in upgrade step 1, not an
+earlier revision that would resume the schedule. With Terraform, apply the older
+chart version while keeping `suspend = true`. Wait for every copy to be ready.
+The configuration Secret is the name set by `clickhouse.backup.user.secret`
+(`ao-clickhouse-backup-credentials` by default); inspect only its `config.yml`
+format setting, not its password fields. Confirm it has refreshed to
 `s3.compression_format: none` before resuming the schedule. After resuming, verify
 that the next backup completes with a `directory, embedded` entry. If a backup
 container still writes tar, pause again, wait for all operations to finish, and
@@ -119,6 +134,74 @@ The saved backups remain readable by the backup tool. Do not edit or remove raw
 catalog files to make an older chart accept them. Deliberately deleting complete
 backups through the backup tool is different: it discards those recovery points
 and is not part of this rollback procedure.
+
+### Check that backup work has stopped
+
+Run from a terminal with Python 3 and `kubectl` access to the intended installation.
+Set the context, namespace, ClickHouse installation name, and configured copy count:
+
+```bash
+export KUBE_CONTEXT="<your-context>" NAMESPACE="<release-namespace>"
+export BACKUP_CHI="otel" BACKUP_COPIES="2"
+kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" get cronjob "$BACKUP_CHI-backup"
+kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" get jobs
+```
+
+The CronJob must show `SUSPEND=True`. Wait for any scheduled or manually started
+backup Job to finish, then query `/backup/actions` on **every** copy. Do not use
+`/backup/status`: it shows only the last action. This read-only snippet discovers
+each pod's API Secret, checks its password revision, and sends credentials through
+stdin to `wget` inside the `clickhouse` container on `127.0.0.1:7171`. Credentials
+are kept in a private temporary file in memory (`/dev/shm`) and removed after the
+request; they are not printed or placed in process arguments. Run it while no
+password rotation or other backup work is being started.
+
+```bash
+python3 <<'PY'
+import base64, json, os, subprocess
+
+k = ["kubectl", "--context", os.environ["KUBE_CONTEXT"], "-n", os.environ["NAMESPACE"]]
+def read(*args):
+    return json.loads(subprocess.check_output(k + ["get", *args, "-o", "json"], timeout=30))
+
+request = '''set -eu
+umask 077
+auth_file=$(mktemp /dev/shm/backup-api.XXXXXX)
+trap 'rm -f "$auth_file"' EXIT HUP INT TERM
+cat >"$auth_file"
+wget --config="$auth_file" --quiet --output-document=- --timeout=30 \\
+  --tries=1 --max-redirect=0 --no-proxy http://127.0.0.1:7171/backup/actions
+'''
+pods = read("pods", "-l", "clickhouse.altinity.com/chi=" + os.environ["BACKUP_CHI"])["items"]
+if len(pods) != int(os.environ["BACKUP_COPIES"]) or not pods:
+    raise SystemExit("Expected copy count does not match; stop and check the pods.")
+for pod in pods:
+    name = pod["metadata"]["name"]
+    secret = next(v["secret"]["secretName"] for v in pod["spec"]["volumes"]
+                  if v["name"] == "backup-api-credentials")
+    data = read("secret", secret)["data"]
+    password = base64.b64decode(data["password"], validate=True)
+    revision = base64.b64decode(data["revision"], validate=True).decode()
+    if not password or not revision or revision != pod["metadata"]["annotations"].get(
+            "backup.montecarlodata.com/password-revision"):
+        raise SystemExit(name + ": password revision mismatch; no API request sent.")
+    auth = base64.b64encode(b"backup:" + password).decode()
+    result = subprocess.run(k + ["exec", "-i", name, "-c", "clickhouse", "--", "sh", "-c", request],
+        input="header = Authorization: Basic " + auth + "\n", text=True,
+        capture_output=True, timeout=45)
+    if result.returncode:
+        raise SystemExit(name + ": API request failed; do not treat this copy as idle.")
+    rows = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+    if any(not isinstance(r, dict) or r.get("status") not in ("success", "error", "cancel") for r in rows):
+        raise SystemExit(name + ": a command is running or its state is unknown; wait and check again.")
+    print(name + ": idle")
+PY
+```
+
+Proceed only when the Job check and every copy's API check succeed. `idle` means
+no command is running; it does not mean earlier deletions succeeded. For an
+unconfirmed deletion, also follow the checks in
+[the first-deletion procedure](backup-cleanup.md#measure-the-first-deletion).
 
 ## AWS prerequisites
 

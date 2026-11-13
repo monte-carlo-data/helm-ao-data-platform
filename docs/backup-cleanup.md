@@ -261,10 +261,15 @@ schedule.
 For two copies on that four-hour interval (14400 seconds), with the default
 10800-second backup allowance:
 
-| Database-disk cleanup | S3 cleanup allowance must be below | S3 delete wait must be below |
+| Database-disk cleanup | S3 cleanup allowance must be below | Largest S3 delete wait in whole seconds |
 | --- | ---: | ---: |
-| Disabled | 3540 seconds | 2990 seconds |
-| Enabled with its default 1800 seconds | 1740 seconds | 1190 seconds |
+| Disabled | 3540 seconds | 2988 seconds |
+| Enabled with its default 1800 seconds | 1740 seconds | 1188 seconds |
+
+With both cleanups enabled at their default 1800-second allowances, the Job
+deadline is 14460 seconds, one minute beyond the four-hour interval. The chart's
+NOTES warn about this combination; adjust the allowances as described in
+[database-disk record cleanup](backup-local-cleanup.md).
 
 These are arithmetic ceilings, not recommended settings: startup, earlier checks,
 local-record removal, and extra deletions need room below them. For example, with
@@ -274,6 +279,33 @@ Whether several deletions fit still depends on their measured durations. To allo
 a 3600-second delete wait on this schedule, the backup allowance must be reduced
 enough to fit cleanup and checks. That also gives slow backups less time; do not
 reduce it without measuring backup durations first.
+
+### Measure the first deletion
+
+If no remote-deletion timings exist yet, use an attended first run rather than
+guessing a longer wait:
+
+1. Review a successful `daily-weekly` preview, then enable deletion with
+   `cleanup.deleteTimeoutSeconds: 300`. Keep enough total cleanup time for the
+   checks above, and choose a window in which you can watch the result. This is a
+   real removal of the previewed backups, not a timing-only check.
+2. If the report shows `response_status: unknown`, pause the schedule before its
+   next trigger. Do not resend the deletion or restart its backup container. The
+   server may keep deleting after the caller's five-minute wait ends. Use
+   [the idle check](clickhouse-backups.md#check-that-backup-work-has-stopped) on
+   every copy and wait for the operation to finish.
+3. Confirm the exact `delete remote <backup-name>` action succeeded and the backup
+   is absent from every copy's `/backup/list/remote` response. Idle alone is not
+   proof of success: failed or cancelled deletions need investigation. Read the
+   completed remote-delete `duration` for that same backup from its
+   `clickhouse-backup` container log.
+4. Set the wait above the longest completed **full-backup** deletion, with margin,
+   and adjust the total cleanup allowance to fit the schedule. A short incremental
+   or local-record deletion does not establish how long a full backup will take.
+   If the first run only deletes incrementals, keep watching until a full finishes.
+   If the measured duration cannot fit, keep S3 cleanup in preview instead of
+   blindly raising the wait. Once all copies are idle and results are confirmed,
+   apply the chosen settings and resume the backup schedule.
 
 ## Local files in the report
 

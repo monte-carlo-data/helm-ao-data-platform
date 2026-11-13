@@ -495,11 +495,13 @@ class Scheduler:
             raise BackupError("The selected ClickHouse copy is no longer caught up; no new backup was started.")
         self.operation(api, "create_remote", name, "/backup/create_remote", query)
         rows = self.read(api, "/backup/list/remote")
-        if not any(row.get("name") == name and row.get("location") == "remote"
-                   and row.get("desc") in REMOTE_EMBEDDED_DESCRIPTIONS
-                   and row.get("required") == (base or "") for row in rows):
+        completed = next((row for row in rows
+                          if row.get("name") == name and row.get("location") == "remote"
+                          and row.get("desc") in REMOTE_EMBEDDED_DESCRIPTIONS
+                          and row.get("required") == (base or "")), None)
+        if completed is None:
             raise BackupError("The backup operation finished, but its completed entry was not found in S3.")
-        print(f"Verified completed {kind} backup {name} in S3.", flush=True)
+        print(f"Verified completed {kind} backup {name} in S3. Format: {completed['desc']}.", flush=True)
         return name
 
 

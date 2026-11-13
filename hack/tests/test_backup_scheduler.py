@@ -137,13 +137,13 @@ class FakeAPI:
 
 
 class SchedulerTests(unittest.TestCase):
-    def run_scheduler(self, *apis, timeout=30, probes=None, **options):
+    def run_scheduler(self, *apis, timeout=30, probes=None, output=None, **options):
         clock = Clock()
         probes = probes if probes is not None else [FakeProbe() for _ in apis]
         scheduler = backup.Scheduler(apis, probes, timeout=timeout, poll_seconds=10,
                                      clock=clock.now, sleep=clock.sleep,
                                      **dict({"freshness_retry_seconds": 0}, **options))
-        with redirect_stdout(io.StringIO()):
+        with redirect_stdout(output if output is not None else io.StringIO()):
             return scheduler.run(NOW)
 
     def test_behind_readonly_expired_or_incomplete_copy_is_not_selected(self):
@@ -391,13 +391,28 @@ class SchedulerTests(unittest.TestCase):
                 self.assertEqual(second.posts[1][2]["diff-from-remote"], FULL)
                 self.assertEqual(second.local[0]["desc"], "embedded")
 
+    def test_success_log_identifies_the_verified_full_or_incremental_format(self):
+        for desc in ("directory, embedded", "tar, embedded"):
+            for base in ("", FULL):
+                with self.subTest(desc=desc, base=base):
+                    api = FakeAPI([remote()] if base else [], created_required=base, created_desc=desc)
+                    output = io.StringIO()
+                    name = self.run_scheduler(api, output=output)
+                    kind = "incremental" if base else "full"
+                    self.assertIn(f"Verified completed {kind} backup {name} in S3. Format: {desc}.",
+                                  output.getvalue())
+
     def test_unknown_or_broken_formats_cannot_be_bases_or_verified_completions(self):
-        for desc in ("embedded", "tar", "tar, embedded, broken", "gzip, embedded", None, []):
+        for desc in ("embedded", "tar", "tar, embedded, broken", "gzip, embedded", None, [],
+                     "tar, embedded\nprivate server response"):
             with self.subTest(desc=desc):
                 self.assertIsNone(backup.full_base([dict(remote(), desc=desc)], NOW))
                 first = FakeAPI(created_desc=desc)
+                output = io.StringIO()
                 with self.assertRaisesRegex(backup.BackupError, "completed entry was not found"):
-                    self.run_scheduler(first)
+                    self.run_scheduler(first, output=output)
+                self.assertNotIn("Verified completed", output.getvalue())
+                self.assertNotIn("private server response", output.getvalue())
 
     def test_fallback_downloads_full_metadata_from_shared_remote_catalog(self):
         first, second = FakeAPI(), FakeAPI([remote()], created_required=FULL)

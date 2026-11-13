@@ -371,6 +371,7 @@ print('ready')
         before = self.snapshot(storage, credentials)
         removed = self.group_objects(before, expired)
         self.assertTrue(any(key.startswith("test/native/") for key in removed))
+        local_before = {copy: self.local_names(storage, copy) for copy in (0, 1)}
 
         for stage in ("before", "after"):
             if stage == "after":
@@ -389,6 +390,7 @@ print('ready')
                     remote = json.loads(self.client(storage, "print(json.dumps(api.request('GET', '/backup/list/remote')))",
                                                     copy=copy))
                     self.assertEqual({row["name"] for row in remote}, set(groups[-1]))
+                    self.assertEqual(self.local_names(storage, copy), local_before[copy] - expired)
 
             destination = "recovered_mixed_" + stage
             self.sql(databases[1], "CREATE DATABASE " + destination)
