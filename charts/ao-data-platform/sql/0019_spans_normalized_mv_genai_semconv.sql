@@ -6,7 +6,7 @@
 -- 0021_spans_normalized_mv_planning_tool_fallbacks.sql, and now lives in
 -- 0027_spans_normalized_mv_planning_messages.sql, the last writer of this
 -- view. The statement was removed from here rather than left in
--- place because schema-job.yaml re-runs every /sql/*.sql on install AND upgrade
+-- place because schema-job.yaml re-runs every file in /sql on install AND upgrade
 -- with no ledger or checksum: a superseded ALTER ... MODIFY QUERY is not merely
 -- redundant, it is a transient REGRESSION. Re-running this file restored the
 -- pre-tool_call_response SELECT for the window between it and 0020, and because

@@ -23,7 +23,7 @@
 -- DEPLOYMENT: this is the authoritative copy of this view definition.
 -- Supersedes 0026_spans_normalized_mv_planning_tool_calls.sql,
 -- whose ALTER ... MODIFY QUERY is emptied by this change (schema-job.yaml
--- re-applies every /sql/*.sql with no ledger, so a superseded ALTER left in
+-- re-applies every file in /sql with no ledger, so a superseded ALTER left in
 -- place would regress the view on every upgrade).
 --
 -- Release order: ship this only after the reader that consumes these prompts
