@@ -142,7 +142,7 @@ jobs:
       - run:
           name: Auth-methods bundle renders both template branches
           # The bundle is what gives the ClickHouse server two valid passwords
-          # during a rotation (YET-2680). Two things can silently break it: a
+          # during a rotation. Two things can silently break it: a
           # user present in the CHI's incl fragment but missing from the bundle
           # (ClickHouse rejects an empty <auth_methods>), and a lost ESO-side
           # `if` around the previous method (the steady-state sentinel "-" would
@@ -210,9 +210,9 @@ jobs:
           name: CHI users live wholly in the fragment, one incl per enabled user
           # Three invariants: (1) none of the six users may keep ANY key in the
           # operator users: spec — the operator injects a password hash for a
-          # password-less entry, which ClickHouse rejects alongside <auth_methods>
-          # (Spike Finding 7); (2) every incl name must have a matching element in
-          # the bundle — an unresolved incl leaves an empty <auth_methods>, also
+          # password-less entry, which ClickHouse rejects alongside <auth_methods>;
+          # (2) every incl name must have a matching element in the bundle — an
+          # unresolved incl leaves an empty <auth_methods>, also
           # rejected; (3) the gated users appear in both files or neither.
           command: |
             helm template charts/ao-data-platform \
@@ -283,6 +283,26 @@ jobs:
             grep -q '<readonly_user_auth_methods>' es-readonly.yaml || {
               echo "readonly_user enabled but the bundle has no readonly_user element — the incl would not resolve"; exit 1; }
             echo "CHI auth-methods wiring rendered correctly."
+      - run:
+          name: Per-table grants render from sql/grants.yaml
+          # The llm_worker, monte_carlo and (with restrictGrants) otel users take their
+          # per-table grants from the generated sql/grants.yaml. A render that loses the file or
+          # a role must fail or show up here, not install a user without its grants.
+          # The render fails on a top-level role other than the three, so helm template catches it.
+          # This checks one rendered grant per user; hack/tests has the full per-user comparison.
+          command: |
+            helm template charts/ao-data-platform \
+              -f charts/ao-data-platform/ci/lint-values.yaml --kube-version 1.30.0 \
+              --set clickhouse.otel.restrictGrants=true \
+              --show-only templates/clickhouse-installation.yaml > chi-grants.yaml
+            for grant in \
+              'GRANT SELECT, INSERT ON otel_traces.llm_batches' \
+              'GRANT INSERT, SYSTEM SYNC REPLICA ON otel_traces.conversations_normalized' \
+              'GRANT INSERT ON otel_traces.otel_traces'; do
+              grep -qF "<query>$grant</query>" chi-grants.yaml || {
+                echo "Missing rendered grant: $grant"; exit 1; }
+            done
+            echo "One rendered grant per user found for sql/grants.yaml."
       - run:
           name: Gateway disabled renders no gateway resources
           # The default posture is gateway.enabled=false. Assert none of the
@@ -824,7 +844,32 @@ jobs:
             fi
             echo "Dev shape rendered correctly with plain-HTTP readiness."
       - run:
+          name: Schema SQL matches its manifest
+          # The SQL files and grants.yaml are generated upstream and copied here
+          # with MANIFEST.sha256. This step catches a file edited, added or
+          # removed here without regenerating the manifest. It does not check
+          # content: an edit that also rewrites the manifest passes. The next
+          # step re-checks the schema rules on the SQL files; grants.yaml content
+          # is trusted from upstream.
+          command: |
+            cd charts/ao-data-platform/sql
+            listed=$(grep -v '^#' MANIFEST.sha256 | awk '{ print $2 }' | sort)
+            present=$(ls -A | grep -v '^MANIFEST.sha256$' | sort)
+            if [ "$listed" != "$present" ]; then
+              echo "Files differ from MANIFEST.sha256 (< listed, > present):"
+              diff <(echo "$listed") <(echo "$present") || true
+              echo "Schema and grant files are generated upstream; don't add or remove files here. See the README's Schema SQL section."
+              exit 1
+            fi
+            if ! grep -v '^#' MANIFEST.sha256 | sha256sum --check --quiet; then
+              echo "Files changed since they were generated (above). Schema and grant changes are made upstream. See the README's Schema SQL section."
+              exit 1
+            fi
+            echo "Schema files match MANIFEST.sha256 ($(echo "$present" | wc -l | tr -d ' ') files)."
+      - run:
           name: Schema SQL is clustered-only
+          # These rules are also enforced upstream. This re-checks the files the
+          # chart ships, whichever way a change arrives.
           # Every table the chart creates must be a path-less Replicated* engine
           # and every DDL statement must run ON CLUSTER — a plain-MergeTree or
           # non-cluster statement installs fine on one replica, then surfaces as
@@ -858,7 +903,7 @@ jobs:
             # insert-triggered and forward-only, so spans ingested in that
             # window keep the older rendering permanently. When a new file
             # supersedes a view's SELECT, the predecessor's statement must be
-            # emptied, keeping the file comment-only (see the 0021 header).
+            # emptied, keeping the file comment-only (as 0019-0021 and 0026 are).
             # MODIFY SQL SECURITY (0014) is deliberately not counted — it does
             # not rewrite the SELECT.
             writers=$(awk 'FNR == 1 { tbl = "" } /^[[:space:]]*--/ { next } /ALTER TABLE/ { tbl = $3 } /MODIFY QUERY/ { print FILENAME ": " tbl }' charts/ao-data-platform/sql/*.sql)
@@ -870,7 +915,7 @@ jobs:
             if [ -n "$dups" ]; then
               echo "More than one live MODIFY QUERY writer per view:"
               echo "$writers"
-              echo "Exactly one file may carry a view's current SELECT — empty the superseded predecessor's statement (keep the file comment-only; see the 0021 header)."
+              echo "Exactly one file may carry a view's current SELECT — empty the superseded predecessor's statement (keep the file comment-only, as 0019-0021 are)."
               fail=1
             fi
             [ "$fail" -eq 0 ] && echo "Schema SQL is clustered-only: ON CLUSTER DDL, path-less Replicated engines, one live MODIFY QUERY writer per view."

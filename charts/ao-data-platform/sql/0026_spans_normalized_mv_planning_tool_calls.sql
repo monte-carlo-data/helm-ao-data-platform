@@ -2,7 +2,7 @@
 --
 -- SUPERSEDED BY 0027, AND DELIBERATELY INERT. The SELECT this file used to
 -- install now lives in 0027_spans_normalized_mv_planning_messages.sql, the
--- last writer of this view. schema-job.yaml re-runs every /sql/*.sql on
+-- last writer of this view. schema-job.yaml re-runs every file in /sql on
 -- install AND upgrade with no ledger, so a superseded ALTER ... MODIFY QUERY
 -- left here would restore the older SELECT for the window between this file
 -- and 0027. See 0021's header for the full reasoning. The file is retained
@@ -17,5 +17,3 @@
 --   * Discovery keeps idx=0 for a step whose tool_selection.name is a
 --     non-empty array, so a tool-only step has one completion with an empty
 --     message and its tool calls.
---
--- Mirrored from monolith 0019_spans_normalized_mv_planning_tool_calls.sql.

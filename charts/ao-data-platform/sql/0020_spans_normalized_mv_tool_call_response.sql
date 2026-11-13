@@ -4,7 +4,7 @@
 -- was carried forward by 0021_spans_normalized_mv_planning_tool_fallbacks.sql
 -- and now lives in 0027_spans_normalized_mv_planning_messages.sql, the last
 -- writer of this view. The statement was removed from here rather than
--- left in place because schema-job.yaml re-runs every /sql/*.sql on install AND
+-- left in place because schema-job.yaml re-runs every file in /sql on install AND
 -- upgrade with no ledger or checksum: a superseded ALTER ... MODIFY QUERY is
 -- not merely redundant, it is a transient REGRESSION. Left in place, this file
 -- would restore the pre-planning-tool-fallback SELECT for the window between it
@@ -15,12 +15,9 @@
 -- lost, then regained, the newer handling on every upgrade pass.
 --
 -- The file is retained (not deleted) to hold the numbering, so this ordinal is
--- never reused, the relative order of files mirrored from the source schema
--- set is preserved (correspondence with that set is by basename, not ordinal --
--- this chart carries migrations the fixture lacks, so ordinals drift: this
--- file is the fixture's 0013), and the chart's history stays readable.
--- Retaining it costs nothing: the schema Job pipes a comment-only file to
--- clickhouse-client, which is a no-op.
+-- never reused and the chart's history stays readable. Retaining it costs
+-- nothing: the schema Job pipes a comment-only file to clickhouse-client, which
+-- is a no-op.
 --
 -- Under this chart's execution model sql/ is a DESIRED-STATE script set, not a
 -- migration history -- so exactly one file may carry the current definition of a

@@ -1,4 +1,4 @@
--- Additive: version the monolith↔worker input contract on llm_inputs.
+-- Additive: version the backend↔worker input contract on llm_inputs.
 -- 0 = legacy/v0 (Bedrock-shaped), 1 = MC eval contract v1. The worker dispatches
 -- on a payload-shape sniff, NOT on this column, so the column is not a migration
 -- gate — it exists for future versioning + observability. Idempotent (ADD COLUMN
