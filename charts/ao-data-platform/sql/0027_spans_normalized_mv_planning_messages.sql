@@ -7,9 +7,9 @@
 -- into role. Spans without a parseable list keep the single planning.query
 -- prompt.
 --
--- Keep the prompt, text and tool_calls arms in lockstep with the read
--- template (monolith agent_observability_queries.yaml, ``native``). Two
--- differences are deliberate; do not sync them away:
+-- Keep the prompt, text and tool_calls arms in lockstep with the backend's
+-- native read template. Two differences are deliberate; do not sync them
+-- away:
 --   * The cortex_search/cortex_analyst arms fold tool-span content into the
 --     prompt and completion, because spans_normalized has no tool I/O columns.
 --     Removing them drops all Cortex tool-span content from ClickHouse.
@@ -23,7 +23,7 @@
 -- DEPLOYMENT: this is the authoritative copy of this view definition.
 -- Supersedes 0026_spans_normalized_mv_planning_tool_calls.sql,
 -- whose ALTER ... MODIFY QUERY is emptied by this change (schema-job.yaml
--- re-applies every /sql/*.sql with no ledger, so a superseded ALTER left in
+-- re-applies every file in /sql with no ledger, so a superseded ALTER left in
 -- place would regress the view on every upgrade).
 --
 -- Release order: ship this only after the reader that consumes these prompts

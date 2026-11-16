@@ -8,7 +8,7 @@
 -- i = length(arr) is the last.
 --
 -- Tuple key order (is_end, is_start, message, position, role[, tool_calls])
--- matches the JSON output the product expects and the V1 monolith query
+-- matches the JSON output the product expects and the V1 backend query
 -- shape, so downstream comparators see byte-identical strings.
 CREATE VIEW IF NOT EXISTS otel_traces.spans ON CLUSTER '{cluster}'
 AS SELECT
