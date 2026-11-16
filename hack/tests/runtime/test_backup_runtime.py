@@ -726,7 +726,7 @@ print(json.dumps({'name': name, 'remote': api.request('GET', '/backup/list/remot
         self.assertEqual(set(catalog), {full["name"], incremental["name"]})
         for backup_name, required in ((full["name"], ""), (incremental["name"], full["name"])):
             with self.subTest(backup=backup_name):
-                self.assertEqual(catalog[backup_name]["desc"], "directory, embedded")
+                self.assertEqual(catalog[backup_name]["desc"], "tar, embedded")
                 self.assertEqual(catalog[backup_name]["location"], "remote")
                 self.assertEqual(catalog[backup_name]["required"], required)
                 metadata = json.loads(self.runtime_python(storage, s3_script + """

@@ -13,6 +13,7 @@ import math
 import time
 
 from backup_common import (BackupError, CleanupStopped, RequestNotSent, REQUEST_TIMEOUT_SECONDS,
+                           DELETE_TIMEOUT_SECONDS, validate_delete_timeout,
                            RevisionError, RevisionCheckUnavailable, SCHEDULED_NAME)
 from cleanup_backups import (READ_PATHS, catalog, local_record_warnings,
                              plan as validate_remote, scheduled_time)
@@ -109,7 +110,8 @@ def validated_rows(rows, location, remote=None):
 
 
 class RemoteCleaner:
-    def __init__(self, apis, daily_days=7, history_days=30, timeout=1800, clock=time.monotonic):
+    def __init__(self, apis, daily_days=7, history_days=30, timeout=1800, clock=time.monotonic,
+                 delete_timeout=DELETE_TIMEOUT_SECONDS):
         if (not apis or type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0):
             raise BackupError("Cleanup requires copies and a positive time limit.")
         if (type(daily_days) is not int or daily_days < 1
@@ -118,6 +120,7 @@ class RemoteCleaner:
         endpoints = [api.endpoint for api in apis if getattr(api, "endpoint", None)]
         if len({id(api) for api in apis}) != len(apis) or len(set(endpoints)) != len(endpoints):
             raise BackupError("Cleanup requires different ClickHouse copy endpoints.")
+        self.delete_timeout = validate_delete_timeout(delete_timeout)
         self.apis = tuple(apis)
         self.daily_days, self.history_days = daily_days, history_days
         self.clock, self.deadline = clock, clock() + timeout
@@ -145,7 +148,8 @@ class RemoteCleaner:
         # password revision lookups which each API performs before its request.
         guard_seconds = (getattr(self.apis[index], "guard_timeout_seconds", 0)
                          + 5 * sum(getattr(api, "guard_timeout_seconds", 0) for api in self.apis))
-        required = 300 + (5 * len(self.apis) + 1) * REQUEST_TIMEOUT_SECONDS + guard_seconds
+        delete_timeout = self.delete_timeout if pieces[3] == "remote" else DELETE_TIMEOUT_SECONDS
+        required = delete_timeout + (5 * len(self.apis) + 1) * REQUEST_TIMEOUT_SECONDS + guard_seconds
         if remaining <= required:
             raise RetentionTimeLimit("Cleanup time limit reached; no further deletion was sent.")
         self.attempted.add(self.pending)
@@ -153,7 +157,7 @@ class RemoteCleaner:
         event = {"copy": index, "location": pieces[3], "name": pieces[4]}
         print("Backup cleanup: " + json.dumps({"event": "delete_requested", **event}, sort_keys=True), flush=True)
         try:
-            rows = self.apis[index].request(method, path, request_timeout=300)
+            rows = self.apis[index].request(method, path, request_timeout=delete_timeout)
         except (RequestNotSent, RevisionError, RevisionCheckUnavailable):
             print("Backup cleanup: " + json.dumps(
                 {"event": "delete_not_sent", **event}, sort_keys=True), flush=True)
