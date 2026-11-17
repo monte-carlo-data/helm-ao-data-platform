@@ -102,7 +102,12 @@ clickhouse:
       # sets per older Monday-Sunday week, within historyDays including today.
       dailyDays: 7
       historyDays: 30
+      # Total S3 cleanup time, including local-record removal and verification.
       timeoutSeconds: 1800
+      # Maximum wait for one S3 delete; local deletes still wait up to 300 seconds.
+      # Increase timeoutSeconds too, leaving time for checks and the next backup.
+      # See docs/backup-cleanup.md#deletion-time-limits for sizing and examples.
+      deleteTimeoutSeconds: 300
     localCleanup:
       # Remove older local records only when their completed S3 backups exist.
       # Runs after a verified backup; every configured copy must be reachable.

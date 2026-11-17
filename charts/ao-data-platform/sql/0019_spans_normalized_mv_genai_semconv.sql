@@ -6,7 +6,7 @@
 -- 0021_spans_normalized_mv_planning_tool_fallbacks.sql, and now lives in
 -- 0027_spans_normalized_mv_planning_messages.sql, the last writer of this
 -- view. The statement was removed from here rather than left in
--- place because schema-job.yaml re-runs every /sql/*.sql on install AND upgrade
+-- place because schema-job.yaml re-runs every file in /sql on install AND upgrade
 -- with no ledger or checksum: a superseded ALTER ... MODIFY QUERY is not merely
 -- redundant, it is a transient REGRESSION. Re-running this file restored the
 -- pre-tool_call_response SELECT for the window between it and 0020, and because
@@ -27,13 +27,6 @@
 -- no-op. Verified by execution: with this file inert, the resulting view is
 -- byte-identical to the previous file set on a fresh install AND on an upgrade
 -- from the previously released chart, with the DEFINER pinned by 0014 preserved.
--- Note this differs from the monolith test fixture, where the equivalent file
--- CANNOT be edited: clickhouse-migrations md5-checksums applied files and raises
--- on any change to one already applied. That directory is append-only by
--- construction; this one is not. Files correspond to that fixture by basename,
--- not ordinal (this chart carries migrations the fixture lacks, so ordinals
--- drift: this file is the fixture's 0012); what holding ordinals preserves is
--- the mirrored files' relative order. Only the redundant statement is gone.
 --
 -- What that superseded SELECT added, kept here as the record of why the change
 -- was made (all of it now carried forward through 0020, 0021 and 0026 into 0027):

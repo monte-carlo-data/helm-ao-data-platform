@@ -1,4 +1,4 @@
--- Clustered-only DDL: every statement in sql/*.sql runs ON CLUSTER '{cluster}' so the
+-- Clustered-only DDL: every statement in the sql/ files runs ON CLUSTER '{cluster}' so the
 -- single schema Job propagates DDL to every replica via Keeper's distributed DDL queue,
 -- and every storage engine is a path-less Replicated* variant that resolves its ZooKeeper
 -- path through the server-level default_replica_path / default_replica_name macros (see
