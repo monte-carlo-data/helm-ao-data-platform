@@ -44,9 +44,8 @@
 -- admitted before this migration stay; the read core's non-empty-side gate
 -- filters them.
 --
--- One consequence for whoever enables a Traceloop-shaped service in
--- conversation_rollup_writer.enabled_services (empty in every shipped
--- config): a root this gate keeps out of the MV is no longer excluded by the
+-- One consequence for a Traceloop-shaped service the rollup writer serves:
+-- a root this gate keeps out of the MV is no longer excluded by the
 -- rollup writer's anti-join, so that writer emits it as a
 -- content-free row the read core drops. Storage only; nothing reads it.
 ALTER TABLE otel_traces.conversations_normalized_mv ON CLUSTER '{cluster}'

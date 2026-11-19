@@ -702,6 +702,18 @@ A schema change arrives as a new file. The schema job re-runs every file on each
 
 A table and its grant can arrive separately. The schema job never drops a table, but the grants follow the installed release, so `helm rollback` to a release without a grant keeps the table and revokes the grant. A release that adds a grant says so in its upgrade note, with what a rollback below it does, as the 5.5.0 note does.
 
+### Data backfills
+
+Some schema changes add a column that a view fills only on new rows. A backfill fills the rows written before. The files in `charts/ao-data-platform/backfill/` are generated upstream with their own `MANIFEST.sha256`, like `sql/`. They are not schema files, so the schema job does not run them.
+
+The `clickhouse-backfill-<revision>` Job runs them on each install and upgrade, as `schema_owner`. Today it fills the span cost-input columns of `spans_normalized` (`new_input_tokens`, `cache_read_input_tokens`, `cache_write_input_tokens` and `query_id`):
+
+- It waits until the schema job has updated `spans_normalized_mv` to fill these columns.
+- It then walks the last `clickhouse.ttlDays` days, oldest first. For each day it counts the rows still to fill. When there are some, it runs one `ALTER TABLE ... UPDATE` on that day's partition and waits until every replica has applied it.
+- It updates only rows that have none of the four columns set. It adds, deletes and copies no rows. A later run finds nothing to fill and runs no update.
+
+Set `clickhouse.backfill.enabled=false` to skip the Job. The rows stay without these columns until they age out.
+
 ### Versioning
 
 Two flows, by branch/tag:

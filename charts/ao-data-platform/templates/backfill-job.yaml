@@ -1,0 +1,102 @@
+{{- if .Values.clickhouse.backfill.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: clickhouse-backfill-{{ .Release.Revision }}
+  labels:
+    {{- include "ao-data-platform.labels" . | nindent 4 }}
+spec:
+  backoffLimit: 10
+  template:
+    spec:
+      restartPolicy: OnFailure
+      volumes:
+        - name: backfill
+          configMap:
+            name: clickhouse-backfill
+        {{- if .Values.tls.enabled }}
+        - name: clickhouse-ca
+          secret:
+            secretName: clickhouse-server-tls
+            items:
+              - key: ca.crt
+                path: ca.crt
+        {{- end }}
+      containers:
+        - name: backfill
+          image: {{ .Values.clickhouse.image }}
+          volumeMounts:
+            - name: backfill
+              mountPath: /backfill
+            {{- if .Values.tls.enabled }}
+            - name: clickhouse-ca
+              mountPath: /tls/clickhouse-ca
+              readOnly: true
+            {{- end }}
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              # Fills the span cost inputs on spans_normalized rows written before the
+              # view filled them. It runs on every install and upgrade, and a run after
+              # the first finds nothing to fill. It only updates the four cost-input
+              # columns of rows that have none: it adds, deletes and copies no rows.
+              #
+              # receive_timeout: each update waits until every replica has applied it
+              # (mutations_sync = 2). One day's partition can take minutes on a large
+              # install.
+              ch() {
+                clickhouse-client --host clickhouse-otel --user schema_owner --password "${CLICKHOUSE_PASSWORD}"{{ if .Values.tls.enabled }} --secure --port 9440{{ end }} --receive_timeout 3600 "$@"
+              }
+              echo "Waiting for ClickHouse to accept queries..."
+              attempt=0
+              until ch --query "SELECT 1" > /dev/null 2>&1; do
+                attempt=$((attempt + 1))
+                if [ $((attempt % 15)) -eq 0 ]; then
+                  echo "  still waiting after $((attempt * 2))s..."
+                fi
+                sleep 2
+              done
+              # The schema job runs alongside this one. Start once the view fills the
+              # cost inputs: rows inserted after that need no backfill, so every day
+              # filled below stays filled.
+              echo "Waiting for the schema job to update spans_normalized_mv..."
+              waited=0
+              until ch --format TSVRaw --query "SHOW CREATE TABLE otel_traces.spans_normalized_mv" 2>/dev/null | grep -q "AS new_input_tokens"; do
+                waited=$((waited + 5))
+                if [ "$waited" -ge 1800 ]; then
+                  echo "spans_normalized_mv does not fill the cost inputs after 30 minutes. Check the schema job."
+                  exit 1
+                fi
+                sleep 5
+              done
+              # One day partition at a time, oldest first, over the retention window.
+              echo "Backfilling span cost inputs over the last {{ .Values.clickhouse.ttlDays }} days..."
+              i={{ .Values.clickhouse.ttlDays }}
+              while [ "$i" -ge 0 ]; do
+                day=$(ch --query "SELECT toString(today() - $i)")
+                pending=$(ch --param_day="$day" < /backfill/spans_normalized_cost_inputs_pending.sql)
+                if [ "$pending" -gt 0 ]; then
+                  echo "  $day: filling $pending rows..."
+                  ch --param_day="$day" < /backfill/spans_normalized_cost_inputs_update.sql
+                  left=$(ch --param_day="$day" < /backfill/spans_normalized_cost_inputs_pending.sql)
+                  if [ "$left" -gt 0 ]; then
+                    echo "  $day: $left rows still unfilled after the update."
+                    exit 1
+                  fi
+                fi
+                i=$((i - 1))
+              done
+              echo "Span cost-input backfill complete."
+          env:
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.clickhouse.schemaOwner.secret }}
+                  key: password
+            {{- if .Values.tls.enabled }}
+            - name: SSL_CERT_FILE
+              value: /tls/clickhouse-ca/ca.crt
+            {{- end }}
+{{- end }}
