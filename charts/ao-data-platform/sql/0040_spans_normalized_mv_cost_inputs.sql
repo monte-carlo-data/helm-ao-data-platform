@@ -6,12 +6,15 @@
 --     reads and writes.
 --   * query_id: the warehouse query a SQL execution span ran, or ''.
 --
--- A montecarlo.cost.* attribute wins when the span carries it. Otherwise the
--- cache counts come from the gen_ai.usage cache keys, and new_input_tokens is
--- prompt_tokens less both cache counts, floored at 0. It is prompt_tokens as
--- is when prompt + completion + both cache counts equals total_tokens,
--- because the source then reports input without the cache. A count that is
--- negative or not a number reads as NULL, so the view never raises.
+-- A montecarlo.cost.* attribute wins when the span carries it. A Cortex span
+-- without them reads its cache counts from the planning token counts. Its
+-- prompt_tokens already excludes cache reads, so new_input_tokens is
+-- prompt_tokens less the cache write, floored at 0. Otherwise the cache counts
+-- come from the gen_ai.usage cache keys, and new_input_tokens is prompt_tokens
+-- less both cache counts, floored at 0. It is prompt_tokens as is when
+-- prompt + completion + both cache counts equals total_tokens, because the
+-- source then reports input without the cache. A count that is negative or
+-- not a number reads as NULL, so the view never raises.
 --
 -- DEPLOYMENT: this is the authoritative copy of this view definition.
 -- 0027's ALTER ... MODIFY QUERY is emptied by this change. schema-job.yaml
@@ -217,13 +220,15 @@ SELECT
         CAST(multiIf(
             prompt_tokens IS NULL,
             NULL,
-            prompt_tokens + completion_tokens + coalesce(coalesce(accurateCastOrNull(SpanAttributes.montecarlo.cost.cache_read_input_tokens, 'UInt32'), accurateCastOrNull(SpanAttributes.gen_ai.usage.cache_read_input_tokens, 'UInt32'), accurateCastOrNull(SpanAttributes.gen_ai.usage.cache_read.input_tokens, 'UInt32')), 0) + coalesce(coalesce(accurateCastOrNull(SpanAttributes.montecarlo.cost.cache_write_input_tokens, 'UInt32'), accurateCastOrNull(SpanAttributes.gen_ai.usage.cache_creation_input_tokens, 'UInt32'), accurateCastOrNull(SpanAttributes.gen_ai.usage.cache_creation.input_tokens, 'UInt32'), accurateCastOrNull(SpanAttributes.gen_ai.usage.cache_write_input_tokens, 'UInt32')), 0) = total_tokens,
+            (accurateCastOrNull(SpanAttributes.snow.ai.observability.agent.planning.token_count.cache_read_input, 'UInt32') IS NOT NULL OR accurateCastOrNull(SpanAttributes.snow.ai.observability.agent.planning.token_count.cache_write_input, 'UInt32') IS NOT NULL),
+            greatest(toInt64(prompt_tokens) - toInt64(coalesce(coalesce(accurateCastOrNull(SpanAttributes.montecarlo.cost.cache_write_input_tokens, 'UInt32'), accurateCastOrNull(SpanAttributes.snow.ai.observability.agent.planning.token_count.cache_write_input, 'UInt32'), accurateCastOrNull(SpanAttributes.gen_ai.usage.cache_creation_input_tokens, 'UInt32'), accurateCastOrNull(SpanAttributes.gen_ai.usage.cache_creation.input_tokens, 'UInt32'), accurateCastOrNull(SpanAttributes.gen_ai.usage.cache_write_input_tokens, 'UInt32')), 0)), 0),
+            prompt_tokens + completion_tokens + coalesce(coalesce(accurateCastOrNull(SpanAttributes.montecarlo.cost.cache_read_input_tokens, 'UInt32'), accurateCastOrNull(SpanAttributes.snow.ai.observability.agent.planning.token_count.cache_read_input, 'UInt32'), accurateCastOrNull(SpanAttributes.gen_ai.usage.cache_read_input_tokens, 'UInt32'), accurateCastOrNull(SpanAttributes.gen_ai.usage.cache_read.input_tokens, 'UInt32')), 0) + coalesce(coalesce(accurateCastOrNull(SpanAttributes.montecarlo.cost.cache_write_input_tokens, 'UInt32'), accurateCastOrNull(SpanAttributes.snow.ai.observability.agent.planning.token_count.cache_write_input, 'UInt32'), accurateCastOrNull(SpanAttributes.gen_ai.usage.cache_creation_input_tokens, 'UInt32'), accurateCastOrNull(SpanAttributes.gen_ai.usage.cache_creation.input_tokens, 'UInt32'), accurateCastOrNull(SpanAttributes.gen_ai.usage.cache_write_input_tokens, 'UInt32')), 0) = total_tokens,
             toInt64(prompt_tokens),
-            greatest(toInt64(prompt_tokens) - toInt64(coalesce(coalesce(accurateCastOrNull(SpanAttributes.montecarlo.cost.cache_read_input_tokens, 'UInt32'), accurateCastOrNull(SpanAttributes.gen_ai.usage.cache_read_input_tokens, 'UInt32'), accurateCastOrNull(SpanAttributes.gen_ai.usage.cache_read.input_tokens, 'UInt32')), 0) + coalesce(coalesce(accurateCastOrNull(SpanAttributes.montecarlo.cost.cache_write_input_tokens, 'UInt32'), accurateCastOrNull(SpanAttributes.gen_ai.usage.cache_creation_input_tokens, 'UInt32'), accurateCastOrNull(SpanAttributes.gen_ai.usage.cache_creation.input_tokens, 'UInt32'), accurateCastOrNull(SpanAttributes.gen_ai.usage.cache_write_input_tokens, 'UInt32')), 0)), 0)
+            greatest(toInt64(prompt_tokens) - toInt64(coalesce(coalesce(accurateCastOrNull(SpanAttributes.montecarlo.cost.cache_read_input_tokens, 'UInt32'), accurateCastOrNull(SpanAttributes.snow.ai.observability.agent.planning.token_count.cache_read_input, 'UInt32'), accurateCastOrNull(SpanAttributes.gen_ai.usage.cache_read_input_tokens, 'UInt32'), accurateCastOrNull(SpanAttributes.gen_ai.usage.cache_read.input_tokens, 'UInt32')), 0) + coalesce(coalesce(accurateCastOrNull(SpanAttributes.montecarlo.cost.cache_write_input_tokens, 'UInt32'), accurateCastOrNull(SpanAttributes.snow.ai.observability.agent.planning.token_count.cache_write_input, 'UInt32'), accurateCastOrNull(SpanAttributes.gen_ai.usage.cache_creation_input_tokens, 'UInt32'), accurateCastOrNull(SpanAttributes.gen_ai.usage.cache_creation.input_tokens, 'UInt32'), accurateCastOrNull(SpanAttributes.gen_ai.usage.cache_write_input_tokens, 'UInt32')), 0)), 0)
         ) AS Nullable(UInt32))
     ) AS new_input_tokens,
-    coalesce(accurateCastOrNull(SpanAttributes.montecarlo.cost.cache_read_input_tokens, 'UInt32'), accurateCastOrNull(SpanAttributes.gen_ai.usage.cache_read_input_tokens, 'UInt32'), accurateCastOrNull(SpanAttributes.gen_ai.usage.cache_read.input_tokens, 'UInt32')) AS cache_read_input_tokens,
-    coalesce(accurateCastOrNull(SpanAttributes.montecarlo.cost.cache_write_input_tokens, 'UInt32'), accurateCastOrNull(SpanAttributes.gen_ai.usage.cache_creation_input_tokens, 'UInt32'), accurateCastOrNull(SpanAttributes.gen_ai.usage.cache_creation.input_tokens, 'UInt32'), accurateCastOrNull(SpanAttributes.gen_ai.usage.cache_write_input_tokens, 'UInt32')) AS cache_write_input_tokens,
+    coalesce(accurateCastOrNull(SpanAttributes.montecarlo.cost.cache_read_input_tokens, 'UInt32'), accurateCastOrNull(SpanAttributes.snow.ai.observability.agent.planning.token_count.cache_read_input, 'UInt32'), accurateCastOrNull(SpanAttributes.gen_ai.usage.cache_read_input_tokens, 'UInt32'), accurateCastOrNull(SpanAttributes.gen_ai.usage.cache_read.input_tokens, 'UInt32')) AS cache_read_input_tokens,
+    coalesce(accurateCastOrNull(SpanAttributes.montecarlo.cost.cache_write_input_tokens, 'UInt32'), accurateCastOrNull(SpanAttributes.snow.ai.observability.agent.planning.token_count.cache_write_input, 'UInt32'), accurateCastOrNull(SpanAttributes.gen_ai.usage.cache_creation_input_tokens, 'UInt32'), accurateCastOrNull(SpanAttributes.gen_ai.usage.cache_creation.input_tokens, 'UInt32'), accurateCastOrNull(SpanAttributes.gen_ai.usage.cache_write_input_tokens, 'UInt32')) AS cache_write_input_tokens,
     coalesce(CAST(SpanAttributes.montecarlo.cost.query_id AS Nullable(String)), '') AS query_id,
 
     (coalesce(CAST(SpanAttributes.gen_ai.request.model AS Nullable(String)), '') != '')
