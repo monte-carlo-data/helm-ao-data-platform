@@ -22,7 +22,7 @@
 -- place would regress the view on every upgrade.
 --
 -- Forward-only: MODIFY QUERY affects new inserts only. Rows written before
--- it keep NULL and '' in these columns until a backfill updates them.
+-- it keep NULL and '' in these columns until the TTL drops them.
 
 ALTER TABLE otel_traces.spans_normalized_mv ON CLUSTER '{cluster}'
 MODIFY QUERY
