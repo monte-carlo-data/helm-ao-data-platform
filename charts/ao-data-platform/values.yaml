@@ -139,11 +139,6 @@ clickhouse:
   # Note: shrinking the value purges already-expired data lazily on the next
   # background merge, not immediately — see README for the manual-purge escape hatch.
   ttlDays: 30
-  # One-time data backfills that run alongside the schema job, as schema_owner, over the
-  # last ttlDays days. They only fill empty columns on existing rows, so a later run does
-  # nothing. See the README's "Data backfills" section.
-  backfill:
-    enabled: true
   # Main users are defined in templates/clickhouse-installation.yaml and external-secret.yaml.
   # Backup and backup_probe users are defined separately in backup-external-secret.yaml.
   # otel — the OTel collector ingest identity. Writes raw telemetry into otel_traces.otel_traces.
