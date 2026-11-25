@@ -897,6 +897,82 @@ class FeedbackStorageTests(unittest.TestCase):
                     expected,
                 )
 
+    def test_view_fills_the_span_cost_inputs(self):
+        sql_query_id = "01c0aa11-0000-1111-0000-000000000003"
+        cases = (
+            (
+                "stamped",
+                "agent.llm",
+                {
+                    "gen_ai.usage.prompt_tokens": 1259,
+                    "montecarlo.cost.new_input_tokens": 1,
+                    "montecarlo.cost.cache_read_input_tokens": 50338,
+                    "montecarlo.cost.cache_write_input_tokens": 1258,
+                    "montecarlo.cost.query_id": "01c0aa11-0000-1111-0000-000000000001",
+                },
+                [1, 50338, 1258, "01c0aa11-0000-1111-0000-000000000001"],
+            ),
+            (
+                "cortex_planning",
+                "ReasoningAgentStepPlanning-0",
+                {
+                    "gen_ai.usage.prompt_tokens": 1259,
+                    "snow.ai.observability.agent.planning.token_count.cache_read_input": 50338,
+                    "snow.ai.observability.agent.planning.token_count.cache_write_input": 1258,
+                },
+                [1, 50338, 1258, ""],
+            ),
+            (
+                "non_numeric_cache",
+                "agent.llm",
+                {
+                    "gen_ai.usage.input_tokens": 100,
+                    "gen_ai.usage.cache_read_input_tokens": "n/a",
+                },
+                [100, None, None, ""],
+            ),
+            (
+                "array_token_count",
+                "agent.llm",
+                {"gen_ai.usage.input_tokens": [1, 2]},
+                [None, None, None, ""],
+            ),
+            (
+                "cortex_sql_tool",
+                "SystemExecuteSQLTool_run_query",
+                {"snow.ai.observability.agent.tool.sql_execution.query_id": sql_query_id},
+                [None, None, None, sql_query_id],
+            ),
+            (
+                "cortex_sql_child",
+                "SqlExecution_SystemSQL_run_query",
+                {"snow.ai.observability.agent.tool.sql_execution.query_id": sql_query_id},
+                [None, None, None, ""],
+            ),
+        )
+        spans = {
+            name: self.span(attrs, SpanName=span_name)
+            for name, span_name, attrs, _ in cases
+        }
+        # One batch: a value the view can't cast must not reject the other spans.
+        self.insert(list(spans.values()))
+        rows = {
+            row["span_id"]: [
+                row["new_input_tokens"],
+                row["cache_read_input_tokens"],
+                row["cache_write_input_tokens"],
+                row["query_id"],
+            ]
+            for row in self.select(
+                "spans_normalized FINAL",
+                "span_id, new_input_tokens, cache_read_input_tokens, "
+                "cache_write_input_tokens, query_id",
+            )
+        }
+        for name, _, _, expected in cases:
+            with self.subTest(case=name):
+                self.assertEqual(rows[spans[name]["SpanId"]], expected)
+
     def test_upgrade_is_repeatable_and_preserves_existing_writer(self):
         migrated = self.execute(
             "SELECT source, cleared, positive, target_id, target_kind, toUnixTimestamp64Nano(feedback_span_time) AS feedback_time FROM otel_traces.agent_feedback WHERE service_name = 'upgrade-seed'"

@@ -1,14 +1,14 @@
 -- Map Cortex reasoning-step message history into prompts.
 --
--- SUPERSEDED BY 0040, AND DELIBERATELY INERT. The SELECT this file used to
--- install now lives in 0040_spans_normalized_mv_cost_inputs.sql, the last
--- writer of this view. schema-job.yaml re-runs every file in /sql on install
+-- SUPERSEDED BY 0040, AND DELIBERATELY INERT. The live SELECT is in the
+-- highest-numbered file that ALTERs spans_normalized_mv. schema-job.yaml re-runs every file in /sql on install
 -- AND upgrade with no ledger, so a superseded ALTER ... MODIFY QUERY left here
--- would restore the older SELECT for the window between this file and 0040.
+-- would restore the older SELECT for the window between this file and its
+-- successor.
 -- See 0021's header for the full reasoning. The file is retained to hold the
 -- numbering.
 --
--- What that superseded SELECT added, carried forward into 0040:
+-- What that superseded SELECT added, carried forward into the live SELECT:
 -- Supersedes 0026. ReasoningAgentStepPlanning / ResponseGeneration spans
 -- carry snow.ai.observability.agent.planning.messages: a JSON-array string of
 -- "User: ..." / "Assistant: ..." elements holding the conversation the step
@@ -16,15 +16,8 @@
 -- into role. Spans without a parseable list keep the single planning.query
 -- prompt.
 --
--- Keep the prompt, text and tool_calls arms in lockstep with the backend's
--- native read template. Two differences are deliberate; do not sync them
--- away:
---   * The cortex_search/cortex_analyst arms fold tool-span content into the
---     prompt and completion, because spans_normalized has no tool I/O columns.
---     Removing them drops all Cortex tool-span content from ClickHouse.
---   * The nullIf wrappers treat '' as absent. The read template's bare casts
---     let '' win, which is a latent bug on that side.
---
+-- The live SELECT's header carries the lockstep rule with the backend's
+-- native read template.
 -- All added expressions are total, so the MV never raises. Output columns
 -- are unchanged. Feedback spans are excluded by their name or evaluation marker
 -- so they do not become normal traces or contribute to derived trace metrics.

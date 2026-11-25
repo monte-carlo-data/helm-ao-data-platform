@@ -1,9 +1,9 @@
 -- Render gen_ai-semconv tool results in the message view.
 --
 -- SUPERSEDED, AND DELIBERATELY INERT. The SELECT this file used to install
--- was carried forward by 0021_spans_normalized_mv_planning_tool_fallbacks.sql
--- and now lives in 0027_spans_normalized_mv_planning_messages.sql, the last
--- writer of this view. The statement was removed from here rather than
+-- was carried forward by 0021_spans_normalized_mv_planning_tool_fallbacks.sql.
+-- The live SELECT is in the highest-numbered file that ALTERs
+-- spans_normalized_mv. The statement was removed from here rather than
 -- left in place because schema-job.yaml re-runs every file in /sql on install AND
 -- upgrade with no ledger or checksum: a superseded ALTER ... MODIFY QUERY is
 -- not merely redundant, it is a transient REGRESSION. Left in place, this file
@@ -23,10 +23,10 @@
 -- migration history -- so exactly one file may carry the current definition of a
 -- given view. That is 0006 (CREATE ... IF NOT EXISTS, which owns the view on a
 -- fresh install) plus one trailing ALTER for clusters where the CREATE is a
--- no-op -- now 0027.
+-- no-op -- the highest-numbered file that ALTERs this view.
 --
 -- What that superseded SELECT added, kept here as the record of why the change
--- was made (all of it now carried forward through 0021 and 0026 into 0027):
+-- was made (all of it now carried forward into the live SELECT):
 --   1. Tool results: a gen_ai.input.messages / gen_ai.output.messages part of
 --      type 'tool_call_response' carries its payload under `response`, not
 --      `content`, so 0019's content-only part-concatenation rendered tool
@@ -61,7 +61,7 @@
 --      and no service.name resource attribute) kept the raw ServiceName and
 --      agent-scoped reads silently missed them.
 --
--- SIZE (still applies to the live SELECT in 0027): `response` is tool-controlled
+-- SIZE (still applies to the live SELECT): `response` is tool-controlled
 -- and copied verbatim, so prompts[].message is unbounded here. It amplifies --
 -- gen_ai.input.messages on a follow-up turn replays every prior tool result,
 -- so a conversation grows O(turns^2) in total prompt bytes. Left unbounded
@@ -79,5 +79,5 @@
 --
 -- Every expression it added was total (never raises), preserving this view's
 -- headline invariant: a raising SELECT expression fails the source INSERT into
--- otel_traces and silently HALTS span ingestion cluster-wide. 0027 preserves
--- that property.
+-- otel_traces and silently HALTS span ingestion cluster-wide. The live SELECT
+-- preserves that property.

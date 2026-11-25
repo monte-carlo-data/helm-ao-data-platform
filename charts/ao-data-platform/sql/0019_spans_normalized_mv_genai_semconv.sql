@@ -3,9 +3,8 @@
 --
 -- SUPERSEDED, AND DELIBERATELY INERT. The SELECT this file used to install was
 -- carried forward by 0020_spans_normalized_mv_tool_call_response.sql and
--- 0021_spans_normalized_mv_planning_tool_fallbacks.sql, and now lives in
--- 0027_spans_normalized_mv_planning_messages.sql, the last writer of this
--- view. The statement was removed from here rather than left in
+-- 0021_spans_normalized_mv_planning_tool_fallbacks.sql. The live SELECT is in
+-- the highest-numbered file that ALTERs spans_normalized_mv. The statement was removed from here rather than left in
 -- place because schema-job.yaml re-runs every file in /sql on install AND upgrade
 -- with no ledger or checksum: a superseded ALTER ... MODIFY QUERY is not merely
 -- redundant, it is a transient REGRESSION. Re-running this file restored the
@@ -29,7 +28,7 @@
 -- from the previously released chart, with the DEFINER pinned by 0014 preserved.
 --
 -- What that superseded SELECT added, kept here as the record of why the change
--- was made (all of it now carried forward through 0020, 0021 and 0026 into 0027):
+-- was made (all of it now carried forward into the live SELECT):
 --   1. Content: the new semconv moved prompt/completion content from per-attribute
 --      indexed keys (gen_ai.prompt.{N}.content) to single JSON-array attributes
 --      gen_ai.input.messages / gen_ai.output.messages, each an array of
@@ -43,4 +42,4 @@
 -- Both axes are total / null-safe -- every expression degrades to '' for a
 -- missing or malformed JSON path and never raises, so a source INSERT into
 -- otel_traces can never be failed by this view (a raising MV halts ingestion
--- cluster-wide). 0027 preserves that property.
+-- cluster-wide). The live SELECT preserves that property.
