@@ -1,12 +1,11 @@
 -- Map Cortex reasoning-step message history into prompts.
 --
--- SUPERSEDED BY 0040, AND DELIBERATELY INERT. The live SELECT is in the
--- highest-numbered file that ALTERs spans_normalized_mv. schema-job.yaml re-runs every file in /sql on install
--- AND upgrade with no ledger, so a superseded ALTER ... MODIFY QUERY left here
--- would restore the older SELECT for the window between this file and its
--- successor.
--- See 0021's header for the full reasoning. The file is retained to hold the
--- numbering.
+-- SUPERSEDED BY 0040, AND DELIBERATELY INERT. The live SELECT is in the file
+-- with the live MODIFY QUERY for spans_normalized_mv. schema-job.yaml re-runs
+-- every file in /sql on install AND upgrade with no ledger, so a superseded
+-- ALTER ... MODIFY QUERY left here would restore the older SELECT for the
+-- window between this file and its successor. See 0021's header for the full
+-- reasoning. The file is retained to hold the numbering.
 --
 -- What that superseded SELECT added, carried forward into the live SELECT:
 -- Supersedes 0026. ReasoningAgentStepPlanning / ResponseGeneration spans

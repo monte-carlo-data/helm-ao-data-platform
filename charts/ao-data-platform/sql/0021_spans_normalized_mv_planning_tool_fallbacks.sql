@@ -1,7 +1,7 @@
 -- Extract Cortex planning tool-use output as the completion.
 --
 -- SUPERSEDED BY 0027, AND DELIBERATELY INERT. The live SELECT is in the
--- highest-numbered file that ALTERs spans_normalized_mv. The statement was removed from
+-- file with the live MODIFY QUERY for spans_normalized_mv. The statement was removed from
 -- here rather than left in place because schema-job.yaml re-runs every
 -- file in /sql on install AND upgrade with no ledger or checksum: a
 -- superseded ALTER ... MODIFY QUERY is not merely redundant, it is a
@@ -20,7 +20,7 @@
 -- a migration history -- so exactly one file may carry the current
 -- definition of a given view. That is 0006 (CREATE ... IF NOT EXISTS, which
 -- owns the view on a fresh install) plus one trailing ALTER for clusters
--- where the CREATE is a no-op -- the highest-numbered file that ALTERs
+-- where the CREATE is a no-op -- the file with the live MODIFY QUERY for
 -- this view.
 --
 -- What that superseded SELECT added, kept here as the record of why the

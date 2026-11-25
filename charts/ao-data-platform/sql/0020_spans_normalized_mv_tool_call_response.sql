@@ -2,7 +2,7 @@
 --
 -- SUPERSEDED, AND DELIBERATELY INERT. The SELECT this file used to install
 -- was carried forward by 0021_spans_normalized_mv_planning_tool_fallbacks.sql.
--- The live SELECT is in the highest-numbered file that ALTERs
+-- The live SELECT is in the file with the live MODIFY QUERY for
 -- spans_normalized_mv. The statement was removed from here rather than
 -- left in place because schema-job.yaml re-runs every file in /sql on install AND
 -- upgrade with no ledger or checksum: a superseded ALTER ... MODIFY QUERY is
@@ -23,7 +23,7 @@
 -- migration history -- so exactly one file may carry the current definition of a
 -- given view. That is 0006 (CREATE ... IF NOT EXISTS, which owns the view on a
 -- fresh install) plus one trailing ALTER for clusters where the CREATE is a
--- no-op -- the highest-numbered file that ALTERs this view.
+-- no-op -- the file with the live MODIFY QUERY for this view.
 --
 -- What that superseded SELECT added, kept here as the record of why the change
 -- was made (all of it now carried forward into the live SELECT):

@@ -4,14 +4,15 @@
 -- SUPERSEDED, AND DELIBERATELY INERT. The SELECT this file used to install was
 -- carried forward by 0020_spans_normalized_mv_tool_call_response.sql and
 -- 0021_spans_normalized_mv_planning_tool_fallbacks.sql. The live SELECT is in
--- the highest-numbered file that ALTERs spans_normalized_mv. The statement was removed from here rather than left in
--- place because schema-job.yaml re-runs every file in /sql on install AND upgrade
--- with no ledger or checksum: a superseded ALTER ... MODIFY QUERY is not merely
--- redundant, it is a transient REGRESSION. Re-running this file restored the
--- pre-tool_call_response SELECT for the window between it and 0020, and because
--- the view is insert-triggered and forward-only, any span ingested in that
--- window keeps a blank tool result permanently -- the exact defect 0020 fixes.
--- Measured on a two-replica cluster: the view lost, then regained, the
+-- the file with the live MODIFY QUERY for spans_normalized_mv. The statement
+-- was removed from here rather than left in place because schema-job.yaml
+-- re-runs every file in /sql on install AND upgrade with no ledger or
+-- checksum: a superseded ALTER ... MODIFY QUERY is not merely redundant, it is
+-- a transient REGRESSION. Re-running this file restored the
+-- pre-tool_call_response SELECT for the window between it and 0020, and
+-- because the view is insert-triggered and forward-only, any span ingested in
+-- that window keeps a blank tool result permanently -- the exact defect 0020
+-- fixes. Measured on a two-replica cluster: the view lost, then regained, the
 -- tool_call_response handling on every upgrade pass.
 --
 -- The file is retained (not deleted) to hold the numbering, so this ordinal is

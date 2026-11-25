@@ -932,9 +932,24 @@ class FeedbackStorageTests(unittest.TestCase):
                 [100, None, None, ""],
             ),
             (
-                "array_token_count",
+                "array_on_every_token_key",
                 "agent.llm",
-                {"gen_ai.usage.input_tokens": [1, 2]},
+                dict.fromkeys(
+                    (
+                        "gen_ai.usage.prompt_tokens",
+                        "gen_ai.usage.input_tokens",
+                        "llm.token_count.prompt",
+                        "snow.ai.observability.agent.planning.token_count.input",
+                        "gen_ai.usage.completion_tokens",
+                        "gen_ai.usage.output_tokens",
+                        "llm.token_count.completion",
+                        "snow.ai.observability.agent.planning.token_count.output",
+                        "gen_ai.usage.total_tokens",
+                        "llm.usage.total_tokens",
+                        "llm.token_count.total",
+                    ),
+                    [1, 2],
+                ),
                 [None, None, None, ""],
             ),
             (
