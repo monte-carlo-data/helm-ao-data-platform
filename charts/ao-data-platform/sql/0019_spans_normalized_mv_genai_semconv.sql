@@ -3,16 +3,16 @@
 --
 -- SUPERSEDED, AND DELIBERATELY INERT. The SELECT this file used to install was
 -- carried forward by 0020_spans_normalized_mv_tool_call_response.sql and
--- 0021_spans_normalized_mv_planning_tool_fallbacks.sql, and now lives in
--- 0027_spans_normalized_mv_planning_messages.sql, the last writer of this
--- view. The statement was removed from here rather than left in
--- place because schema-job.yaml re-runs every file in /sql on install AND upgrade
--- with no ledger or checksum: a superseded ALTER ... MODIFY QUERY is not merely
--- redundant, it is a transient REGRESSION. Re-running this file restored the
--- pre-tool_call_response SELECT for the window between it and 0020, and because
--- the view is insert-triggered and forward-only, any span ingested in that
--- window keeps a blank tool result permanently -- the exact defect 0020 fixes.
--- Measured on a two-replica cluster: the view lost, then regained, the
+-- 0021_spans_normalized_mv_planning_tool_fallbacks.sql. The live SELECT is in
+-- the file with the live MODIFY QUERY for spans_normalized_mv. The statement
+-- was removed from here rather than left in place because schema-job.yaml
+-- re-runs every file in /sql on install AND upgrade with no ledger or
+-- checksum: a superseded ALTER ... MODIFY QUERY is not merely redundant, it is
+-- a transient REGRESSION. Re-running this file restored the
+-- pre-tool_call_response SELECT for the window between it and 0020, and
+-- because the view is insert-triggered and forward-only, any span ingested in
+-- that window keeps a blank tool result permanently -- the exact defect 0020
+-- fixes. Measured on a two-replica cluster: the view lost, then regained, the
 -- tool_call_response handling on every upgrade pass.
 --
 -- The file is retained (not deleted) to hold the numbering, so this ordinal is
@@ -29,7 +29,7 @@
 -- from the previously released chart, with the DEFINER pinned by 0014 preserved.
 --
 -- What that superseded SELECT added, kept here as the record of why the change
--- was made (all of it now carried forward through 0020, 0021 and 0026 into 0027):
+-- was made (all of it now carried forward into the live SELECT):
 --   1. Content: the new semconv moved prompt/completion content from per-attribute
 --      indexed keys (gen_ai.prompt.{N}.content) to single JSON-array attributes
 --      gen_ai.input.messages / gen_ai.output.messages, each an array of
@@ -43,4 +43,4 @@
 -- Both axes are total / null-safe -- every expression degrades to '' for a
 -- missing or malformed JSON path and never raises, so a source INSERT into
 -- otel_traces can never be failed by this view (a raising MV halts ingestion
--- cluster-wide). 0027 preserves that property.
+-- cluster-wide). The live SELECT preserves that property.

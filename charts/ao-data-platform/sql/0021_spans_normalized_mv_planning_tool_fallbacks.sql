@@ -1,13 +1,12 @@
 -- Extract Cortex planning tool-use output as the completion.
 --
--- SUPERSEDED BY 0027, AND DELIBERATELY INERT. The SELECT this file used to
--- install now lives in 0027_spans_normalized_mv_planning_messages.sql,
--- which is the last writer of this view. The statement was removed from
+-- SUPERSEDED BY 0027, AND DELIBERATELY INERT. The live SELECT is in the
+-- file with the live MODIFY QUERY for spans_normalized_mv. The statement was removed from
 -- here rather than left in place because schema-job.yaml re-runs every
 -- file in /sql on install AND upgrade with no ledger or checksum: a
 -- superseded ALTER ... MODIFY QUERY is not merely redundant, it is a
 -- transient REGRESSION. Left in place, this file would restore the
--- pre-planning-tool-calls SELECT for the window between it and 0027, and
+-- pre-planning-tool-calls SELECT for the window between it and its successor, and
 -- because the view is insert-triggered and forward-only, a Cortex planning
 -- tool-use span ingested in that window keeps the superseded rendering
 -- permanently. Measured on a two-replica cluster when 0020 superseded 0019.
@@ -21,10 +20,11 @@
 -- a migration history -- so exactly one file may carry the current
 -- definition of a given view. That is 0006 (CREATE ... IF NOT EXISTS, which
 -- owns the view on a fresh install) plus one trailing ALTER for clusters
--- where the CREATE is a no-op -- now 0027.
+-- where the CREATE is a no-op -- the file with the live MODIFY QUERY for
+-- this view.
 --
 -- What that superseded SELECT added, kept here as the record of why the
--- change was made (superseded again by 0026, then carried into 0027):
+-- change was made (superseded again by 0026, then carried into the live SELECT):
 --   1. Changed the completion extraction (idx=0 Snowflake-native arm) to a
 --      seven-arm COALESCE: record_root.output -> planning.thinking_response
 --      -> planning.response -> planning.tool_execution.results ->
@@ -41,4 +41,4 @@
 -- Every expression it added was total (never raises), preserving this
 -- view's headline invariant: a raising SELECT expression fails the source
 -- INSERT into otel_traces and silently HALTS span ingestion cluster-wide.
--- 0027 preserves that property.
+-- The live SELECT preserves that property.
